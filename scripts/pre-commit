@@ -1,0 +1,54 @@
+#!/bin/sh
+# Pre-commit hook: secret scan, then cargo fmt check and clippy.
+# Install: ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
+#
+# Deterministic gates only. The model-driven security review is a separate,
+# advisory step: run /security-review before opening a PR.
+
+set -e
+
+# Secret scan runs on every commit, not just Rust ones — a credential can land in
+# a markdown, TOML, or workflow file just as easily. Config (allowlists for the
+# AWS EXAMPLE key fixtures and target/) comes from .gitleaks.toml automatically.
+if command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: scanning staged changes for secrets..."
+    if ! gitleaks git --staged --redact --no-banner . >/dev/null 2>&1; then
+        echo "pre-commit: gitleaks found a secret in staged changes. Details:"
+        # -v prints rule/file/line; --redact keeps the value out of the terminal.
+        gitleaks git --staged --redact -v --no-banner . || true
+        echo "pre-commit: unstage the secret, or allowlist the fixture in .gitleaks.toml."
+        exit 1
+    fi
+else
+    echo "pre-commit: gitleaks not installed, skipping secret scan (brew install gitleaks)"
+fi
+
+# Only run the Rust gates if Rust files are staged
+if ! git diff --cached --name-only | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$'; then
+    exit 0
+fi
+
+echo "pre-commit: checking formatting..."
+if ! cargo fmt --check; then
+    echo "pre-commit: cargo fmt --check failed. Run 'cargo fmt' and re-stage."
+    exit 1
+fi
+
+echo "pre-commit: running clippy..."
+if ! cargo clippy -- -D warnings; then
+    echo "pre-commit: clippy failed. Fix warnings before committing."
+    exit 1
+fi
+
+# Advisory-DB check, only when the dependency graph actually changed.
+if git diff --cached --name-only | grep -qE 'Cargo\.(toml|lock)$'; then
+    if command -v cargo-audit >/dev/null 2>&1; then
+        echo "pre-commit: auditing dependencies..."
+        if ! cargo audit --deny warnings; then
+            echo "pre-commit: cargo audit failed. Resolve the advisory before committing."
+            exit 1
+        fi
+    else
+        echo "pre-commit: cargo-audit not installed, skipping advisory check (cargo install cargo-audit)"
+    fi
+fi

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the Credsd.app BUNDLE, not the bare-binary embedded plist that
+  crates/credsd-daemon/build.rs produces — that one identifies the Mach-O, this one
+  identifies the bundle the provisioning profile binds to.
+
+  CFBundleIdentifier MUST equal the App ID the provisioning profile is bound to.
+  CFBundleExecutable MUST match the file in Contents/MacOS/.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleIdentifier</key>
+    <string>@IDENTIFIER@</string>
+    <key>CFBundleName</key>
+    <string>@BUNDLE_NAME@</string>
+    <key>CFBundleExecutable</key>
+    <string>@EXECUTABLE@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <!-- Headless daemon: no UI, never shown in Dock/Finder as a launchable app. -->
+    <key>LSBackgroundOnly</key>
+    <true/>
+</dict>
+</plist>

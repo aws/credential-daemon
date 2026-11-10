@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # A Markdown-only PR runs the test suite on one platform instead of the full matrix. It cannot
+  # skip tests entirely: tests read Markdown (docs_maturity_notice holds every doc to README.md's
+  # notice), and a workflow-level `paths-ignore: '**.md'` once let a README edit break main.
+  # Markdown is not platform-gated, so one row sees everything such a change can break.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      # HEAD is the PR merged into its base, so HEAD^1 is the base and the diff is the PR.
+      - id: diff
+        run: |
+          if git diff --name-only HEAD^1 HEAD | grep -qv '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  docs:
+    name: Test (Markdown-only change)
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-docs-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-docs-cargo-
+
+      - name: test
+        run: cargo test --locked
+
+  # Matrixed over both supported host families, because a single-target lint run cannot see
+  # platform-gated code. That is not hypothetical: two `#[cfg(target_os = "linux")]` functions
+  # once reached this job with 8 violations that a macOS clippy run never compiles, and the
+  # mirror-image blind spot — `cfg(target_os = "macos")` code, `install::macos`,
+  # `proc_pidinfo` — was linted by nothing at all. Windows joins when its build row returns.
+  lint:
+    name: Lint (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-lint-cargo-
+
+      # rustfmt has no platform-gated behavior, so one row is enough; running it on both is
+      # cheaper than a conditional.
+      - name: fmt
+        run: cargo fmt --check
+
+      # A library crate's `default` is active when the crate is in the build selection and
+      # absent when it is reached only through dependents that set `default-features = false`.
+      # Both sets can activate identical code and still be different `-C metadata` inputs, so
+      # `cargo build -p creds` and a workspace build emit different bytes for the same program
+      # — which the downstream integration lane rejects when it compares `<platform>-tpm/creds`
+      # against `<platform>/creds`. Defaults live on the binaries, where there is one answer.
+      - name: assert no library-crate default features
+        run: |
+          if grep -lE '^default *=' crates/credsd-core/Cargo.toml crates/credsd-client/Cargo.toml; then
+            echo "::error::a library crate declares a default feature; move it to crates/credsd-daemon and crates/credsd"
+            exit 1
+          fi
+
+      # `--all-targets` so the never-crash lint policy reaches test code too. Without it the
+      # policy stops at lib and bin targets, and a `panic!`/`unwrap` reachable only from a test
+      # helper — which the clippy.toml relaxations do not cover — never gets linted.
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Feature-gated code has the same blind spot this job exists to close for platform-gated
+      # code. The default lint run compiles neither the Swift seam nor any
+      # `cfg(feature = "secure-enclave")` block, so a violation in either reaches no linter at
+      # all — the exact shape of the 8 unlinted violations described above. `file` rides along:
+      # on macOS it is off by default too, and the default run lints only its absent arm.
+      - name: clippy (secure-enclave, file)
+        if: matrix.platform == 'macos'
+        run: cargo clippy --all-targets --features secure-enclave,file -- -D warnings
+
+      # Same blind spot as the step above, for the Linux-only feature. `credsd-core/tpm`
+      # rather than a bare `tpm`: at the workspace root `--all-targets` selects members that
+      # do not define that feature, and a bare name fails against them.
+      - name: clippy (tpm)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libtss2-dev
+          cargo clippy --all-targets --features credsd-core/tpm -- -D warnings
+
+      # Same blind spot again: `kkrs` is off in every shipped build, so without this step the
+      # retained backend would reach no linter. `credsd-core/kkrs` for the reason given above.
+      - name: clippy (kkrs)
+        if: matrix.platform == 'linux'
+        run: cargo clippy --all-targets --features credsd-core/kkrs -- -D warnings
+
+  # THIRD-PARTY-LICENSES.md must track Cargo.lock. Pinned so a cargo-about release cannot
+  # reformat the file and fail every PR. Reads `cargo metadata` only, so the tpm feature
+  # needs no tpm2-tss headers here.
+  attribution:
+    name: Third-party attribution
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-about@0.9.3
+
+      - name: regenerate and diff
+        run: |
+          cargo about generate --all-features --workspace --locked -o THIRD-PARTY-LICENSES.md about.hbs
+          git diff --exit-code THIRD-PARTY-LICENSES.md \
+            || { echo "::error::THIRD-PARTY-LICENSES.md is stale; run: cargo about generate --all-features --workspace --locked -o THIRD-PARTY-LICENSES.md about.hbs"; exit 1; }
+
+  build:
+    name: Build & Test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/build.yml
+
+  # Coverage runs on one row, not the build matrix. Nothing in src/ branches on
+  # distro or libc — the only gates are cfg(unix), cfg(target_os), and one
+  # cfg(any(linux, macos)) — so ubuntu-24.04 and the AL2/AL2023 rows instrument
+  # an identical set of lines. The matrix exists to prove the glibc floor and the
+  # platform backends still build and pass, which is a different question from
+  # which lines the tests reach.
+  #
+  # Separate from `lint` because instrumented builds cannot share its cargo
+  # cache: coverage sets its own RUSTFLAGS, so every object is rebuilt.
+  coverage:
+    name: Coverage
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      # llvm-tools-preview comes from rust-toolchain.toml's components, so there is
+      # no install step here — the pin is what makes the command work identically
+      # for developers and for CI.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-coverage-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-coverage-cargo-
+
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-llvm-cov
+
+      # Instrument and run once, then render both reports from the same profile
+      # data. Two plain `cargo llvm-cov` invocations would re-run the whole suite.
+      - name: test (instrumented)
+        run: cargo llvm-cov --locked --no-report
+
+      # Region coverage is the number to read, not line coverage: it counts match
+      # arms and `?` early-returns separately, which is where this codebase's
+      # classification logic lives.
+      - name: coverage summary
+        run: cargo llvm-cov report --summary-only
+
+      # `--lcov` has no default output location, unlike `--html`, which already writes
+      # under target/. Pointing it there too keeps the tree clean with no .gitignore
+      # entry of its own.
+      - name: coverage report (lcov)
+        run: cargo llvm-cov report --lcov --output-path target/lcov.info
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: target/lcov.info
+          if-no-files-found: error

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the credsd DAEMON only (Credsd.app). The client (creds) is
+  unentitled and is signed as a bare Mach-O.
+
+  Only keychain-access-groups belongs here. The entitlements a provisioning
+  profile already authorizes (application-identifier, team-identifier, etc.) must
+  NOT be duplicated here — the profile is the authoritative source for those.
+
+  The group is <TeamID>.<AppID> = 94KV3E626L.com.amazon.aws.credsd.daemon, written
+  as a LITERAL rather than $(AppIdentifierPrefix)com.amazon.aws.credsd.daemon:
+  Xcode-style variables are not expanded here, and an un-expanded variable
+  produces an invalid entitlement.
+-->
+<plist version="1.0">
+<dict>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>94KV3E626L.com.amazon.aws.credsd.daemon</string>
+    </array>
+</dict>
+</plist>

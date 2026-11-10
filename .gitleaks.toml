@@ -1,0 +1,37 @@
+# gitleaks configuration for credsd.
+#
+# Keeps the full default ruleset and adds a narrow allowlist for known-fake test
+# credentials and untracked build output. Scoped as tightly as the fixtures
+# require so a real secret dropped into test code is still caught.
+#
+# Scan modes:
+#   gitleaks git --log-opts="--all"   # history-wide, the release-gate scan
+#   gitleaks dir .                     # working tree incl. gitignored target/
+# The path allowlist below only matters for `dir` mode; `git` mode never sees
+# untracked files.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-fake test credentials and untracked build artifacts"
+
+# AWS's published example keys (AWS docs / SDK samples). Used in unit tests in
+# crates/credsd-core/src/{credentials,import}.rs and
+# crates/credsd-daemon/src/server/{mod,uds}.rs. Every such literal contains
+# EXAMPLE; matching on that substring avoids masking a real AKIA... that lacks it,
+# so a new fixture must spell EXAMPLE rather than invent a plausible-looking key.
+stopwords = ["EXAMPLE"]
+
+# Compiled Rust output is gitignored and never published. rustls bundles test
+# certificates that land in build metadata (*.rmeta) and trip the private-key
+# rule. Only relevant to `gitleaks dir`; anchored to build dirs, not source.
+paths = [
+  '''target/''',
+  # Throwaway test keypairs belonging to the vendored rolesanywhere-core crate's
+  # own test suite. Locally generated with OpenSSL, tied to no account, trust
+  # anchor, or identity — see vendor/rolesanywhere/tst/certs/README.md for the
+  # generation recipe. They are known-answer-test vectors, so the crate's tests
+  # need these exact bytes on disk to run.
+  '''vendor/rolesanywhere/tst/certs/''',
+]

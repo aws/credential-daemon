@@ -1,0 +1,306 @@
+name: Build
+
+# Reusable build+test matrix. Called by ci.yml (PRs) and release.yml (main/dispatch)
+# so the platform matrix lives in exactly one place.
+
+on:
+  workflow_call:
+    inputs:
+      upload-artifacts:
+        description: 'Upload built binaries as workflow artifacts (needed by callers that publish)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `features` is what the published binary is built with, where a row needs one. The
+          # macOS row needs the opposite — see the macOS build step, which drops the daemon's
+          # default `secure-enclave`. `file` is compiled and tested on this row but never
+          # built into target/release.
+          - os: macos-latest        # Apple Silicon (M-series)
+            platform: macos-aarch64
+
+          - os: ubuntu-24.04
+            platform: ubuntu-x64
+
+          - os: ubuntu-24.04-arm
+            platform: ubuntu-aarch64
+
+          - os: ubuntu-24.04
+            platform: al2023-x64
+            container: amazonlinux:2023
+            bootstrap: dnf install -y --quiet tar git gcc
+
+          - os: ubuntu-24.04-arm
+            platform: al2023-aarch64
+            container: amazonlinux:2023
+            bootstrap: dnf install -y --quiet tar git gcc
+
+          # The `-tpm` rows ship a second artifact per distro and arch, with `credsd` linked
+          # against the system tpm2-tss libraries. They cannot replace the default rows: a
+          # binary that links tpm2-tss does not start on a host without it. See
+          # docs/design/tpm-linux-artifact.md. Container rows run as root; runner rows need
+          # sudo for the same install.
+          - os: ubuntu-24.04
+            platform: ubuntu-x64-tpm
+            bootstrap: sudo apt-get update -qq && sudo apt-get install -y -qq libtss2-dev
+            tpm: true
+
+          - os: ubuntu-24.04-arm
+            platform: ubuntu-aarch64-tpm
+            bootstrap: sudo apt-get update -qq && sudo apt-get install -y -qq libtss2-dev
+            tpm: true
+
+          - os: ubuntu-24.04
+            platform: al2023-x64-tpm
+            container: amazonlinux:2023
+            bootstrap: dnf install -y --quiet tar git gcc tpm2-tss-devel
+            tpm: true
+
+          - os: ubuntu-24.04-arm
+            platform: al2023-aarch64-tpm
+            container: amazonlinux:2023
+            bootstrap: dnf install -y --quiet tar git gcc tpm2-tss-devel
+            tpm: true
+
+          # AL2 remains in use on legacy hosts and sets the oldest glibc (2.26)
+          # credsd must run against. AL2 ships cmake 2.8, which aws-lc-sys/ring
+          # reject; cmake3 (3.17) is in amzn2-core but installs as `cmake3`,
+          # hence the symlink. gcc 7.3.1 is sufficient.
+          #
+          # `image` rather than `container`: these rows run the job on the host
+          # and invoke docker themselves. See the "build and test (image)" step.
+          - os: ubuntu-24.04
+            platform: al2-x64
+            image: amazonlinux:2
+            bootstrap: yum install -y -q tar gzip git gcc cmake3 && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+
+          - os: ubuntu-24.04-arm
+            platform: al2-aarch64
+            image: amazonlinux:2
+            bootstrap: yum install -y -q tar gzip git gcc cmake3 && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+
+    steps:
+      - name: install prerequisites
+        if: matrix.bootstrap && !matrix.image
+        run: ${{ matrix.bootstrap }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Container images have no preinstalled Rust. `--default-toolchain none`
+      # avoids downloading `stable` only to have rust-toolchain.toml's pin
+      # override it on the first in-repo cargo call.
+      - name: install rust toolchain
+        if: matrix.container
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-toolchain none
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # Skipped for `image` rows: the cargo home being populated lives inside the
+      # container, not in the host paths this would save.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !matrix.image }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-cargo-
+
+      - name: build
+        if: ${{ !matrix.image && !matrix.tpm && !startsWith(matrix.os, 'macos') }}
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo build --release --locked ${FEATURES:+--features "$FEATURES"}
+
+      # Two invocations for the same reason the tpm row needs them, with the opt-out on the
+      # other side. The published daemon drops `secure-enclave`: this artifact's supported
+      # path is `credsd install --user`, whose keystore is the data protection keychain the
+      # bundle's provisioning profile authorizes, and a LaunchDaemon can never reach that
+      # keychain — so compiling the enclave in would make `sudo credsd install` resolve a
+      # backend and look supported. The client keeps the feature, which is what signs a
+      # presence challenge with Touch ID.
+      - name: build (macos)
+        if: ${{ !matrix.image && !matrix.tpm && startsWith(matrix.os, 'macos') }}
+        run: |
+          cargo build --release --locked -p credsd-daemon --no-default-features
+          cargo build --release --locked -p creds
+
+      - name: test
+        if: ${{ !matrix.image && !matrix.tpm }}
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --locked ${FEATURES:+--features "$FEATURES"}
+
+      # Two invocations, not one. `creds` depends on `credsd-core` directly, so a single
+      # workspace build with the feature on resolves one `credsd-core` for every member and
+      # hands the client the tpm-linked rlib. Separate invocations give the two binaries two
+      # feature resolutions; the second rebuilds `credsd-core` without the feature and leaves
+      # the first invocation's `credsd` in place, so both binaries survive in target/release.
+      - name: build and test (tpm)
+        if: matrix.tpm
+        run: |
+          cargo build --release --locked -p credsd-daemon --features tpm
+          cargo build --release --locked -p creds
+          cargo test --locked -p credsd-core --features tpm
+
+      # The macOS `test` step already covers `secure-enclave`, which is in the default set: the
+      # shim links, the build script runs, and the feature-gated code passes against the fake
+      # seam. Nothing there asserts anything about the enclave itself — `hardware_round_trip`
+      # stays `#[ignore]`d because these runners are virtualized and expose none. The published
+      # daemon is the one build that drops it.
+      #
+      # This step adds `file`, which the published macOS binary omits, so its macOS paths are
+      # compiled and tested somewhere. Test only, never `build --release`: a release build here
+      # would overwrite target/release with a binary that ships `file`. A step rather than a
+      # matrix row because macOS minutes bill at 10x. `startsWith` so a second macOS row is
+      # covered without editing this condition.
+      - name: test (secure-enclave, file)
+        if: startsWith(matrix.os, 'macos')
+        run: cargo test --locked --features secure-enclave,file
+
+      # `kkrs` is off in every shipped build; this keeps the retained backend compiled and
+      # tested. Test only, never `build --release`, for the same reason as the step above.
+      # Runner rows only: container rows run under a seccomp profile that can refuse the
+      # keyring syscalls the backend's tests make.
+      - name: test (kkrs)
+        if: ${{ !matrix.image && !matrix.tpm && !matrix.container && startsWith(matrix.os, 'ubuntu') }}
+        run: cargo test --locked -p credsd-core --features kkrs
+
+      # AL2 cannot host the workflow's JS actions: the runner forces them onto
+      # Node 24, which needs glibc 2.28, and AL2 has 2.26 — the very floor this
+      # row exists to verify. So the host runs the actions and docker runs only
+      # cargo, still against a real AL2 userland.
+      #
+      # The container runs as root because `yum` needs to write the RPM db, so
+      # target/ comes back root-owned; chown it so later host steps (artifact
+      # upload, cleanup) can read and remove it.
+      - name: build and test (${{ matrix.image }})
+        if: matrix.image
+        run: |
+          docker run --rm -v "$PWD":/w -w /w -e CARGO_TERM_COLOR=always \
+            ${{ matrix.image }} sh -euc '
+              ${{ matrix.bootstrap }}
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --no-modify-path --default-toolchain none
+              . "$HOME/.cargo/env"
+              cargo build --release --locked
+              cargo test --locked
+            '
+          sudo chown -R "$(id -u):$(id -g)" target
+
+      # Read off the binary rather than inferred from the build command, like the tpm linkage
+      # check below. The macOS list is exact: an extra backend in the official build is the
+      # regression this exists to catch. Linux must always carry `file`, the only backend with
+      # no hardware prerequisite.
+      - name: assert storage backends
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          line="$(target/release/credsd --version | grep '^storage backends: ')"
+          fail() { echo "::error::$PLATFORM: $1 (got '$line')"; exit 1; }
+          case "$RUNNER_OS" in
+            macOS)
+              [ "$line" = "storage backends: data-protection-keychain" ] \
+                || fail "macOS build must ship exactly data-protection-keychain"
+              ;;
+            Linux)
+              grep -qw file <<<"$line" || fail "Linux build must ship the file backend"
+              ;;
+          esac
+
+      # `if-no-files-found: error` cannot catch a *partial* set: it fires only when nothing
+      # matches, so an artifact holding the daemon and no client still uploads green. That is
+      # exactly how a release shipped `credsd` alone. Assert each binary by name instead.
+      - name: verify release binaries
+        if: inputs.upload-artifacts
+        run: |
+          for binary in credsd creds; do
+            test -x "target/release/$binary" \
+              || { echo "::error::target/release/$binary is missing"; exit 1; }
+          done
+
+      # The claim the `-tpm` artifacts exist to make, read off the binary rather than inferred
+      # from the build command: whether an unused `libtss2` survives into a link depends on
+      # --as-needed and dead-object elimination, which vary by toolchain and distro. `creds` is
+      # checked on every row because it must never link tpm2-tss, whatever the row built.
+      # Linux-gated because macOS has no `ldd`, but NOT gated on upload-artifacts: every Linux
+      # row has both binaries built by here, and a pull request is where a leaked link should
+      # be caught rather than on the push that would publish it.
+      - name: assert tpm2-tss linkage
+        if: runner.os == 'Linux'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TPM: ${{ matrix.tpm }}
+        run: |
+          set -euo pipefail
+          # Via a variable, so `ldd` failing aborts the step: grepping the empty output of a
+          # failed `ldd` would read as "links nothing" and pass three of these four checks.
+          credsd_libs="$(ldd target/release/credsd)"
+          creds_libs="$(ldd target/release/creds)"
+          fail() { echo "::error::$PLATFORM: $1"; exit 1; }
+          if [ "$TPM" = "true" ]; then
+            grep -q libtss2-esys <<<"$credsd_libs" || fail "credsd does not link libtss2-esys"
+          elif grep -q libtss2 <<<"$credsd_libs"; then
+            fail "credsd links libtss2"
+          fi
+          if grep -q libtss2 <<<"$creds_libs"; then
+            fail "creds links libtss2"
+          fi
+
+      # Recorded here, on the machine that produced the binary, and in hex.
+      # macOS runners ship no `sha256sum` and the AL2/AL2023 containers ship no
+      # `shasum`, so take whichever the row has.
+      - name: record binary digests
+        if: inputs.upload-artifacts
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          hex() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
+          mkdir -p digests
+          printf '{"%s":{"creds":"%s","credsd":"%s"}}\n' \
+            "$PLATFORM" "$(hex target/release/creds)" "$(hex target/release/credsd)" \
+            > "digests/$PLATFORM.json"
+          cat "digests/$PLATFORM.json"
+
+      # Matrix job outputs cannot be aggregated across legs in Actions, so each leg's
+      # digests travel to the manifest job as their own small artifact.
+      - name: upload digests
+        if: inputs.upload-artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.platform }}
+          path: digests/${{ matrix.platform }}.json
+          if-no-files-found: error
+
+      # Both binaries: `credsd` is the daemon, `creds` the client every user-facing command runs
+      # through. Shipping either alone ships nothing usable. release.yml uploads whatever each
+      # artifact contains, so it needs no matching change.
+      - name: upload artifact
+        if: inputs.upload-artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: |
+            target/release/credsd
+            target/release/creds
+          if-no-files-found: error

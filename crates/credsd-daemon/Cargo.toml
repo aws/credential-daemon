@@ -1,0 +1,60 @@
+[package]
+name = "credsd-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "AWS credential daemon — the UDS credential server"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "credsd"
+path = "src/main.rs"
+
+[dependencies]
+credsd-core = { path = "../credsd-core", default-features = false }
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+base64 = "0.23"
+chrono = { version = "0.4", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["socket", "process", "resource", "user"] }
+
+# systemd socket activation (LISTEN_FDS). launchd activation uses a raw libSystem FFI via
+# nix::libc, so it needs no extra dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+listenfd = "1"
+
+[features]
+# On, so a plain `cargo build` yields a daemon that can run the system service: the enclave is
+# the only hardware-backed keystore reachable from a LaunchDaemon, and a build from source has
+# no Apple signing identity, so it can never reach the data protection keychain. The signed
+# release builds this crate `--no-default-features` — it ships the keychain and a user-scoped
+# service, and compiling the enclave in would make `sudo credsd install` look supported.
+default = ["secure-enclave"]
+# Passthrough to `credsd-core`'s feature of the same name: links the Swift Secure Enclave
+# shim. See `crates/credsd-core/Cargo.toml`.
+secure-enclave = ["credsd-core/secure-enclave"]
+# Passthrough to `credsd-core`'s feature of the same name: links the system tpm2-tss C
+# libraries. Off by default; see `crates/credsd-core/Cargo.toml`.
+tpm = ["credsd-core/tpm"]
+# Passthrough to `credsd-core`'s feature of the same name: the `file` backend on macOS. Off by
+# default and absent from the official build; see `crates/credsd-core/Cargo.toml`.
+file = ["credsd-core/file"]
+# Passthrough to `credsd-core`'s feature of the same name: the JWT bearer grant. Off by default.
+jwt-bearer = ["credsd-core/jwt-bearer"]
+# Passthrough to `credsd-core`'s feature of the same name: the Linux kernel-keyring backend. Off
+# by default and absent from every shipped build; see `crates/credsd-core/Cargo.toml`.
+kkrs = ["credsd-core/kkrs"]
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+async-trait = "0.1"
+
+[lints]
+workspace = true
