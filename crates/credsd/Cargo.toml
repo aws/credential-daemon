@@ -1,0 +1,46 @@
+[package]
+name = "creds"
+version = "0.1.0"
+edition = "2021"
+description = "AWS credential daemon — the unprivileged client CLI"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "creds"
+path = "src/main.rs"
+
+[dependencies]
+credsd-core = { path = "../credsd-core", default-features = false }
+# UDS client library — all socket operations go through here. credsd-core is kept
+# for non-UDS internals (logging, config keys); that dep can drop once those have their own crate.
+credsd-client = { path = "../credsd-client" }
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64 = "0.23"
+rolesanywhere-core = { path = "../../vendor/rolesanywhere/crates/core" }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# On, and it stays on in the signed release: this is what signs a presence challenge with
+# Touch ID. Only the daemon builds `--no-default-features`, to drop the enclave *backend*.
+default = ["secure-enclave"]
+# Passthrough to `credsd-core`'s feature of the same name: links the Swift Secure Enclave
+# shim. See `crates/credsd-core/Cargo.toml`.
+secure-enclave = ["credsd-core/secure-enclave"]
+# Passthrough to `credsd-core`'s feature of the same name: the `jwt-bearer` bootstrap subcommand.
+# Off by default.
+jwt-bearer = ["credsd-core/jwt-bearer"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["fs"] }

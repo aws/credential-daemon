@@ -1,0 +1,28 @@
+[package]
+name = "credsd-client"
+version = "0.1.0"
+edition = "2021"
+description = "Public client library for the AWS credential daemon"
+license = "Apache-2.0"
+publish = false
+
+[features]
+# Feature-gate the blocking wrapper: a current-thread tokio runtime wraps every
+# async call. Do NOT enable if your code already runs inside a tokio runtime —
+# constructing a runtime inside another panics. See `blocking::Client`.
+blocking = ["tokio/rt"]
+
+[dependencies]
+credsd-core = { path = "../credsd-core", default-features = false }
+tokio = { version = "1", features = ["net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

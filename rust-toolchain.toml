@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.95.0"
+# llvm-tools-preview supplies the profdata tooling `cargo llvm-cov` needs. It is here
+# rather than in a CI step so `cargo llvm-cov` works for every developer after a plain
+# checkout; the subcommand itself still needs `cargo install cargo-llvm-cov`.
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

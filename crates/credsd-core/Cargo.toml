@@ -1,0 +1,101 @@
+[package]
+name = "credsd-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared internals for the AWS credential daemon (axum-free)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "credsd_core"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+toml_edit = { version = "0.25", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.23"
+zeroize = { version = "1", features = ["derive"] }
+rpassword = "7"
+async-trait = "0.1"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+aws-sdk-sso = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssooidc = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-lc-rs = "1"
+# Local crate implementing the IAM Roles Anywhere CreateSession signing pipeline, vendored
+# under vendor/rolesanywhere/. Kept as a path dependency so it can later be swapped for a
+# published crate with a one-line change here. Imported as `rolesanywhere_core`.
+rolesanywhere-core = { path = "../../vendor/rolesanywhere/crates/core" }
+x509-cert = "0.2"
+tempfile = "3"
+
+[features]
+# No `default` here, on purpose: this crate is a dependency of every binary, so a `default`
+# resolves one way when it is in the build selection and another when it is reached only
+# through dependents that set `default-features = false`. Both sets activate the same code but
+# are different `-C metadata` inputs, so `cargo build -p creds` and a workspace build emit
+# different bytes for the same program. The binaries carry the defaults instead.
+
+# Compiles the tss-esapi-backed TPM seal/unseal seam. Off by default because it
+# links the system tpm2-tss C libraries (build-time headers + pkg-config) and is
+# only usable on a Linux host with a TPM 2.0 device. All TPM *logic* (policy,
+# sidecar, recovery, backend wiring) builds and is unit-tested without it.
+tpm = ["dep:tss-esapi"]
+
+# Compiles and links the Swift Secure Enclave shim (`swift/SecureEnclaveShim.swift`). In the
+# default set of `credsd-daemon` and `credsd`, not of this crate; a no-op off macOS, where the
+# backend is not compiled either way. All Secure Enclave *logic* (file layout, get-or-create,
+# recovery, backend wiring) builds and is unit-tested without it, against a fake seam, which is
+# what `--no-default-features` leaves.
+secure-enclave = []
+
+# Compiles the `file` storage backend on macOS, where it is off by default: a Mac with a Secure
+# Enclave has a hardware-bound backend for every install scope, so the official build omits it.
+# For Macs without one (VMs, pre-T2 Intel). No effect elsewhere: Linux and Windows always
+# compile `file`, since they have no guarantee of hardware-backed storage.
+file = []
+
+# Compiles the OAuth 2.0 JWT bearer grant (RFC 7523) provider and its bootstrap. Off by default:
+# the grant is opt-in, so a build without it carries none of its seal/replay path. Stored
+# jwt-bearer credentials still parse without it and are skipped with a warning at load.
+jwt-bearer = []
+
+# Compiles the Linux kernel-keyring (`kkrs`) storage backend. Off in every shipped build until
+# the re-enabling conditions in `docs/specs/kkrs-encryption-backend/requirements.md` are met; the
+# code stays in the tree and CI builds and tests it with this feature.
+kkrs = ["dep:linux-keyutils"]
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["socket", "process", "resource", "signal", "user"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { version = "7", optional = true }
+# Pure-Rust bindings to the Linux kernel key-retention service (no libkeyutils C
+# dependency). Backs the `kkrs` storage backend, so optional behind the `kkrs` feature. `std`
+# feature so KeyError is a std::error::Error and the crate uses std collections.
+linux-keyutils = { version = "0.2.5", features = ["std"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+wiremock = "0.6"
+mockito = "1"
+
+[lints]
+workspace = true

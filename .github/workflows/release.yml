@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to build'
+        default: 'main'
+
+permissions:
+  contents: read
+
+env:
+  # Only this repository feeds the release path. Anywhere else this workflow runs,
+  # it writes a staging prefix that no release or integration consumer reads.
+  BUILD_PREFIX: ${{ github.repository == 'aws/credential-daemon' && 'builds' || 'staging-builds' }}
+
+jobs:
+  build:
+    name: Build & Test
+    # Artifacts are only needed when we publish (push to main). Manual dispatches
+    # build+test to prove the tree is releasable but publish nothing.
+    uses: ./.github/workflows/build.yml
+    with:
+      upload-artifacts: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+  upload:
+    name: Upload to S3
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts/
+          pattern: binaries-*
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      # push-to-main builds are unsigned continuous dev artifacts. The per-commit
+      # prefix is immutable, and is both the release path's input and what the
+      # integration lanes read.
+      #
+      # UPLOAD-ORDER INVARIANT — creds is written FIRST and credsd LAST within a
+      # platform. One EventBridge rule per platform fires internal integration tests on
+      # the arrival of builds/*/<platform>/credsd, and the lane downloads both
+      # binaries with no existence guard, so the daemon's arrival has to imply the
+      # client is already there. Do not reorder these, and do not parallelize them.
+      - name: Upload binaries to S3
+        env:
+          BUCKET: ${{ secrets.S3_ARTIFACTS_BUCKET }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          put() {
+            aws s3 cp "$1" "s3://$BUCKET/$2" --metadata "git-sha=$COMMIT,git-ref=$REF"
+          }
+          for dir in artifacts/binaries-*/; do
+            platform=$(basename "$dir")
+            platform=${platform#binaries-}
+            for binary in creds credsd; do
+              test -f "$dir/$binary" \
+                || { echo "::error::$dir$binary is missing"; exit 1; }
+            done
+            put "$dir/creds"  "$BUILD_PREFIX/$COMMIT/$platform/creds"
+            put "$dir/credsd" "$BUILD_PREFIX/$COMMIT/$platform/credsd"
+          done
+
+      # develop/<platform>/ is the preview-consumer prefix: mutable, not commit
+      # scoped, and no EventBridge rule keys on it. Temporary — it retires with its
+      # access points after the first signed release, when this step is deleted.
+      - name: Upload binaries to the preview prefix
+        if: github.repository == 'aws/credential-daemon'
+        env:
+          BUCKET: ${{ secrets.S3_ARTIFACTS_BUCKET }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for dir in artifacts/binaries-*/; do
+            platform=$(basename "$dir")
+            platform=${platform#binaries-}
+            for binary in creds credsd; do
+              aws s3 cp "$dir/$binary" "s3://$BUCKET/develop/$platform/$binary" \
+                --metadata "git-sha=$COMMIT,git-ref=$REF"
+            done
+          done
+
+  manifest:
+    name: Manifest
+    # `needs: build` is every matrix leg — the reusable workflow's job stays
+    # incomplete until all of them finish, so a red platform yields no manifest.
+    # `needs: upload` because the manifest asserts what is under the prefix, and a
+    # manifest naming bytes that never landed would read downstream as a verified
+    # set rather than as an error.
+    needs: [build, upload]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # Checkout first since it cleans the working directory
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # merge-multiple: each leg's blob is a single uniquely named
+      # <platform>.json, so they can land flat in one directory.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: digests/
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      # Create a zip of the packaging directory to be uploaded under the commit
+      # prefix so it can be used for building the .app bundle and .pkg
+      #
+      # The legal files ride along: they are what the .app bundle and the Linux
+      # archives have to ship, and this zip is the only commit-scoped materials
+      # object both stages already read. `git archive` fails on a pathspec that
+      # matches nothing, so a renamed or deleted file stops the release here.
+      - name: Zip packaging materials
+        run: |
+          set -euo pipefail
+          git archive --format=zip -o packaging.zip HEAD \
+            packaging LICENSE NOTICE THIRD-PARTY-LICENSES.md
+          digest=$(sha256sum packaging.zip | cut -d' ' -f1)
+          echo "PKG_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "packaging.zip sha256: $digest"
+
+      # { schemaVersion, commit, ref, createdAt, platforms: { <platform>: { creds,
+      # credsd } } }, digests hex. The release path's precondition step compares
+      # tested/<commit>/ against this file, and promotion verifies the Linux
+      # binaries against it. macOS is the exception: a code signature is embedded
+      # in the Mach-O, so the digest here is the unsigned build output and the
+      # shipped digest comes from after artifact signing. 
+      - name: Build manifest
+        run: |
+          set -euo pipefail
+          jq -s \
+            --arg commit "${{ github.sha }}" \
+            --arg ref "${{ github.ref_name }}" \
+            --arg pkgDigest "$PKG_DIGEST" \
+            '{schemaVersion: 1, commit: $commit, ref: $ref,
+              createdAt: (now | todate), platforms: add,
+              packaging: {"packaging.zip": $pkgDigest}}' \
+            digests/*.json > manifest.json
+          cat manifest.json
+
+      # A digest artifact lost between jobs would otherwise produce a short
+      # manifest that still validates. Compare the manifest's set of platform and
+      # binary pairs against what is actually under the prefix, before writing it.
+      - name: Cross-check the manifest against the prefix
+        env:
+          BUCKET: ${{ secrets.S3_ARTIFACTS_BUCKET }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          declared=$(jq -r '.platforms | to_entries[] | .key as $p
+                            | .value | keys[] | "\($p)/\(.)"' manifest.json | sort)
+          uploaded=$(aws s3 ls --recursive "s3://$BUCKET/$BUILD_PREFIX/$COMMIT/" \
+                     | awk '{print $4}' | sed "s|^$BUILD_PREFIX/$COMMIT/||" | sort)
+          if [ "$declared" != "$uploaded" ]; then
+            echo "::error::manifest does not match $BUILD_PREFIX/$COMMIT/"
+            diff <(echo "$declared") <(echo "$uploaded") || true
+            exit 1
+          fi
+
+      # Uploaded after the cross-check (which lists the whole prefix and compares
+      # against the platform/binary set) so it does not read as an unexpected key,
+      # and before the manifest, which stays the last object written.
+      - name: Upload packaging.zip to S3
+        env:
+          BUCKET: ${{ secrets.S3_ARTIFACTS_BUCKET }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          aws s3 cp packaging.zip "s3://$BUCKET/$BUILD_PREFIX/$COMMIT/packaging.zip" \
+            --content-type application/zip \
+            --metadata "git-sha=$COMMIT,git-ref=$REF"
+
+      - name: Upload manifest to S3
+        env:
+          BUCKET: ${{ secrets.S3_ARTIFACTS_BUCKET }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          aws s3 cp manifest.json "s3://$BUCKET/$BUILD_PREFIX/$COMMIT/manifest.json" \
+            --content-type application/json \
+            --metadata "git-sha=$COMMIT,git-ref=$REF"

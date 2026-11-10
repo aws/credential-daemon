@@ -1,0 +1,30 @@
+# Unanchored so it also covers crates outside the workspace — a detached crate builds
+# into its own `target/`, which a root-anchored `/target/` leaves tracked.
+target/
+/.kiro/
+
+# Maintainer-local working materials. Not part of the project.
+/private/
+/demo/
+
+# Prototypes. Outside the workspace, so they get neither the workspace clippy lints
+# nor a CI row — not shippable as-is.
+/spikes/
+
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Built .pkg artifacts, including signed ones.
+/packaging/dist/
+
+# Agent-specific config. Only the agent-neutral `AGENTS.md` and `.agents/` are
+# tracked; symlink or adapt them for your agent of choice (e.g.
+# `ln -s AGENTS.md CLAUDE.md`).
+/CLAUDE.md
+/.claude/
+/.cursor/
+/.cursorrules
+/.aider*
+/.github/copilot-instructions.md

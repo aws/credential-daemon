@@ -1,0 +1,49 @@
+This file holds the PGP public key(s) used to sign credsd release archives.
+
+Each release ships a detached signature file (.sig) for every archive and for
+SHA256SUMS. Verify with:
+
+  gpg --import KEYS
+  gpg --verify <archive>.sig <archive>
+
+On key rotation, the old public key is appended here (so prior releases remain
+verifiable) and the new key replaces the signing secret.
+
+------------------------------------------------------------------------
+Key 1
+  Fingerprint: 91AA 53FE 815B 7D0D C20D  1467 189A 6EBA E4B4 D2A4
+  Identity:    AWS Credential Daemon <aws-credential-daemon@amazon.com>
+  Algorithm:   RSA-4096
+  Created:     2026-10-09
+  Expires:     2030-10-08
+------------------------------------------------------------------------
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBGrJH2oBEADCwbGV0a0lkB7bwJZmXq7ZfBREtuMb18DRAwFe2eloh8UEdmFu
+p09nFSHu74G8j61QiTQIRsu3BrOXS6a59TIDS0XFyPLYwqLow6JFDz+wqz6XoX46
+pcMHXUoTnvIBI8K5IWq0wRqm+F3ndaZ1ofHzrIdggJPJyeG1sU9i6kAha215TOc+
+lq8uBHw8qSDCnjjEzlmG0na7IZVDJUnERijhPomjJV36YMEsi0w0cWPiOgCIFtsw
+n/amanSaH3WCz8WlJkwFjmqmdzqHUqM0V8MQ3OPuvLj9rtFkaQulIiMxxScoi85K
+jlbluSJVpe+m+irQ70yQAqW8mbDHI/xILbvru/NhF2KdWzZzgQokMce9pDcU5Nkl
+uV7zVZwD08wd/3Elc+ToSJYsnAsWlKffcKf2AohbIYjfV0TUsh9MM+rOZzfiHwvf
+YX7NZA4LIzzUbrbkJq2sVZLut7v6v7p9uPAJQyNFcEdP5aaWniB9VFGSJpweUynz
+bg25ck0jSqhouCDqEDwg/8jIrLkmkYSXkzqiDPLdeOHjuzsliVUfdyYBxE2+spX1
+LkPWy8sJXZf5g/4jzIKmLXCBpeI3fFTQWn+48oL2GUT/88lWSELI8FKfF5HpuJig
+jTqbeHfLRH/H0UqUdn/d+svjQgqNeh2AE9kF5oP26NFX87KO4DM0CMe55wARAQAB
+tDhBV1MgQ3JlZGVudGlhbCBEYWVtb24gPGF3cy1jcmVkZW50aWFsLWRhZW1vbkBh
+bWF6b24uY29tPokCcwQTAQgAXRYhBJGqU/6BW30Nwg0UZxiabrrktNKkBQJqyR9q
+GxSAAAAAAAQADm1hbnUyLDIuNSsxLjEyLDAsMwIbAwUJB4TOAAULCQgHAgIiAgYV
+CgkICwIEFgIDAQIeBwIXgAAKCRAYmm665LTSpNXGD/9AgV4Uo3eEbBU41cQf0e8B
+k7mG4Ze6BlqCDOTIsHH1BUPpdsAT088+U8gn5rYsELReMD9ogfP/nDUlSEcGZG3l
+PReuMwflKLhyOmWCDKDQ3rUdIOkWWMOQrL6YRZM7luWzfPXHXH3ffX2zdyXVVpuQ
+2rCbc3q4TPXmJPYViaOfhytY4lmwUgk94i9n67xE9y9hMxk68o5pENOnsmzt+PCV
+zS0rpowg+x2q0vCUQVMGaDPKrRs1n+bGne6h11wfSyLZKFoQTPoaM492P9SXXBgz
+Qyv/0dcLSF3NNXRIWsp/x+cLCLjKzPgQ8HMeBv517ZIwntjF0hVw1fu1gNV8PzFl
+Zd4E9l4igmFDECycdI4FxkdQhPMUcHzucGRjFcmLACa/7aL0BWuGsRh1KAp3gdl1
+a/MjoChwKaAyczVR+8ii9D0VYXEgSPlWkQYnpWdmpiOh7qV9jth3RaoVfpaWx6vU
+cJ8nqA1cJQGwlSh5KncnsptroK7Wg0FExSztWxa72hWJXLFA2xsrlVRNiZOuuosf
+BUmQQh6sZ3GFAdnSa9qN39EMPOMXILEJ6VWiw8QkWbTl5XpdGAbknK/UMui5GR8E
+KFjhfJl8VbfC1dgkX/urGiRO2c9O2S12/lLZLDuAP3j9G8DFPofztc/iCmBc39xY
+feurlPhI6Vi9YskmgPW1uA==
+=Rrae
+-----END PGP PUBLIC KEY BLOCK-----

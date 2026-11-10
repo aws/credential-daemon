@@ -1,0 +1,12 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This product includes software developed by Amazon.com, Inc. or its affiliates:
+
+  The Rust IAM Roles Anywhere credential-helper core — a pre-release copy, vendored
+  into the credsd source tree at vendor/rolesanywhere/crates/core. It ships in the
+  credsd binaries under the same Apache-2.0 terms as credsd itself, in the LICENSE
+  file beside this one. Being a path dependency rather than a registry crate, it is
+  not listed in THIRD-PARTY-LICENSES.md.
+
+Third-party dependency licences are listed in THIRD-PARTY-LICENSES.md, generated
+from the dependency graph by `cargo about`.

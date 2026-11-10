@@ -1,0 +1,213 @@
+#!/bin/bash
+# PATH access for the installed bundle, then registration of the user-scoped service.
+#
+# One mechanism either way: symlink both commands into a bin directory. Which directory
+# follows from whether this runs as root, which follows from the install destination.
+#
+# $2 is the install destination — the only argument that differs between the two.
+# Bundle integrity failure is fatal (Req 5.12); PATH and registration failures are not.
+set -uo pipefail
+
+DEST="${2:?missing install destination}"
+BUNDLE="$DEST/Credsd.app"
+DAEMON="$BUNDLE/Contents/MacOS/credsd"
+CLIENT="$BUNDLE/Contents/Resources/creds"
+MARKER="# Added by credsd"
+
+note() { printf 'credsd postinstall: %s\n' "$*"; }
+
+# Remove any symlinks this installer owns so a failed integrity check does not leave
+# existing PATH entries pointing into a bundle that just failed verification.
+remove_owned_links() {
+    for bin_dir in /usr/local/bin "$HOME/.local/bin"; do
+        for name in credsd creds; do
+            local link="$bin_dir/$name"
+            [ -L "$link" ] || continue
+            case "$(readlink "$link" 2>/dev/null)" in
+                */Credsd.app/Contents/MacOS/credsd | */Credsd.app/Contents/Resources/creds)
+                    rm -f "$link" ;;
+            esac
+        done
+    done
+}
+
+# Emit the error, remove owned links, and exit. Installer.app shows only "The installation
+# failed"; the full message is in /var/log/install.log.
+fail() {
+    note "$*"
+    note "details are in /var/log/install.log"
+    remove_owned_links
+    exit 1
+}
+
+# Before relinking, confirm the bundle, its intermediate directories, and its executables
+# are all root-owned and not group- or other-writable. This closes the install-time window
+# where a non-root admin could plant a foreign bundle in the install destination before this
+# pkg ran; a non-root account cannot create root-owned files, so the check holds at the
+# moment it runs. It does not protect against post-install replacement — an admin-group
+# account can write /Applications at any time after a genuine install (Req 6.6). Only
+# meaningful for root installs; home-directory installs are user-owned by construction.
+# On failure: exit non-zero so the installer reports failure (Req 5.12). Linking a suspect
+# bundle into PATH is worse than a failed install — the user expects a working install, not
+# a silent partial one.
+verify_bundle() {
+    [ "$(id -u)" -eq 0 ] || return 0
+
+    local bundle="$1"
+    local bundle_uid; bundle_uid="$(stat -f '%u' "$bundle")"
+    if [ "$bundle_uid" != "0" ]; then
+        fail "bundle owner uid $bundle_uid is not root — aborting: $bundle"
+    fi
+
+    # Intermediate directories: a non-root owner on Contents or Contents/MacOS lets an
+    # admin rename the executable out and drop in a replacement after this check passes.
+    for dir in "$bundle/Contents" "$bundle/Contents/MacOS" "$bundle/Contents/Resources"; do
+        if [ ! -d "$dir" ]; then
+            fail "bundle is missing directory $(basename "$dir") — aborting"
+        fi
+        local uid; uid="$(stat -f '%u' "$dir")"
+        if [ "$uid" != "0" ]; then
+            fail "$(basename "$dir") directory owner uid $uid is not root — aborting"
+        fi
+        local mode; mode="$(stat -f '%p' "$dir")"
+        if (( (0$mode & 0022) != 0 )); then
+            fail "$(basename "$dir") directory is group- or other-writable — aborting"
+        fi
+    done
+
+    for inner in "$bundle/Contents/MacOS/credsd" "$bundle/Contents/Resources/creds"; do
+        if [ ! -f "$inner" ]; then
+            fail "bundle is missing $(basename "$inner") — aborting"
+        fi
+        local uid; uid="$(stat -f '%u' "$inner")"
+        if [ "$uid" != "0" ]; then
+            fail "$(basename "$inner") owner uid $uid is not root — aborting"
+        fi
+        local mode; mode="$(stat -f '%p' "$inner")"
+        if (( (0$mode & 0022) != 0 )); then
+            fail "$(basename "$inner") is group- or other-writable — aborting"
+        fi
+    done
+}
+
+verify_bundle "$BUNDLE"
+
+# Best effort: this script's PATH is not the customer's login-shell PATH.
+report_shadow() {
+    resolved="$(command -v "$1" 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ "$resolved" != "$2" ]; then
+        note "PATH resolves $1 to $resolved, which shadows $2"
+    fi
+}
+
+# Replace only a link this installer owns. An entry of the same name pointing elsewhere
+# belongs to another product, and taking the name over silently would break it.
+link_into() {
+    dir="$1"
+    name="$2"
+    target="$3"
+    link="$dir/$name"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        case "$(readlink "$link" 2>/dev/null || true)" in
+            */Credsd.app/Contents/MacOS/credsd | */Credsd.app/Contents/Resources/creds) ;;
+            *)
+                note "left $link alone: not a credsd link"
+                return 0
+                ;;
+        esac
+    fi
+    if ln -sfn "$target" "$link"; then
+        report_shadow "$name" "$link"
+    else
+        note "could not create $link; invoke $target directly"
+    fi
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+    BIN_DIR=/usr/local/bin
+else
+    # /usr/local/bin is root-owned and a private install must not require root.
+    BIN_DIR="$HOME/.local/bin"
+fi
+
+mkdir -p "$BIN_DIR"
+if [ ! -d "$BIN_DIR" ]; then
+    note "could not create $BIN_DIR; invoke $DAEMON and $CLIENT directly"
+    exit 0
+fi
+
+link_into "$BIN_DIR" credsd "$DAEMON"
+link_into "$BIN_DIR" creds "$CLIENT"
+
+# /usr/local/bin is on the default PATH; ~/.local/bin is not, so a private install may also
+# need a PATH entry. Skipped when this script's PATH already has it or a startup file already
+# adds it, so repeated installs cannot stack duplicates.
+ensure_path_entry() {
+    [ "$(id -u)" -eq 0 ] && return 0
+
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+    esac
+    if grep -qsF '.local/bin' "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.zshenv" \
+           "$HOME/.bash_profile" "$HOME/.profile"; then
+        return 0
+    fi
+
+    # The user record is authoritative; $SHELL is whatever this script happened to inherit. The
+    # argument is a directory-service record path, which is not the home directory even where
+    # the two happen to coincide.
+    login_shell="$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')"
+    case "$login_shell" in
+        # Empty means the lookup failed; zsh is the default for macOS 11 and later.
+        */zsh | '') rc="$HOME/.zprofile" ;;
+        */bash) rc="$HOME/.bash_profile" ;;
+        *)
+            # fish and tcsh read neither file, and `export PATH=` is not their syntax.
+            note "login shell $login_shell is not supported; add $BIN_DIR to PATH by hand"
+            return 0
+            ;;
+    esac
+
+    if {
+        printf '\n%s\n' "$MARKER"
+        printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+    } >>"$rc"; then
+        note "added \$HOME/.local/bin to PATH in $rc; open a new terminal to pick it up"
+    else
+        note "could not update $rc; add $BIN_DIR to PATH by hand"
+    fi
+}
+
+register_user_service() {
+    if [ "$(id -u)" -ne 0 ]; then
+        "$DAEMON" install --user --skip-security-warning && return 0
+        note "could not register the user service; run 'credsd install --user' in a terminal"
+        return 0
+    fi
+
+    console_uid="$(stat -f '%u' /dev/console 2>/dev/null || true)"
+    console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+    # _mbsetupuser owns /dev/console for the whole of Setup Assistant, which is the window
+    # Automated Device Enrollment installs packages in. Registering for it would put the
+    # agent and the master key in an account that is about to stop existing.
+    case "$console_user" in
+        '' | root | loginwindow | _mbsetupuser) console_user="" ;;
+    esac
+    if [ -z "$console_user" ] || [ "$console_uid" = 0 ]; then
+        note "no console user; run 'credsd install --user' in a terminal to start the service"
+        return 0
+    fi
+
+    # asuser supplies the target uid's gui domain and login session: loading the agent needs the
+    # first, minting the keychain item needs the second, and root substitutes for neither.
+    # -H because `install --user` derives the data dir and socket path from $HOME.
+    if ! launchctl asuser "$console_uid" \
+            sudo -H -u "$console_user" -- "$DAEMON" install --user --skip-security-warning; then
+        note "could not register the user service for $console_user;" \
+             "run 'credsd install --user' in a terminal"
+    fi
+}
+
+ensure_path_entry
+register_user_service
+exit 0

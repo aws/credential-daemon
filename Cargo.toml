@@ -1,0 +1,99 @@
+[workspace]
+resolver = "2"
+members = ["crates/credsd-core", "crates/credsd-daemon", "crates/credsd", "crates/credsd-client"]
+# Vendored third-party crate: keep it a plain path dependency, not a workspace member, so
+# clippy's -D warnings does not lint upstream code we don't own (it lives under the workspace
+# root, which would otherwise pull it in).
+exclude = ["vendor"]
+
+# Never-crash policy, enforced by the compiler instead of by review. Each crate opts in
+# with `[lints] workspace = true`; test-only relaxations live in clippy.toml so no code
+# needs #[allow] boilerplate.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+exit = "deny"
+# Denied for every type, no clippy.toml exemptions: release builds have overflow-checks off,
+# so integer overflow wraps silently instead of panicking, and chrono's Add/Sub panic on
+# overflow in every profile.
+arithmetic_side_effects = "deny"
+
+# Ratchets: zero violations when added, so each one costs nothing today and refuses a class of
+# regression tomorrow. Grouped by what they protect rather than alphabetically, since the reason
+# is the only thing that justifies keeping a lint nobody currently trips.
+
+# Secret material. `mem::forget` on a Zeroize type skips the Drop that scrubs it, and a Drop impl
+# that zeroizes nothing is the same bug wearing the right clothes.
+mem_forget = "deny"
+empty_drop = "deny"
+mem_replace_with_uninit = "deny"
+
+# Path construction. `push`/`join` of an absolute component silently discards the base, which on
+# the per-uid `callers/<uid>/` tree means writing outside the caller's root.
+path_buf_push_overwrite = "deny"
+join_absolute_paths = "deny"
+# `&s[a..b]` panics mid-UTF-8-char; the byte offsets in a parser are not char boundaries.
+string_slice = "deny"
+
+# Process handling. `exec.rs` spawns children, and an unreaped one is a zombie; a space inside a
+# single `arg()` is one token to the kernel, not two.
+zombie_processes = "deny"
+suspicious_command_arg_space = "deny"
+
+# Filesystem checks used as security checks. `is_file()` is true for a symlink to a file, so it
+# cannot answer "is this the file I think it is".
+filetype_is_file = "deny"
+verbose_file_reads = "deny"
+
+# Panics reached through a function that promised a `Result` instead.
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+
+# `unsafe` hygiene. Real FFI unsafe exists in six files, so `forbid(unsafe_code)` is not available
+# workspace-wide; these make each block account for itself. AGENTS.md already requires the safety
+# comment — this compiles the rule.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+# Suppressions must explain themselves. Deliberately NOT `allow_attributes` (which would force
+# `#[expect]`): a `dead_code` suppression on a variant that tests construct is fulfilled under
+# `--all-targets` and unfulfilled without it, so no `#[expect]` can satisfy both builds. `#[expect]`
+# is still the better tool wherever the lint fires unconditionally — it turns a stale suppression
+# into an error — it just cannot be mandatory here.
+allow_attributes_without_reason = "deny"
+
+# Misc correctness.
+integer_division = "deny"
+float_cmp = "deny"
+lossy_float_literal = "deny"
+dbg_macro = "deny"
+
+# Library output hygiene. AGENTS.md: "do not write to stdout in library code".
+# Binary crates (credsd, credsd-daemon) suppress this at the file level with
+# #[allow(clippy::print_stdout, reason = "...")]
+print_stdout = "deny"
+
+# Wildcard imports hide what names are actually in scope and make diffs harder
+# to review. AGENTS.md already bans them by convention; this compiles the rule.
+wildcard_imports = "deny"
+
+# Explicit `return` in cfg-gated and early-exit branches aids readability.
+needless_return = "allow"
+
+[workspace.lints.rust]
+# An `unsafe fn` body is not an implicit `unsafe {}` block: each operation inside still has to be
+# marked, or the audit trail stops at the signature.
+unsafe_op_in_unsafe_fn = "deny"
+# Homoglyph identifiers — two distinct names that render identically in review.
+non_ascii_idents = "deny"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

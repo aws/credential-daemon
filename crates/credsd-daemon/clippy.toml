@@ -1,0 +1,9 @@
+# Clippy reads the nearest clippy.toml and does not merge it with the workspace one, so the
+# workspace settings are repeated here.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+disallowed-methods = [
+    { path = "credsd_core::config::snapshot::seal", reason = "seal a snapshot through integrity::Verified::seal_snapshot, which only the shared drift check (drift-detection Requirement 5.8) can produce" },
+]

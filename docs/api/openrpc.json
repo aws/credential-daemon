@@ -1,0 +1,2450 @@
+{
+  "openrpc": "1.3.2",
+  "info": {
+    "title": "credsd daemon API",
+    "version": "1.0.0",
+    "description": "JSON-RPC 2.0 over the daemon's Unix socket (carrier `uds`). Methods marked `stdio` are also exposed on the model-facing stdio carrier, which the daemon does not yet serve. Shapes only; behavior is in docs/specs/. See docs/specs/api-contract/.",
+    "x-prelaunch-waiver": true
+  },
+  "methods": [
+    {
+      "name": "config/get",
+      "summary": "Read an environment setting.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "key",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "config/set",
+      "summary": "Set an environment setting.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "key",
+          "schema": {
+            "type": "string",
+            "description": "A setting key such as `region` or `sdk.endpoint_url`."
+          },
+          "required": true
+        },
+        {
+          "name": "value",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "Gated: returns APPROVAL_REQUIRED; `request/approve` applies it.",
+      "x-gated": "ConfigSet"
+    },
+    {
+      "name": "config/unset",
+      "summary": "Remove an environment setting.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "key",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "Gated. Unsetting an absent key succeeds without a challenge.",
+      "x-gated": "ConfigUnset"
+    },
+    {
+      "name": "credential/get",
+      "summary": "Material for one credential.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "credential",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": false,
+          "description": "Absent means the environment's default credential. A credential the environment does not reach fails as ENVIRONMENT_NOT_FOUND."
+        },
+        {
+          "name": "scope",
+          "schema": {
+            "$ref": "#/components/schemas/Scope"
+          },
+          "required": false
+        },
+        {
+          "name": "claim",
+          "schema": {
+            "$ref": "#/components/schemas/Claim"
+          },
+          "required": false
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CredentialResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ReauthRequired"
+        },
+        {
+          "$ref": "#/components/errors/WrongCredentialType"
+        },
+        {
+          "$ref": "#/components/errors/ProviderUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": true
+    },
+    {
+      "name": "credential/get_batch",
+      "summary": "Material for every credential an environment names, all or none.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "scope",
+          "schema": {
+            "$ref": "#/components/schemas/Scope"
+          },
+          "required": false
+        },
+        {
+          "name": "claim",
+          "schema": {
+            "$ref": "#/components/schemas/Claim"
+          },
+          "required": false
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "credentials": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/CredentialResult"
+              }
+            }
+          },
+          "required": [
+            "credentials"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ReauthRequired"
+        },
+        {
+          "$ref": "#/components/errors/WrongCredentialType"
+        },
+        {
+          "$ref": "#/components/errors/ProviderUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": true,
+      "description": "Any member failure fails the whole request without naming the member."
+    },
+    {
+      "name": "credential/list",
+      "summary": "Enumerate the caller's credentials. No material.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": false,
+          "description": "Restrict to one environment."
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "credentials": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/CredentialSummary"
+              }
+            }
+          },
+          "required": [
+            "credentials"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        }
+      ],
+      "x-carriers": [
+        "uds",
+        "stdio"
+      ],
+      "x-deny-unknown-params": true
+    },
+    {
+      "name": "credential/remove",
+      "summary": "Remove a credential and its sealed material.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "credential",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "Gated: returns APPROVAL_REQUIRED; `request/approve` applies it.",
+      "x-gated": "RemoveCredential"
+    },
+    {
+      "name": "environment/bootstrap",
+      "summary": "Provision a credential and its environment.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "credential",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": false,
+          "description": "Absent means a credential named after the environment."
+        },
+        {
+          "name": "provider",
+          "schema": {
+            "$ref": "#/components/schemas/ProviderParams"
+          },
+          "required": true
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ProviderUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/AuthTimeout"
+        },
+        {
+          "$ref": "#/components/errors/AuthCancelled"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRefused"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "Gated only when it would replace existing state; re-sent after approval.",
+      "x-gated": "Bootstrap",
+      "x-streaming": {
+        "emits": [
+          "notifications/progress"
+        ],
+        "accepts": [
+          "environment/bootstrap/respond"
+        ]
+      }
+    },
+    {
+      "name": "environment/describe",
+      "summary": "An environment's manifest. No material.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ProfileManifest"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": true
+    },
+    {
+      "name": "environment/import",
+      "summary": "Seal discovered static-key profiles in one batch.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "profiles",
+          "schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImportProfile"
+            }
+          },
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "schema": {
+            "type": "boolean",
+            "default": false
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "outcomes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ImportOutcome"
+              }
+            }
+          },
+          "required": [
+            "outcomes"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRefused"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "One outcome per submitted profile, in order. Gated when it would replace existing state.",
+      "x-gated": "Import"
+    },
+    {
+      "name": "environment/login",
+      "summary": "Re-authenticate a credential from its saved provider config.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "credential",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": false
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ProviderUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/AuthTimeout"
+        },
+        {
+          "$ref": "#/components/errors/AuthCancelled"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "x-streaming": {
+        "emits": [
+          "notifications/progress"
+        ],
+        "accepts": [
+          "environment/bootstrap/respond"
+        ]
+      }
+    },
+    {
+      "name": "environment/remove",
+      "summary": "Remove an environment.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "environment",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "Gated: returns APPROVAL_REQUIRED; `request/approve` applies it.",
+      "x-gated": "RemoveEnv"
+    },
+    {
+      "name": "file/revalidate",
+      "summary": "Ratify hand-edited, deleted, or unverifiable config files.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": true,
+      "description": "Succeeds with nothing to do when both files verify; otherwise gated.",
+      "x-gated": "Revalidate"
+    },
+    {
+      "name": "presence/enroll",
+      "summary": "Enroll a presence key; raises the approval that installs it.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "public_key",
+          "schema": {
+            "type": "string",
+            "description": "Hex SEC1 uncompressed P-256 public key."
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "challenge": {
+              "$ref": "#/components/schemas/Challenge"
+            },
+            "fingerprint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "challenge",
+            "fingerprint"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "presence/revoke",
+      "summary": "Revoke the caller's enrolled presence key.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "revoked": {
+              "type": "string",
+              "description": "Fingerprint of the revoked key."
+            }
+          },
+          "required": [
+            "revoked"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "presence/status",
+      "summary": "The caller's presence enrollment.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "uid": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "presence_key": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "enrolled_at": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "approved_by_uid": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "approved_by_login_uid": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "uid",
+            "presence_key",
+            "enrolled_at",
+            "approved_by_uid",
+            "approved_by_login_uid"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "request/approve",
+      "summary": "Approve a pending gated operation.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        },
+        {
+          "name": "signature",
+          "schema": {
+            "type": "string",
+            "description": "Hex DER ECDSA signature. Absent for a privileged approval."
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string"
+            },
+            "verifier": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "verifier"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/RequestNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRefused"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "request/get",
+      "summary": "One pending request.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PendingSummary"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/RequestNotFound"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "request/list",
+      "summary": "Pending requests visible to the caller.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/components/schemas/PendingSummary"
+          }
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "request/withdraw",
+      "summary": "Withdraw the caller's own pending request.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/RequestNotFound"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false
+    },
+    {
+      "name": "system/health",
+      "summary": "Protocol handshake and liveness.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "protocol": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Wire protocol version. Equals the major of info.version."
+            },
+            "version": {
+              "type": "string",
+              "description": "Daemon build version. Not an API version."
+            }
+          },
+          "required": [
+            "protocol",
+            "version"
+          ]
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        }
+      ],
+      "x-carriers": [
+        "uds",
+        "stdio"
+      ],
+      "x-deny-unknown-params": false
+    }
+  ],
+  "components": {
+    "schemas": {
+      "AccountInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "email"
+        ]
+      },
+      "ApprovalRefusedData": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "const": "APPROVAL_REFUSED"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/RefusalReason"
+          },
+          "remediation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "reason",
+          "remediation"
+        ]
+      },
+      "ApprovalRequiredData": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "const": "APPROVAL_REQUIRED"
+          },
+          "challenge": {
+            "$ref": "#/components/schemas/Challenge"
+          },
+          "remediation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "challenge",
+          "remediation"
+        ]
+      },
+      "Challenge": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string",
+            "description": "Hex SHA-256 of the pending operation's canonical form."
+          },
+          "description": {
+            "type": "string",
+            "description": "What approving authorizes. Rendered to the approver."
+          },
+          "expires_in_secs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "accepts": {
+            "type": "string",
+            "enum": [
+              "any",
+              "privileged"
+            ]
+          },
+          "presence_key": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Fingerprint of the owner's enrolled presence key."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "digest",
+          "description",
+          "expires_in_secs",
+          "accepts",
+          "presence_key"
+        ]
+      },
+      "Claim": {
+        "type": "string",
+        "enum": [
+          "agentic"
+        ],
+        "x-open-enum": true,
+        "description": "Self-reported caller identity claim. Its presence is the assertion; unrecognised values are ignored."
+      },
+      "CliSettings": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "pager": {
+            "type": "string"
+          },
+          "cli_timestamp_format": {
+            "type": "string"
+          },
+          "cli_binary_format": {
+            "type": "string"
+          },
+          "cli_follow_urlparam": {
+            "type": "boolean"
+          }
+        },
+        "description": "AWS CLI settings an environment projects. Absent members are omitted."
+      },
+      "CredentialEntry": {
+        "type": "object",
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CredentialType"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CredentialSourceType"
+          },
+          "env_var": {
+            "type": "string"
+          },
+          "projection": {
+            "$ref": "#/components/schemas/ProjectionType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SessionStatus"
+          },
+          "default": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "credential",
+          "kind",
+          "source",
+          "status",
+          "default"
+        ]
+      },
+      "CredentialResult": {
+        "type": "object",
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "material": {
+            "$ref": "#/components/schemas/Material"
+          },
+          "expires_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          }
+        },
+        "required": [
+          "credential",
+          "material",
+          "expires_at",
+          "provenance"
+        ]
+      },
+      "CredentialSourceType": {
+        "type": "string",
+        "enum": [
+          "aws_idc_sso",
+          "aws_iam_user",
+          "aws_roles_anywhere",
+          "aws_web_identity",
+          "aws_login",
+          "jwt",
+          "oauth",
+          "jwt_bearer",
+          "static_secret"
+        ],
+        "x-open-enum": true,
+        "description": "Provider that issues a credential. Unrecognised values read as unsupported."
+      },
+      "CredentialSummary": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CredentialType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SessionStatus"
+          }
+        },
+        "required": [
+          "environment",
+          "credential",
+          "kind",
+          "status"
+        ]
+      },
+      "CredentialType": {
+        "type": "string",
+        "enum": [
+          "access_token",
+          "session_credentials"
+        ],
+        "x-open-enum": true,
+        "description": "Kind of material a credential yields."
+      },
+      "DomainCode": {
+        "type": "string",
+        "enum": [
+          "ENVIRONMENT_NOT_FOUND",
+          "REAUTH_REQUIRED",
+          "WRONG_CREDENTIAL_TYPE",
+          "PROVIDER_UNAVAILABLE",
+          "INTERNAL",
+          "CONFIG_DRIFTED",
+          "INTEGRITY_UNVERIFIABLE",
+          "CUSTODY_BROKEN",
+          "AUTH_TIMEOUT",
+          "AUTH_CANCELLED",
+          "APPROVAL_REQUIRED",
+          "APPROVAL_REFUSED",
+          "REQUEST_NOT_FOUND"
+        ],
+        "x-open-enum": true,
+        "description": "Domain failure classifier carried in `error.data.code`."
+      },
+      "IdentityType": {
+        "type": "string",
+        "enum": [
+          "human",
+          "automation",
+          "agent"
+        ],
+        "x-open-enum": true,
+        "description": "Identity tier of the credential. Absent means `human`."
+      },
+      "ImportOutcome": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "imported",
+              "skipped",
+              "would_import",
+              "would_skip"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ]
+      },
+      "ImportProfile": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Credential and environment name. Validated per entry: an invalid name is a skipped outcome, not a params error."
+          },
+          "access_key_id": {
+            "type": "string"
+          },
+          "secret_access_key": {
+            "type": "string",
+            "x-secret": true,
+            "description": "Long-term secret access key."
+          },
+          "region": {
+            "type": "string"
+          },
+          "identity_type": {
+            "type": "string",
+            "enum": [
+              "human",
+              "automation",
+              "agent"
+            ],
+            "x-open-enum": true,
+            "description": "Identity tier of the credential. Absent means `human`."
+          }
+        },
+        "required": [
+          "name",
+          "access_key_id",
+          "secret_access_key",
+          "region"
+        ]
+      },
+      "Material": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "session_credentials"
+              },
+              "access_key_id": {
+                "type": "string"
+              },
+              "secret_access_key": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Secret access key."
+              },
+              "session_token": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Session token."
+              }
+            },
+            "required": [
+              "type",
+              "access_key_id",
+              "secret_access_key",
+              "session_token"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "access_token"
+              },
+              "token": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Bearer token."
+              },
+              "token_type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "token",
+              "token_type"
+            ]
+          }
+        ],
+        "description": "Credential material, tagged by `type`. Further variants may be added.",
+        "x-open-enum": true
+      },
+      "Name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$",
+        "not": {
+          "const": "default"
+        },
+        "description": "An environment or credential name: ASCII letters, digits, '.', '_' or '-', at most 64 characters, not starting with '.', and not `default`. Validated at deserialization; a violation is INVALID_PARAMS."
+      },
+      "OkResult": {
+        "type": "object",
+        "properties": {},
+        "description": "The method succeeded; nothing to return."
+      },
+      "PendingSummary": {
+        "type": "object",
+        "properties": {
+          "challenge": {
+            "$ref": "#/components/schemas/Challenge"
+          },
+          "owner_uid": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "owner_pid": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "owner_executable": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "raised_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "challenge",
+          "owner_uid",
+          "owner_pid",
+          "owner_executable",
+          "raised_at"
+        ]
+      },
+      "ProfileManifest": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "credentials": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CredentialEntry"
+            }
+          },
+          "projection": {
+            "$ref": "#/components/schemas/Projection"
+          }
+        },
+        "required": [
+          "environment",
+          "credentials",
+          "projection"
+        ],
+        "description": "An environment's manifest. Contains no material."
+      },
+      "ProgressParams": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "device_code"
+              },
+              "verification_uri": {
+                "type": "string"
+              },
+              "user_code": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "verification_uri",
+              "user_code"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "polling"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "select_account"
+              },
+              "accounts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AccountInfo"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "accounts"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "select_role"
+              },
+              "roles": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "roles"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "mfa_required"
+              },
+              "serial": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "serial"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "authorize_url"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "url"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "authorize_code"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "url"
+            ]
+          }
+        ],
+        "description": "A step of an interactive bootstrap or login, tagged by `type`.",
+        "x-open-enum": true
+      },
+      "Projection": {
+        "type": "object",
+        "properties": {
+          "projections": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ProjectionDecl"
+            },
+            "description": "Projection declarations keyed by credential name. Omitted when empty."
+          },
+          "region": {
+            "type": "string"
+          },
+          "sdk": {
+            "$ref": "#/components/schemas/SdkSettings"
+          },
+          "cli": {
+            "$ref": "#/components/schemas/CliSettings"
+          }
+        },
+        "description": "Environment-level projection inputs."
+      },
+      "ProjectionDecl": {
+        "type": "string",
+        "description": "A projection declaration, `<type>[:<address>]`, where `<type>` is a ProjectionType."
+      },
+      "ProjectionType": {
+        "type": "string",
+        "enum": [
+          "aws-profile",
+          "env-var",
+          "credential-endpoint"
+        ],
+        "x-open-enum": true,
+        "description": "How a credential is delivered to a consumer."
+      },
+      "Provenance": {
+        "type": "string",
+        "enum": [
+          "cached_shared",
+          "minted_for_request"
+        ],
+        "x-open-enum": true,
+        "description": "Whether material was served from the shared cache or minted for this request."
+      },
+      "ProviderParams": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "aws_idc_sso"
+              },
+              "start_url": {
+                "type": "string"
+              },
+              "sso_region": {
+                "type": "string"
+              },
+              "account_id": {
+                "type": "string",
+                "description": "Chosen at sign-in when absent."
+              },
+              "role_name": {
+                "type": "string",
+                "description": "Chosen at sign-in when absent."
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "start_url",
+              "sso_region"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "aws_iam_user"
+              },
+              "access_key_id": {
+                "type": "string"
+              },
+              "secret_access_key": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Long-term secret access key."
+              },
+              "region": {
+                "type": "string"
+              },
+              "duration_seconds": {
+                "type": "integer"
+              },
+              "mfa_serial": {
+                "type": "string"
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "access_key_id",
+              "secret_access_key",
+              "region"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "aws_roles_anywhere"
+              },
+              "trust_anchor_arn": {
+                "type": "string"
+              },
+              "profile_arn": {
+                "type": "string"
+              },
+              "role_arn": {
+                "type": "string"
+              },
+              "cert_der": {
+                "type": "string",
+                "description": "Base64 DER of the leaf certificate."
+              },
+              "key_der": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Base64 DER of the private key."
+              },
+              "key_tag": {
+                "type": "string",
+                "enum": [
+                  "PKCS8",
+                  "RSA",
+                  "EC"
+                ],
+                "description": "PEM tag of the key format."
+              },
+              "chain_der": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "region": {
+                "type": "string"
+              },
+              "duration_seconds": {
+                "type": "integer"
+              },
+              "role_session_name": {
+                "type": "string"
+              },
+              "endpoint_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "HTTPS only."
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "trust_anchor_arn",
+              "profile_arn",
+              "role_arn",
+              "cert_der",
+              "key_der",
+              "key_tag"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "aws_web_identity"
+              },
+              "authorization_endpoint": {
+                "type": "string",
+                "format": "uri",
+                "description": "HTTPS only."
+              },
+              "token_endpoint": {
+                "type": "string",
+                "format": "uri",
+                "description": "HTTPS only."
+              },
+              "client_id": {
+                "type": "string"
+              },
+              "scopes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [
+                  "openid"
+                ],
+                "description": "`openid` is added when missing."
+              },
+              "role_arn": {
+                "type": "string"
+              },
+              "region": {
+                "type": "string"
+              },
+              "duration_seconds": {
+                "type": "integer"
+              },
+              "role_session_name": {
+                "type": "string"
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              },
+              "callback_port": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              }
+            },
+            "required": [
+              "type",
+              "authorization_endpoint",
+              "token_endpoint",
+              "client_id",
+              "role_arn",
+              "region"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "aws_login"
+              },
+              "region": {
+                "type": "string"
+              },
+              "callback_port": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "remote": {
+                "type": "boolean",
+                "default": false
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "region"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "jwt"
+              },
+              "jwt": {
+                "type": "string",
+                "x-secret": true,
+                "description": "The token."
+              },
+              "env_var": {
+                "type": "string"
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "jwt"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "oauth"
+              },
+              "token_url": {
+                "type": "string"
+              },
+              "client_id": {
+                "type": "string"
+              },
+              "client_secret": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Client secret."
+              },
+              "private_key_pem": {
+                "type": "string",
+                "x-secret": true,
+                "description": "Private key for client authentication."
+              },
+              "scope": {
+                "type": "string"
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "token_url",
+              "client_id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "jwt_bearer"
+              },
+              "token_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "HTTPS only."
+              },
+              "assertion": {
+                "type": "string",
+                "x-secret": true,
+                "description": "The bearer assertion."
+              },
+              "client_id": {
+                "type": "string"
+              },
+              "scope": {
+                "type": "string"
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "token_url",
+              "assertion"
+            ],
+            "x-feature": "jwt-bearer"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "static_secret"
+              },
+              "secret": {
+                "type": "string",
+                "x-secret": true,
+                "description": "The secret."
+              },
+              "env_var": {
+                "type": "string"
+              },
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "secret_source": {
+                "type": "string"
+              },
+              "identity_type": {
+                "type": "string",
+                "enum": [
+                  "human",
+                  "automation",
+                  "agent"
+                ],
+                "x-open-enum": true,
+                "description": "Identity tier of the credential. Absent means `human`."
+              }
+            },
+            "required": [
+              "type",
+              "secret"
+            ]
+          }
+        ],
+        "description": "Provider parameters, tagged by `type`. An unrecognised type is refused by the handler.",
+        "x-open-enum": true
+      },
+      "ReauthRequiredData": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "const": "REAUTH_REQUIRED"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "remediation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "environment",
+          "remediation"
+        ]
+      },
+      "RefusalReason": {
+        "type": "string",
+        "enum": [
+          "not_satisfied",
+          "signature_invalid",
+          "no_presence_key",
+          "privileged_only",
+          "base_state_changed"
+        ],
+        "x-open-enum": true,
+        "description": "Why an approval did not satisfy its challenge."
+      },
+      "RequestId": {
+        "type": "string",
+        "description": "Caller-supplied correlation id, opaque to the daemon."
+      },
+      "Scope": {
+        "description": "Caller-supplied session policy that can only narrow. The grammar is not settled; any JSON value is carried. Absence means boundary-scoped, never unscoped. A malformed scope fails the retrieval."
+      },
+      "SdkSettings": {
+        "type": "object",
+        "properties": {
+          "endpoint_url": {
+            "type": "string"
+          },
+          "use_fips_endpoint": {
+            "type": "boolean"
+          },
+          "use_dualstack_endpoint": {
+            "type": "boolean"
+          },
+          "ca_bundle": {
+            "type": "string"
+          },
+          "retry_mode": {
+            "type": "string"
+          },
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "defaults_mode": {
+            "type": "string"
+          },
+          "sts_regional_endpoints": {
+            "type": "string"
+          },
+          "s3_us_east_1_regional_endpoint": {
+            "type": "string"
+          },
+          "disable_request_compression": {
+            "type": "boolean"
+          },
+          "request_min_compression_size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "parameter_validation": {
+            "type": "boolean"
+          },
+          "ignore_configured_endpoint_urls": {
+            "type": "boolean"
+          },
+          "sdk_ua_app_id": {
+            "type": "string"
+          },
+          "account_id_endpoint_mode": {
+            "type": "string"
+          }
+        },
+        "description": "AWS SDK settings an environment projects. Absent members are omitted."
+      },
+      "SessionStatus": {
+        "type": "string",
+        "enum": [
+          "active",
+          "expiring",
+          "expired",
+          "sign_in_required",
+          "no_session",
+          "corrupt",
+          "unreadable",
+          "decrypt_failed",
+          "unknown"
+        ],
+        "description": "Whether a credential would work right now."
+      }
+    },
+    "errors": {
+      "ApprovalRefused": {
+        "code": -32000,
+        "message": "The approval did not satisfy the challenge.",
+        "data": {
+          "code": "APPROVAL_REFUSED"
+        }
+      },
+      "ApprovalRequired": {
+        "code": -32000,
+        "message": "The operation is gated; it was not performed.",
+        "data": {
+          "code": "APPROVAL_REQUIRED"
+        }
+      },
+      "AuthCancelled": {
+        "code": -32000,
+        "message": "Interactive sign-in was cancelled.",
+        "data": {
+          "code": "AUTH_CANCELLED"
+        }
+      },
+      "AuthTimeout": {
+        "code": -32000,
+        "message": "Interactive sign-in did not complete in time.",
+        "data": {
+          "code": "AUTH_TIMEOUT"
+        }
+      },
+      "ConfigDrifted": {
+        "code": -32000,
+        "message": "config.toml or credentials.toml has drifted from its sealed snapshot.",
+        "data": {
+          "code": "CONFIG_DRIFTED"
+        }
+      },
+      "CustodyBroken": {
+        "code": -32000,
+        "message": "Custody of the integrity record or enrolled-key registry is broken.",
+        "data": {
+          "code": "CUSTODY_BROKEN"
+        }
+      },
+      "EnvironmentNotFound": {
+        "code": -32000,
+        "message": "No such environment or credential is visible to the caller.",
+        "data": {
+          "code": "ENVIRONMENT_NOT_FOUND"
+        }
+      },
+      "IntegrityUnverifiable": {
+        "code": -32000,
+        "message": "The caller's integrity record cannot be opened.",
+        "data": {
+          "code": "INTEGRITY_UNVERIFIABLE"
+        }
+      },
+      "Internal": {
+        "code": -32000,
+        "message": "A domain failure with no more specific code.",
+        "data": {
+          "code": "INTERNAL"
+        }
+      },
+      "InternalError": {
+        "code": -32603,
+        "message": "Internal error."
+      },
+      "InvalidParams": {
+        "code": -32602,
+        "message": "Params do not match the method's schema."
+      },
+      "MethodNotFound": {
+        "code": -32601,
+        "message": "Unknown method, or not exposed on this carrier."
+      },
+      "ProviderUnavailable": {
+        "code": -32000,
+        "message": "The credential provider could not be reached.",
+        "data": {
+          "code": "PROVIDER_UNAVAILABLE"
+        }
+      },
+      "ReauthRequired": {
+        "code": -32000,
+        "message": "The credential needs interactive re-authentication.",
+        "data": {
+          "code": "REAUTH_REQUIRED"
+        }
+      },
+      "RequestNotFound": {
+        "code": -32000,
+        "message": "No pending request by that id is visible.",
+        "data": {
+          "code": "REQUEST_NOT_FOUND"
+        }
+      },
+      "WrongCredentialType": {
+        "code": -32000,
+        "message": "The credential's kind cannot be projected onto the requested shape.",
+        "data": {
+          "code": "WRONG_CREDENTIAL_TYPE"
+        }
+      }
+    }
+  },
+  "x-notifications": [
+    {
+      "name": "environment/bootstrap/respond",
+      "direction": "client-to-server",
+      "summary": "The user's selection for the step last announced (account, role, or MFA code).",
+      "params": {
+        "type": "object",
+        "properties": {
+          "selection": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "selection"
+        ]
+      }
+    },
+    {
+      "name": "notifications/progress",
+      "direction": "server-to-client",
+      "summary": "A step of an in-flight bootstrap or login.",
+      "params": {
+        "$ref": "#/components/schemas/ProgressParams"
+      }
+    }
+  ],
+  "x-error-data": {
+    "APPROVAL_REFUSED": {
+      "$ref": "#/components/schemas/ApprovalRefusedData"
+    },
+    "APPROVAL_REQUIRED": {
+      "$ref": "#/components/schemas/ApprovalRequiredData"
+    },
+    "REAUTH_REQUIRED": {
+      "$ref": "#/components/schemas/ReauthRequiredData"
+    }
+  }
+}

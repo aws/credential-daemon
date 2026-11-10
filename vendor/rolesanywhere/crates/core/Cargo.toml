@@ -1,0 +1,67 @@
+[package]
+name = "rolesanywhere-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Library crate name: what `use rolesanywhere_core::…` resolves to. Named distinctly so it
+# never shadows Rust's built-in `core`.
+[lib]
+name = "rolesanywhere_core"
+
+[dependencies]
+# --- Cryptography ---
+# aws-lc-rs is AWS's own cryptography library (the same FIPS-validated engine the
+# AWS SDK for Rust uses). It provides ALL of our crypto in one audited place:
+#   - SHA-256 hashing (for the canonical request and payload hash)
+#   - RSA PKCS#1 v1.5 signing  (matches Go's rsa.SignPKCS1v15)
+#   - ECDSA P-256 signing      (matches Go's ecdsa.SignASN1)
+#   - secure random bytes      (for the Amz-Sdk-Invocation-Id UUID)
+aws-lc-rs = "1"
+
+# --- Encoding helpers ---
+# Hex-encode signatures and hashes (SigV4 puts them in headers as hex strings).
+hex = "0.4.3"
+# Base64-encode certificate DER bytes for the X-Amz-X509 header.
+base64 = "0.22"
+
+# --- Date / time ---
+# SigV4 requires a UTC timestamp formatted a specific way (X-Amz-Date + scope).
+chrono = "0.4.45"
+
+# --- Certificate and key parsing (NOT crypto — just reading the file formats) ---
+# Parse X.509 certificates to read the serial number.
+x509-cert = "0.2"
+# Decode PEM text files into DER bytes.
+pem = "3"
+# Read the PKCS#8 PrivateKeyInfo structure to learn the key's algorithm OID
+# (this tells us whether a "PRIVATE KEY" PEM block holds an RSA or an EC key).
+pkcs8 = "0.10"
+# Low-level DER/ASN.1 encode/decode (used to pull the raw serial-number bytes).
+der = "0.7"
+# Arbitrary-precision integers for certificate serial numbers (can exceed 64 bits).
+# We use the SIGNED BigInt so our output matches Go's big.Int.String().
+num-bigint = "0.4"
+
+# --- Secret hygiene (NOT crypto — just memory scrubbing) ---
+# Scrub the plaintext private-key DER buffers on drop (Zeroizing<Vec<u8>> in
+# key_reader) so freed key bytes don't linger in reused heap. Already present
+# transitively via aws-lc-rs/der; named directly here since we use it in our code.
+zeroize = "1"
+
+# --- HTTP + JSON ---
+# HTTP client for the CreateSession API (blocking mode, rustls for TLS 1.2+).
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+# JSON serialization/deserialization for the request body and response.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# URL percent-encoding for the query string (profileArn, roleArn, trustAnchorArn).
+percent-encoding = "2"
+
+[dev-dependencies]
+# Property-based testing for the formatting/parsing logic.
+proptest = "1"
+
+[features]
+integration-tests = []
