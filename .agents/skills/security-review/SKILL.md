@@ -14,7 +14,7 @@ credsd holds long-lived AWS SSO refresh material and vends short-lived credentia
 local IPC. The threat actors that matter are, in order:
 
 1. **A non-root local user on the same machine** — the primary adversary. Wants to read
-   another user's credentials via the socket, an ephemeral proxy's port, or log files.
+   another user's credentials via the socket or log files.
 2. **A same-UID unprivileged process** — a browser tab's helper, a malicious `npm`
    postinstall. Already inside the UID boundary, so file modes don't stop it; what stops
    it is that there is nothing extra to steal beyond what the UID already grants.
@@ -25,12 +25,12 @@ local IPC. The threat actors that matter are, in order:
 Root on the same machine is **explicitly out of scope** (`SECURITY.md`: "root is trusted at
 install time"), as is local DoS. Do not report findings whose precondition is root.
 
-The file-and-line specifics below describe the tree as of the removal of the persistent TCP
-listener: `serve` binds a Unix domain socket only. Two per-operation loopback listeners exist
-and close with the operation that opened them — the `credsd run` proxy for one child process,
-and the OAuth authorization-code callback for one aws-login flow. Where a checklist item names a file or symbol,
-confirm it still exists before trusting the surrounding claim — a checklist that has drifted
-from the code will send you looking for the wrong bug.
+The file-and-line specifics below describe a tree with no HTTP transport: `serve` binds a Unix
+domain socket only, and there is no bearer token on it — the daemon takes the caller's uid from
+the kernel. One per-operation loopback listener remains, the OAuth authorization-code callback,
+which closes with the aws-login flow that opened it. Where a checklist item names a file or
+symbol, confirm it still exists before trusting the surrounding claim — a checklist that has
+drifted from the code will send you looking for the wrong bug.
 
 **Windows is deferred.** `storage/windows.rs` and `storage/dpapi.rs` are still in the tree and
 still worth reading — unreviewed `unsafe` is unreviewed `unsafe`, and the code is not being
@@ -135,12 +135,12 @@ reporting it, and drop it if it is a false positive (say that you dropped it and
 |---|---|---|
 | `crypto` | `encryption.rs`, future DPoP/PKCE code | primitive choice, nonce discipline, key sizes, signature encoding |
 | `secrets` | `credentials.rs`, `credential_store.rs`, `credential_env.rs`, `storage/*`, `config/keys.rs` | every secret-bearing type zeroizes; no secret reaches a log, error string, `Debug`, or serialized artifact |
-| `ipc-auth` | `auth.rs`, `server/{middleware,uds,proxy,routes,mod}.rs` | who can reach the endpoint, and what proves they are allowed; that no auth secret is optional-typed |
-| `fs-perms` | `config/{mod,platform}.rs`, `aws_config.rs`, `log.rs`, `server/uds.rs`, `storage/file.rs` | mode is set **before** secret bytes land; TOCTOU; symlink and parent-dir trust |
+| `ipc-auth` | `server/{uds,routes,dispatch,classify,revalidate,presence}.rs` — `CallerAuth` and `DenyReason` are defined in `routes.rs`, resolved in `uds.rs` | who can reach the socket, and what proves they are allowed; that the kernel-supplied uid is the only accepted proof and no claim a client sends substitutes for it |
+| `fs-perms` | `config/{mod,platform}.rs`, `log.rs`, `server/uds.rs`, `storage/file.rs` | mode is set **before** secret bytes land; TOCTOU; symlink and parent-dir trust |
 | `unsafe-ffi` | `server/process_tree.rs`, `storage/{windows,dpapi}.rs` (deferred, unbuilt) | every `unsafe` block's invariant actually holds; buffer sizes, lifetimes, null and error paths |
 | `service` | `install.rs` | injection into plist/unit/task XML; write-path trust; privilege at install and at run |
-| `exec` | `mcp/tools/launch_command.rs`, `get.rs`, `bootstrap.rs` | argv construction, no shell interpolation, no secret in argv or in a command echoed to a user |
-| `net` | `providers/sso.rs`, `server/proxy.rs`, `aws_config.rs` | TLS backend, endpoint/redirect validation, SSRF via loopback, response trust |
+| `exec` | `credential_env.rs`, `get.rs`, `bootstrap.rs`, `install.rs` | argv construction, no shell interpolation, no secret in argv or in a command echoed to a user |
+| `net` | `providers/*` | TLS backend, endpoint/redirect validation, SSRF via the OAuth loopback callback, response trust |
 | `supply-chain` | `Cargo.toml`, `Cargo.lock` | advisories, duplicate crypto stacks, unmaintained crates, build-script risk |
 
 ### `crypto`
@@ -183,20 +183,22 @@ reporting it, and drop it if it is a false positive (say that you dropped it and
 
 ### `ipc-auth`
 
-- **UDS.** `server/uds.rs` sets parent dir `0700` and socket `0600`, and `verify_peer_uid`
-  rejects a mismatched peer UID. Confirm `verify_peer_uid` is actually called on **every**
-  accepted connection — a socket whose permission check exists but is never invoked is a
-  live cross-user read. Note the socket `set_permissions` is deliberately best-effort
+- **UDS.** `server/uds.rs` sets parent dir `0700` and socket `0600`, and the accept loop
+  resolves the kernel-supplied peer uid through `resolve_caller` into a `CallerAuth`.
+  Confirm it is consulted on **every** accepted connection and that both failure modes fail
+  closed: no peer credential at all (`DenyReason::NoPeerCred`) and a passwd lookup that
+  fails (`CallerAuth::Unresolved`). A check that exists but is never invoked, or that
+  defaults to authorized, is a live cross-user read. Note the socket `set_permissions` is
+  deliberately best-effort
   (`let _ =`), with the parent dir as the real gate; that is sound only if the parent mode
   is enforced (not best-effort) and its own parents are not writable by others.
 - **Stale-socket handling.** `check_stale_socket` removes a path that fails to connect.
   Reason about a hostile file at that path (symlink, another user's socket) and about the
   race between the check and `bind`.
-- **Bearer token.** `middleware.rs` exempts `/health` from auth — confirm `/health` leaks
-  nothing (no profile names, no expiry, no paths). `validate_bearer` strips an optional
-  `Bearer ` prefix and compares constant-time; length mismatch returns early, which leaks
-  only length and is acceptable for a fixed-length token. The token is 32 CSPRNG bytes,
-  base64url, generated per invocation and held only in memory.
+- **No token at all.** Nothing on the socket authenticates by secret; `credsd-core/src/auth.rs`
+  still carries unused bearer helpers from the removed HTTP transport, so a change that starts
+  calling them is reintroducing a credential, not reusing an existing one. Review it as new
+  auth.
 - **No persistent token.** There is deliberately no token file: `serve` authenticates by
   peer UID, so a bearer token would add a second, weaker credential for the same boundary.
   Treat the reintroduction of an on-disk token as a finding in itself, and if one ever
@@ -209,11 +211,12 @@ reporting it, and drop it if it is a false positive (say that you dropped it and
   to a request sending exactly `Bearer `. Any auth secret whose type permits an empty or
   absent state is a finding regardless of whether you can reach it today — prefer a
   non-optional type so the state is unrepresentable.
-- **Ephemeral proxy.** `server/proxy.rs` binds loopback for container-credential consumers.
-  A TCP port has **no UID boundary** — any local user can connect. The per-invocation
-  bearer token is therefore the only gate; confirm it is enforced on every proxy route,
-  that it is freshly generated per `run` rather than shared or persisted, that the listener
-  dies with the child, and that the bind address is loopback and never `0.0.0.0`.
+- **OAuth callback listener.** `providers/aws_login.rs` and `providers/oauth/callback.rs`
+  bind the one remaining loopback TCP listener, for an authorization-code redirect. A TCP
+  port has **no UID boundary** — any local user can connect, and with `callback_port` set
+  the port is predictable. Confirm the bind address is loopback and never `0.0.0.0`, that
+  PKCE and the `state` parameter are what gate the exchange rather than the port, and that
+  the listener dies with the flow that opened it.
 
 ### `fs-perms`
 

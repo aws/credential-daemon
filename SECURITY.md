@@ -72,15 +72,46 @@ the daemon starts does not need a debugger: `LD_PRELOAD` / `DYLD_INSERT_LIBRARIE
 patched binary, or simply their own build with the hardening removed all work. A process
 asking the kernel to protect itself cannot defend against whoever chose to run that process.
 
-Two things follow, and they are the actual security requirements here:
+Two things follow, and they are the actual security requirements here. Which one each install
+shape rests on is not the same:
 
 1. **Launch `credsd serve` from a trusted path** — a supervisor-managed service
    (`launchd`, `systemd`) whose unit file and binary are not writable by the account the
-   daemon serves. This assumption is load-bearing.
-2. **Kernel-enforced-at-`exec` protection is the real fix**, because it is not the
-   process's request to make: on macOS, a binary signed with the hardened runtime and
-   without the `get-task-allow` entitlement cannot be attached to *even by its launcher*.
-   Linux has no direct equivalent, which is why (1) carries the weight there.
+   daemon serves. Every system install meets this: the unit and the staged binary are
+   root-owned, and the daemon runs as the `credsd` account.
+2. **Kernel-enforced-at-`exec` protection**, because it is not the process's request to make:
+   on macOS, a binary signed with the hardened runtime and without the `get-task-allow`
+   entitlement cannot be attached to *even by its launcher*. Linux has no direct equivalent,
+   which is why (1) carries the weight there.
+
+**The macOS user-scoped install rests on (2), not (1).** There, the daemon runs as the account
+it serves, and the `.pkg` puts both the service definition and the bundle inside that account's
+home: `~/Library/LaunchAgents/com.amazon.aws.credsd.daemon.plist` is user-writable, and in the
+`CurrentUserHomeDirectory` install so is `~/Applications/Credsd.app`. A process running as you
+can rewrite either one and decide how the daemon next starts. The `-target /` install makes the
+bundle root-owned under `/Applications`, but the LaunchAgent plist is in your home in both
+cases, so (1) never holds for this shape.
+
+What holds instead is the signature. The signed release's daemon and client are both built with
+the hardened runtime — `codesign -dvvv` on `Credsd.app/Contents/MacOS/credsd` from the v0.1.0
+`.pkg` reports `flags=0x10000(runtime)` under `Developer ID Application: AMZN Mobile LLC
+(94KV3E626L)` — and the daemon's entitlements are exactly `application-identifier`,
+`team-identifier`, and `keychain-access-groups`. There is no `get-task-allow`, no
+`disable-library-validation`, and no `allow-dyld-environment-variables`, which is what
+`docs/specs/presence-gated-operations/` Requirement 7.4 demands. So a rewritten plist can
+launch the daemon, but not under a debugger and not with injected code, and the data protection
+keychain refuses the master key to any binary carrying a different signature. Verify it yourself
+on an installed copy:
+
+```bash
+codesign -dvvv ~/Applications/Credsd.app/Contents/MacOS/credsd 2>&1 | grep -E 'flags|Authority'
+codesign -d --entitlements - ~/Applications/Credsd.app/Contents/MacOS/credsd
+```
+
+The signing step is not in this repository, so the hardened runtime is a property of the
+published artifact rather than of anything `cargo build` produces. A build from source has no
+Apple signing identity, which is why it cannot install this shape at all — see
+[docs/install.md](docs/install.md).
 
 Corollary for maintainers: the fact that `gdb ./credsd serve` still works on Linux is
 **not** a gap to be closed with `PR_SET_PTRACER` (which grants `ptrace` permission — the
@@ -102,9 +133,6 @@ inverse) or a Yama `ptrace_scope` change. It is a boundary of the technique.
   would mean installing our own Mach exception handler, which risks swallowing real
   crashes; treat crash reports from a daemon host as sensitive instead.
 - **Swap.** Secrets are not `mlock`ed; a page holding credential material may reach swap.
-- **`credsd run`'s proxy.** It holds live session credentials for the child command's
-  lifetime and is not hardened — `RLIMIT_CORE` would be inherited by the child, and the
-  dumpable flag is reset by `execve`.
 
 A hardening call the platform rejects is logged and non-fatal; the daemon's own log records
 which controls took effect.

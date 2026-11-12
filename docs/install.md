@@ -14,7 +14,8 @@
 |---|---|---|---|---|
 | macOS, official signed release | `credsd install --user` | launchd LaunchAgent | your uid | `data-protection-keychain` |
 | macOS, built from source | `sudo credsd install` | launchd LaunchDaemon | `credsd` | `secure-enclave` |
-| Linux | `sudo credsd install` | systemd unit + socket | `credsd` | `tpm` |
+| Linux, `-tpm` archive or a `tpm`-feature build | `sudo credsd install` | systemd unit + socket | `credsd` | `tpm` |
+| Linux, any other build | `sudo credsd install --storage-backend file` | systemd unit + socket | `credsd` | `file` |
 | Windows | not yet decided | — | — | — |
 
 On macOS the artifact decides the command, and each artifact supports one. The signed release
@@ -131,15 +132,89 @@ sudo credsd install --storage-backend file
 
 ## Linux system install
 
-Build with the `tpm` feature, which links the system tpm2-tss libraries (headers and
-`pkg-config` needed at build time). Without it the `tpm` backend is selected when
-`/dev/tpmrm0` exists and then fails every seal.
+### From a published archive
+
+Eight Linux archives are published on
+[Releases](https://github.com/aws/credential-daemon/releases), one per distribution,
+architecture, and TPM linkage:
+
+| | x86_64 | aarch64 |
+|---|---|---|
+| Amazon Linux 2023 | `credsd-al2023-x64.tar.gz` | `credsd-al2023-aarch64.tar.gz` |
+| Amazon Linux 2023, TPM | `credsd-al2023-x64-tpm.tar.gz` | `credsd-al2023-aarch64-tpm.tar.gz` |
+| Ubuntu | `credsd-ubuntu-x64.tar.gz` | `credsd-ubuntu-aarch64.tar.gz` |
+| Ubuntu, TPM | `credsd-ubuntu-x64-tpm.tar.gz` | `credsd-ubuntu-aarch64-tpm.tar.gz` |
+
+Take a `-tpm` archive on a host with a TPM 2.0 at `/dev/tpmrm0`. Only those carry the `tpm`
+feature. They link the system tpm2-tss libraries — `libtss2-esys.so.0`, `libtss2-mu.so.0`,
+and `libtss2-tctildr.so.0` — so tpm2-tss has to be installed (`tpm2-tss` on AL2023,
+`libtss2-dev` on Ubuntu) and the daemon does not start without it — which is why they are
+separate downloads rather than the default. On Ubuntu each runtime library is its own package
+named after its soname, so those names change between releases; `libtss2-dev` depends on all
+three and is the name that holds across them. A plain archive has no
+hardware-backed backend on Linux, so its only option is `file`, named explicitly and paired
+with full-disk encryption. There is no Amazon Linux 2 archive.
+
+Every archive and `SHA256SUMS` carries a detached PGP signature. Verify the signature, then
+the digest:
 
 ```bash
-cargo build --release --features credsd-core/tpm
+base=https://github.com/aws/credential-daemon/releases/latest/download
+archive=credsd-ubuntu-x64-tpm.tar.gz
+
+curl -fLO "$base/$archive"
+curl -fLO "$base/$archive.sig"
+curl -fLO "$base/SHA256SUMS"
+curl -fLO "$base/SHA256SUMS.sig"
+
+curl -fsSL https://raw.githubusercontent.com/aws/credential-daemon/main/KEYS | gpg --import
+gpg --verify "$archive.sig" "$archive"
+gpg --verify SHA256SUMS.sig SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+```
+
+A freshly imported key is uncertified, so `gpg` adds `WARNING: This key is not certified with
+a trusted signature`. That is expected; `Good signature from "AWS Credential Daemon
+<aws-credential-daemon@amazon.com>"` is the line that matters, and the key's fingerprint is
+recorded in [`KEYS`](../KEYS). `SHA256SUMS` lists every archive, so `--ignore-missing` checks
+the one you downloaded and skips the rest.
+
+Each archive unpacks into a directory named after itself, holding both binaries, a `.sha256`
+for each, and the license files:
+
+```bash
+tar xzf "$archive"
+cd "${archive%.tar.gz}"
+sha256sum -c creds.sha256 credsd.sha256
+sudo install -m 0755 credsd creds /usr/local/bin/
+sudo credsd install
+```
+
+`install` resolves `tpm` on a `-tpm` build with `/dev/tpmrm0` present. Anywhere else it fails
+rather than falling back, so name the backend:
+
+```bash
+sudo credsd install --storage-backend file   # also bakes --insecure-backend; use LUKS
+```
+
+### From source
+
+Build with the `tpm` feature, which links the system tpm2-tss libraries (headers and
+`pkg-config` needed at build time). Without it the `tpm` backend cannot be selected at all,
+and `install` errors unless a backend is named.
+
+Two invocations, not one: a single workspace build resolves one `credsd-core` for every
+member, which would hand `creds` the tpm-linked rlib. The client must never link tpm2-tss,
+and CI fails the build that makes it.
+
+```bash
+cargo build --release -p credsd-daemon --features tpm
+cargo build --release -p creds
 sudo install -m 0755 target/release/credsd target/release/creds /usr/local/bin/
 sudo credsd install
 ```
+
+### What install does
 
 `install` creates the `credsd` system user (`useradd --system`, shell `/usr/sbin/nologin`)
 if absent, chowns the data directory to it and restricts it to 0700, writes `credsd.service`

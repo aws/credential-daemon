@@ -398,16 +398,23 @@ Daemon and service installer. Global flags, accepted before or after the subcomm
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `--storage-backend <NAME>` | backend | Where the master key is held: `data-protection-keychain`, `secure-enclave`, `tpm`, `kkrs`, `file`, `dpapi`, `credential-manager`, as compiled into this build (`credsd --version`). Omitted: auto-detect. See [key security](../key-security.md). |
+| `--storage-backend <NAME>` | backend | Where the master key is held: `data-protection-keychain`, `secure-enclave`, `tpm`, `kkrs`, `file`, `dpapi`, `credential-manager`, as compiled into this build (`credsd --version`). Required by `serve` and `init`; optional for `install`. See [key security](../key-security.md). |
 | `--config-dir <PATH>` | path | Sets `CREDSD_CONFIG_DIR` for this invocation. |
 | `--quiet`, `-q` | | Log level `error`. Conflicts with `--verbose`. |
 | `--verbose`, `-v` | | Log level `debug`. |
 | `--log-file <PATH>` | path | Append logs to this file. |
 | `--log-format <FORMAT>` | `text`, `json` | Log format. |
 
-Auto-detect: macOS picks `data-protection-keychain`, else `secure-enclave`; Linux picks `tpm`
-when `/dev/tpmrm0` exists; Windows picks `dpapi`. With no hardware-backed backend, auto-detect
-fails and a backend must be named.
+`credsd install` is the only subcommand that resolves a backend when the flag is absent:
+`credsd install --user` resolves `data-protection-keychain`, a macOS `sudo credsd install`
+picks `secure-enclave` and never considers the keychain (a LaunchDaemon has no login session
+to reach it), and Linux picks `tpm` when the build has the feature and `/dev/tpmrm0` exists.
+There is no Windows install yet; when there is, it would resolve `dpapi`. With nothing
+hardware-backed available, `install` fails rather than falling back, and a backend must be
+named.
+
+`credsd serve` and `credsd init` do not resolve one. Both exit with an error when the flag is
+absent; the installed service passes the backend `install` baked into its definition.
 
 ### credsd serve
 
@@ -430,7 +437,7 @@ See [install](../install.md).
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `--user` | | macOS, official signed release only: install a LaunchAgent running as your uid. Refused on Linux. Refuses the `file` backend. |
+| `--user` | | macOS, official signed release only: install a LaunchAgent running as your uid. Refused on Linux, and under `sudo`. Accepts `data-protection-keychain` and nothing else — every other backend is refused, because it is the only keystore a service running as its own caller's uid can hold a key in. Omit `--storage-backend` and it resolves that one. |
 | `--skip-security-warning` | | Skip the interactive confirmation `--user` shows. |
 
 ```
@@ -458,10 +465,21 @@ The keystore has to be one the invoking user can reach. A user install's data pr
 keychain item belongs to your login session, so purge it as yourself; a system install's
 key belongs to the service account, so purge it under `sudo`.
 
+A system install is the only shape with a backend to switch to, since a user install accepts
+`data-protection-keychain` alone:
+
+```bash
+# switch a Linux system install from the file backend to the TPM.
+# Install a -tpm artifact's binaries first; a build without the feature cannot select tpm.
+sudo credsd uninstall --purge-key --storage-backend file
+sudo credsd install --storage-backend tpm
 ```
-# switch a user install from the keychain to the Secure Enclave
+
+For a user install, purging is how you discard the keychain key and start over:
+
+```bash
 credsd uninstall --user --purge-key --storage-backend data-protection-keychain
-credsd install --user --storage-backend secure-enclave
+credsd install --user
 ```
 
 ### credsd init
