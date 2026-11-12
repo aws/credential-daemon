@@ -43,7 +43,7 @@ Everything it holds belongs to one user on one machine. See the [overview](docs/
 
 | Platform | Install shape | Storage backend |
 |---|---|---|
-| macOS, official signed release (not yet published) | User-scoped (LaunchAgent), `credsd install --user` | `data-protection-keychain` |
+| macOS, official signed release (`credsd-macos-aarch64.pkg`) | User-scoped (LaunchAgent), `credsd install --user` | `data-protection-keychain` |
 | macOS, built from source | System (LaunchDaemon), `sudo credsd install` | `secure-enclave` |
 | Linux | System (systemd) | `tpm` |
 | Windows | Not yet decided | — |

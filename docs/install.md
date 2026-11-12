@@ -12,7 +12,7 @@
 
 | Artifact and platform | Command | Service manager | Daemon runs as | Backend |
 |---|---|---|---|---|
-| macOS, official signed release (not yet published) | `credsd install --user` | launchd LaunchAgent | your uid | `data-protection-keychain` |
+| macOS, official signed release | `credsd install --user` | launchd LaunchAgent | your uid | `data-protection-keychain` |
 | macOS, built from source | `sudo credsd install` | launchd LaunchDaemon | `credsd` | `secure-enclave` |
 | Linux | `sudo credsd install` | systemd unit + socket | `credsd` | `tpm` |
 | Windows | not yet decided | — | — | — |
@@ -45,17 +45,21 @@ provisioned, which its first `creds bootstrap` does.
 
 ## macOS user-scoped install
 
-Official signed release only, which is not yet published. The release is a `.pkg` carrying `Credsd.app`, with the daemon
-at `Contents/MacOS/credsd` and the client at `Contents/Resources/creds`.
+Official signed release only. The release is `credsd-macos-aarch64.pkg`, published on
+[Releases](https://github.com/aws/credential-daemon/releases) with a detached PGP
+signature, Apple Silicon only, carrying `Credsd.app`, with the daemon at
+`Contents/MacOS/credsd` and the client at `Contents/Resources/creds`.
 
 | Installer destination | Bundle | Symlinks |
 |---|---|---|
-| Me only (`installer -pkg credsd.pkg -target CurrentUserHomeDirectory`) | `~/Applications/Credsd.app` | `~/.local/bin/{credsd,creds}` |
+| Me only (`installer -pkg credsd-macos-aarch64.pkg -target CurrentUserHomeDirectory`) | `~/Applications/Credsd.app` | `~/.local/bin/{credsd,creds}` |
+| All users (`sudo installer -pkg credsd-macos-aarch64.pkg -target /`) | `/Applications/Credsd.app` | `/usr/local/bin/{credsd,creds}` |
 
 A private install appends a block marked `# Added by credsd` to `~/.zprofile` or
 `~/.bash_profile` when `~/.local/bin` is not already on `PATH`.
 
-The `.pkg` registers the service for the account that installed it. If that step did not run,
+The `.pkg` registers the service for the account that installed it, or for the console user
+when the install ran as root. If that step did not run,
 register it by hand in a new terminal:
 
 ```bash

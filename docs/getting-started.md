@@ -12,7 +12,7 @@
 
 | Platform | Build | Path |
 |---|---|---|
-| macOS | Official signed release (`.pkg`, not yet published) | [A: user-scoped install](#path-a-macos-official-signed-release) |
+| macOS (Apple Silicon) | Official signed release (`credsd-macos-aarch64.pkg`) | [A: user-scoped install](#path-a-macos-official-signed-release) |
 | macOS | Built from this repository | [B: system install](#path-b-macos-open-source-build) |
 | Linux | Any | [C: system install](#path-c-linux) |
 
@@ -21,19 +21,38 @@ protects.
 
 ## Path A: macOS, official signed release
 
-The signed release is not yet published; until it is, use Path B.
-
-Install the package for yourself:
+Signed and notarized, Apple Silicon only — the installer refuses to run on an Intel Mac.
+Download it from [Releases](https://github.com/aws/credential-daemon/releases) and verify
+the detached signature against the public key in [`KEYS`](../KEYS):
 
 ```bash
-installer -pkg credsd.pkg -target CurrentUserHomeDirectory
+base=https://github.com/aws/credential-daemon/releases/latest/download
+curl -fLO "$base/credsd-macos-aarch64.pkg"
+curl -fLO "$base/credsd-macos-aarch64.pkg.sig"
+curl -fsSL https://raw.githubusercontent.com/aws/credential-daemon/main/KEYS | gpg --import
+gpg --verify credsd-macos-aarch64.pkg.sig credsd-macos-aarch64.pkg
 ```
 
-The installer registers the user-scoped service for your account, so in a new terminal:
+The package carries `Credsd.app` with both binaries inside the bundle, and offers two
+destinations:
+
+```bash
+# Me only — bundle in ~/Applications, symlinks in ~/.local/bin
+installer -pkg credsd-macos-aarch64.pkg -target CurrentUserHomeDirectory
+
+# All users of this Mac — bundle in /Applications, symlinks in /usr/local/bin
+sudo installer -pkg credsd-macos-aarch64.pkg -target /
+```
+
+The service is user-scoped either way. The installer registers it for the installing
+account, or for the console user when the install ran as root, so in a new terminal:
 
 ```bash
 credsd status
 ```
+
+A private install also adds `~/.local/bin` to `PATH` in your shell profile when it is not
+already there, which is the other reason for the new terminal.
 
 Every other account on a shared install registers its own, once, with `credsd install
 --user` — that one does carry a typed security prompt.
