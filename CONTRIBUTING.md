@@ -43,24 +43,8 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-### macOS: code signing for Secure Enclave (one-time)
-
-The Secure Enclave storage backend requires a code-signed binary. `demo/reinstall.sh`
-handles signing automatically, but it needs a local self-signed certificate first:
-
-1. Open **Keychain Access.app**
-2. Menu: **Keychain Access → Certificate Assistant → Create a Certificate…**
-3. **Name**: `credsd-dev`, **Identity Type**: Self Signed Root, **Certificate Type**: Code Signing
-4. Click **Create**, then **Done**
-5. Trust it for code signing (both user and system level):
-     ```bash
-     security find-certificate -a -c "credsd-dev" -p > /tmp/credsd-dev.pem
-     security add-trusted-cert -p codeSign -k ~/Library/Keychains/login.keychain-db /tmp/credsd-dev.pem
-     sudo security add-trusted-cert -d -p codeSign /tmp/credsd-dev.pem
-     ```
-
-After that, `demo/reinstall.sh` signs every build automatically. You only need to do this
-once per machine.
+`scripts/install.sh` builds and symlinks the daemon onto PATH in one step. It links
+`credsd` only — the `creds` client is not installed by it.
 
 ## Code Style
 
@@ -81,8 +65,8 @@ Error messages: lowercase start, no trailing period, include actionable context.
 
 ```rust
 // Good
-"profile '{}' not found. Run 'credsd bootstrap' first"
-"no daemon running on port {}. Start with 'credsd serve' or omit --attach"
+"env '{}' not found. Run 'credsd bootstrap' first"
+"storage backend '{}' is not compiled into this build; rebuild with `--features {}`"
 
 // Bad
 "Profile not found."
@@ -139,11 +123,11 @@ Note: there is no Windows CI row, so the `#[cfg(target_os = "windows")]` code (`
 
 ## Submitting Changes
 
-1. Create a feature branch from `develop`
+1. Create a feature branch from `main`
 2. Make focused, small changes
 3. Run the pre-commit hygiene checks above
 4. Commit with a clear message describing the why
-5. Open a PR against `develop` (or `main` for releases)
+5. Open a PR against `main`
 
 ## Spec-Required Changes
 
@@ -151,19 +135,18 @@ Changes to the following require a spec (requirements.md + design.md) before imp
 
 - New credential provider type (auth mode)
 - Storage backend additions
-- API surface changes (new HTTP endpoints, response format changes)
+- API surface changes (new JSON-RPC methods on the Unix socket, response format changes)
 - Security model modifications (trust boundaries, threat model)
 - Breaking changes to config.toml format
-- Sandbox runtime additions
 
 Changes that do NOT require a spec: bug fixes, internal refactors, documentation, dependency updates, CI changes, new output formats on existing commands.
 
 ### Spec Format
 
-Specs live in `.kiro/specs/<feature-name>/`. The path is a convention — any editor, agent, or human can produce the files. No specific tooling is required.
+Specs live in `docs/specs/<feature-name>/`. The path is a convention — any editor, agent, or human can produce the files. No specific tooling is required.
 
 ```
-.kiro/specs/my-feature/
+docs/specs/my-feature/
 ├── requirements.md    # What: user stories, acceptance criteria, constraints
 ├── design.md          # How: technical approach, data flow, API shapes, alternatives considered
 └── tasks.md           # Work breakdown: generated only when spec reaches "accepted" status
@@ -309,7 +292,7 @@ Task 2 is independent
 - Include a dependency graph at the bottom showing which tasks block others
 - Update status as work proceeds; a task is `[x]` only when it compiles, passes tests, and satisfies its linked acceptance criteria
 
-Tasks are execution scaffolding. They may be deleted or gitignored before merging to `main` — the durable record is requirements + design. They may also be retained on `develop` as progress tracking during active work.
+Tasks are execution scaffolding. They may be deleted or gitignored before merging to `main` — the durable record is requirements + design. They may be retained on the feature branch as progress tracking during active work.
 
 ---
 
