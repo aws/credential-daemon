@@ -74,9 +74,10 @@ task keeps working without holding anything long-lived. The last row is the plai
 and it is the exception. Field-level detail is in the
 [configuration reference](reference/configuration.md#credentialstoml).
 
-† `jwt-bearer` is experimental and no published build enables it; it needs a build from source
-with `--features jwt-bearer`. See
-[`jwt-bearer`](reference/configuration.md#jwt-bearer) in the configuration reference.
+† `jwt-bearer` is experimental and subject to change, and no published build enables it; it needs
+a build from source with `--features jwt-bearer`. See
+[`creds bootstrap jwt-bearer`](reference/commands.md#creds-bootstrap-jwt-bearer) in the command
+reference.
 
 ### Environment definitions
 

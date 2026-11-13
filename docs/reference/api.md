@@ -264,9 +264,6 @@ Notes:
 - `aws_web_identity` and `jwt_bearer` endpoints must be `https://` with no userinfo. `scopes` always
   gains `openid`. After sealing, `aws_web_identity` federates once; failure there returns an error
   even though the credential was saved.
-- `jwt_bearer` needs a build with the `jwt-bearer` feature, which no published build enables, and
-  is experimental; a default daemon rejects it here, though `source` still reports it for a
-  credential stored by a feature build.
 - `env_var` defaults to the credential name, upper-cased (`.`, `-`, `_` folded to `_`; a leading digit gets a `_` prefix).
 
 Result: `{}`.
