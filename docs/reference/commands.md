@@ -304,7 +304,9 @@ creds config get <KEY> --environment <ENV>
 
 ### creds config unset
 
-Remove a key, reverting to its default.
+Remove a key, reverting to its default. `identity_type` is the exception: an absent
+`identity_type` is read as `human`, the most privileged tier, so unsetting it is refused —
+set it to an explicit tier instead.
 
 ```
 creds config unset <KEY> --environment <ENV>
