@@ -42,23 +42,26 @@ ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
 
 # Build and verify
 cargo build
-cargo test
-cargo clippy -- -D warnings
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-`scripts/install.sh` builds the workspace and symlinks the daemon onto PATH in one step. It
-links `credsd` only, so link the `creds` client alongside it to run the client examples
-below:
+Those four commands are the same ones CI runs on every PR; see
+[Pre-commit Hygiene](#pre-commit-hygiene) for the extra rows CI adds for feature-gated code
+and dependency changes. Nothing else in this section is needed to build, test, or lint.
 
-```bash
-./scripts/install.sh
-sudo ln -sfn "$PWD/target/debug/creds" /usr/local/bin/creds
-```
+To exercise the daemon and the `creds` client end to end, follow
+[docs/getting-started.md](docs/getting-started.md) Path B: it installs both binaries, runs
+`sudo credsd install`, and checks `credsd status`. Every `creds` command talks to the daemon
+over its Unix socket, so without that install step there is nothing to connect to.
 
-Both links point into `target/`, so a rebuild lands behind them with no reinstall. See
-[docs/getting-started.md](docs/getting-started.md) for the installed-copy paths a user
-follows instead.
+`scripts/install.sh` is the shortcut for the build-and-relink half of that loop: it builds
+the workspace and symlinks `credsd` onto PATH. On a Mac with no Secure Enclave (a VM, a
+pre-T2 Intel) pass `FEATURES=file` — the default build has no usable storage backend there.
+The link points into `target/`, so a rebuild lands behind it with no reinstall for
+*interactive* use only; the service runs a root-owned copy that `sudo credsd install`
+stages, so re-run that to put a new build behind the service.
 
 ## Code Style
 
@@ -125,11 +128,26 @@ Run before every commit:
 
 ```bash
 cargo fmt
-cargo clippy -- -D warnings
-cargo test
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
 ```
 
 All three must pass locally. CI enforces them too — catching issues locally avoids fixup commits cluttering the history.
+
+CI lints more than that, because the default run compiles neither the platform-gated nor the
+feature-gated arms. It adds `--features secure-enclave,file` on macOS and
+`--features credsd-core/tpm` (needs `libtss2-dev`) and `--features credsd-core/kkrs` on
+Linux. If you touched code behind one of those gates, run the matching row locally — the
+default run never compiles it.
+
+Dependency changes have one more gate: `THIRD-PARTY-LICENSES.md` must track `Cargo.lock`, and
+CI regenerates it and fails on any diff. After changing a dependency, regenerate it in the
+same commit:
+
+```bash
+cargo install cargo-about --locked --version 0.9.3   # the version CI pins
+cargo about generate --all-features --workspace --locked -o THIRD-PARTY-LICENSES.md about.hbs
+```
 
 Commit discipline: one meaningful commit per push. If CI fails on something you missed locally, amend the commit and force-push the branch rather than stacking "fix fmt" / "fix clippy" commits.
 
@@ -140,7 +158,7 @@ Note: there is no Windows CI row, so the `#[cfg(target_os = "windows")]` code (`
 1. Create a feature branch from `main`
 2. Make focused, small changes
 3. Run the pre-commit hygiene checks above
-4. Commit with a clear message describing the why
+4. Commit with `git commit -s` and a clear message describing the why — the sign-off is the DCO certification and is mandatory on every commit
 5. Open a PR against `main`
 
 ## Spec-Required Changes
@@ -163,48 +181,54 @@ Specs live in `docs/specs/<feature-name>/`. The path is a convention — any edi
 docs/specs/my-feature/
 ├── requirements.md    # What: user stories, acceptance criteria, constraints
 ├── design.md          # How: technical approach, data flow, API shapes, alternatives considered
-└── tasks.md           # Work breakdown: generated only when spec reaches "accepted" status
+└── tasks.md           # Work breakdown: optional scaffolding, written when a spec is accepted
 ```
 
 ### Spec Lifecycle and Status
 
-Status is recorded in YAML front matter of `requirements.md` only (the lead artifact). Other files in the spec directory inherit the status of their `requirements.md`. Valid statuses:
+Status is recorded in `requirements.md` only (the lead artifact). Other files in the spec directory inherit the status of their `requirements.md`. Two notations are equivalent, and both are in use in `docs/specs/`:
 
-| Status | Meaning | `tasks.md` present? |
-|--------|---------|---------------------|
-| `proposal` | Under discussion. Design may change. No commitment to implement. | No |
-| `accepted` | Approved for implementation. Task list generated. | Yes |
-| `complete` | Implemented as designed. All MUST/SHALL criteria verified in code. | Yes (all tasks `[x]`) |
-| `rejected` | Evaluated and declined. Retained for historical context. | No |
-
-**Front matter format** (required on `requirements.md`):
 ```yaml
 ---
-status: proposal
-authors: [github-username]
-created: YYYY-MM-DD
-completed: YYYY-MM-DD    # only present when status is complete
-rejected_reason: "..."   # only present when status is rejected
+status: accepted
+created: 2026-10-04
 ---
 ```
 
+```markdown
+**Status:** accepted
+```
+
+The bold-line form is the more common one, and it usually carries a trailing clause
+qualifying what the status means for that spec ("accepted — compiled only with the `kkrs`
+feature, which no shipped build enables"). That qualification is worth keeping. Pick one
+notation per spec; do not write both.
+
+Valid statuses:
+
+| Status | Meaning |
+|--------|---------|
+| `draft` | Being written or under discussion. Design may change. Approval means "proceed to implementation". |
+| `proposal` | Synonym for `draft`. No spec currently uses it; prefer `draft`. |
+| `accepted` | Approved for implementation. |
+| `complete` | Implemented as designed. All MUST/SHALL criteria verified in code. |
+| `rejected` | Evaluated and declined. Retained for historical context. |
+
 **Transitions:**
-- `proposal → accepted`: Generate `tasks.md`. Change to `status: accepted`. Implementation may begin.
-- `accepted → complete`: All tasks in `tasks.md` are `[x]`. Verify by tracing each MUST/SHALL criterion in `requirements.md` to code that satisfies it. Change to `status: complete` and add `completed` date. The spec is now an assertion: the code conforms to this design.
-- `proposal → rejected`: Change to `status: rejected`. Add `rejected_reason` field with a one-line rationale. No `tasks.md` is created. The spec remains in the repo as a record of the decision.
-- `accepted → rejected`: Rare (scope cut, abandoned). Change status, add reason. `tasks.md` may be deleted or retained for context.
-- `complete → accepted`: If a regression is found or a requirement is unmet, revert to `accepted` and reopen the relevant task(s).
+- `draft → accepted`: Implementation may begin.
+- `accepted → complete`: Verify by tracing each MUST/SHALL criterion in `requirements.md` to code that satisfies it, then change the status. The spec is now an assertion: the code conforms to this design.
+- `draft → rejected`: Note a one-line rationale alongside the status. The spec remains in the repo as a record of the decision.
+- `accepted → rejected`: Rare (scope cut, abandoned). Change status, add reason.
+- `complete → accepted`: If a regression is found or a requirement is unmet, revert to `accepted`.
 
 **Marking a spec complete:**
 
 A spec may only move to `complete` when:
-1. Every task in `tasks.md` is marked `[x]`.
+1. Every task in `tasks.md` is marked `[x]`, if the spec has a `tasks.md` (most do not — see below).
 2. Every MUST/SHALL criterion in `requirements.md` can be traced to implementation code (a function, a test, a config path) that satisfies it.
-3. The code compiles, passes `cargo clippy -- -D warnings`, and all tests pass.
+3. The code compiles, passes `cargo clippy --all-targets -- -D warnings`, and all tests pass.
 
 This is an auditable assertion. If an agent or contributor is asked to verify spec status, they should read the requirements, trace each criterion to code, and confirm or dispute the `complete` status with evidence.
-
-Specs with no front matter are treated as accepted (legacy convention).
 
 ### Requirements Language (RFC 2119)
 
@@ -255,7 +279,7 @@ Requirements use RFC 2119 keywords (MUST, MUST NOT, SHALL, SHALL NOT, SHOULD, SH
 
 ### `tasks.md`
 
-Generated only when a spec moves from `proposal` to `accepted`. Breaks the design into ordered implementation steps, structured for delegation to agents or collaborators.
+Optional, and written only when a spec moves from `draft` to `accepted`. Breaks the design into ordered implementation steps, structured for delegation to agents or collaborators. No spec currently in `docs/specs/` keeps one.
 
 **Structure:** Two levels of nesting. Top-level tasks (## headings) are logical units of work — a module, a trait implementation, a CLI command, or a test suite. Subtasks (list items) are concrete actions within that unit.
 
