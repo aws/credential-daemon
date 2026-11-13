@@ -1,12 +1,4 @@
-<!-- maturity-notice -->
-> **Pre-release preview.** credsd is provided as a pre-release preview in coordination with
-> [Strands Box](https://github.com/strands-agents/box). Commands, configuration, the socket
-> API, and on-disk formats can change between releases, and a change does not necessarily come
-> with a migration path. The on-disk layout may change without a migration. Windows is for
-> ease of use only: there is no process-tree assessment, and `serve` does not run there yet.
-<!-- /maturity-notice -->
-
-# credsd
+# AWS Credential Daemon (credsd)
 
 credsd is a local credential daemon for developers and for the agents and tools they run. It
 holds long-lived secrets — SSO sessions, IAM user keys, Roles Anywhere private keys, OAuth and
