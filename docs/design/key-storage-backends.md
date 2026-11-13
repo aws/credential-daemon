@@ -157,8 +157,11 @@ through `security_framework::passwords` with `kSecUseDataProtectionKeychain = tr
 explicit `kSecAttrAccessGroup`, so the item lands in the daemon's default access group: the
 single entry of its `keychain-access-groups` entitlement,
 `94KV3E626L.com.amazon.aws.credsd.daemon` (`packaging/credsd.entitlements`). The enclave
-protects that keychain's key hierarchy, so the item is device-bound — a copied keychain file
-cannot be decrypted on another machine. The legacy, file-based keychain is not used by any
+protects that keychain's key hierarchy, so a keychain file copied off the disk does not yield
+the key on another machine. How much further that binding goes is not pinned and not measured
+here: the backend sets no `kSecAttrAccessible*`, so the item takes Apple's default protection
+class, and whether a backup or a migration assistant can carry it to another Mac is untested —
+see "Gaps to close". The legacy, file-based keychain is not used by any
 backend; `legacy-keychain` was removed from every build on 2026-10-07
 (`mac-pkg-installation` Requirement 7.6).
 
@@ -202,7 +205,8 @@ degrades silently to `FileStorage`.
 
 ### Residual posture
 
-- `data-protection-keychain` is device-bound, and the gate is the entitlement rather than the
+- `data-protection-keychain` is device-bound to the extent the gap below records, and the gate
+  is the entitlement rather than the
   account. A process running as the same uid without the signature cannot read the item,
   which is what makes the user-scoped install viable at all. What remains is root, and any
   binary Apple would issue the same entitlement to — which is why the release also runs under
@@ -634,6 +638,15 @@ seal that fails later.
 - **No FileVault precondition check.** Row 4's argument rests on full-disk encryption. Probe
   `fdesetup status` and refuse or warn rather than assuming. Nothing in the tree reads it
   today.
+- **The keychain item's protection class is left to Apple's default.**
+  `DataProtectionKeychainStorage` sets service, account, and
+  `kSecUseDataProtectionKeychain` and nothing else — no `kSecAttrAccessible*`, no
+  `kSecAttrSynchronizable` — so how far the device binding goes is inherited rather than
+  asserted. A copied keychain file does not yield the key, but whether a backup or a migration
+  assistant can carry the item to another Mac is untested. Pin
+  `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and the claim becomes the code's rather than
+  the platform's. This is the same "inheriting a default that has already drifted once" risk
+  the Closed entry below records for `kSecUseDataProtectionKeychain`.
 - **No automated run touches an enclave.** The backend ships from source and its
   launchd-context behavior has been observed by hand — that is where `key agreement failed
   (-6)` and the mint LaunchDaemon come from — but `hardware_round_trip` is `#[ignore]`d

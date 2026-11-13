@@ -28,7 +28,8 @@ install time"), as is local DoS. Do not report findings whose precondition is ro
 The file-and-line specifics below describe a tree with no HTTP transport: `serve` binds a Unix
 domain socket only, and there is no bearer token on it — the daemon takes the caller's uid from
 the kernel. One per-operation loopback listener remains, the OAuth authorization-code callback,
-which closes with the aws-login flow that opened it. Where a checklist item names a file or
+bound by an `aws-login` or `aws-web-identity` flow and closed with the flow that opened it. Note
+that the *daemon* binds it, not the client. Where a checklist item names a file or
 symbol, confirm it still exists before trusting the surrounding claim — a checklist that has
 drifted from the code will send you looking for the wrong bug.
 
@@ -211,8 +212,12 @@ reporting it, and drop it if it is a false positive (say that you dropped it and
   to a request sending exactly `Bearer `. Any auth secret whose type permits an empty or
   absent state is a finding regardless of whether you can reach it today — prefer a
   non-optional type so the state is unrepresentable.
-- **OAuth callback listener.** `providers/aws_login.rs` and `providers/oauth/callback.rs`
-  bind the one remaining loopback TCP listener, for an authorization-code redirect. A TCP
+- **OAuth callback listener.** `providers/oauth/callback.rs` binds the one remaining loopback
+  TCP listener, for an authorization-code redirect. Two call sites reach it, both
+  `begin_interactive_login` — `providers/aws_login.rs` for `aws-login`, and
+  `providers/oauth/mod.rs` for `aws-web-identity` (the provider there is
+  `AwsWebIdentityProvider`; the `oauth` credential type is the client-credentials grant and
+  binds nothing). Both run inside the daemon, from `server/bootstrap.rs`. A TCP
   port has **no UID boundary** — any local user can connect, and with `callback_port` set
   the port is predictable. Confirm the bind address is loopback and never `0.0.0.0`, that
   PKCE and the `state` parameter are what gate the exchange rather than the port, and that

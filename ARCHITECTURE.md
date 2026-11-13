@@ -28,11 +28,18 @@ lints do not apply to code we do not own.
 
 ## Transport
 
-The daemon serves line-delimited JSON-RPC 2.0 over a Unix domain socket and listens on nothing
-else. The socket carries no bearer token: the daemon reads the connecting process's uid from the
-kernel, so there is no credential to steal. A system install is socket-activated by launchd or
-systemd. The `credential-endpoint` projection in [docs/overview.md](docs/overview.md) is an
-address run-time tooling fills, not a listener the daemon opens.
+The daemon serves line-delimited JSON-RPC 2.0 over a Unix domain socket. That socket is the
+whole RPC surface — there is no HTTP transport — and it carries no bearer token: the daemon
+reads the connecting process's uid from the kernel, so there is no credential to steal. A system
+install is socket-activated by launchd or systemd.
+
+The daemon does bind one other listener, and only during a bootstrap or an interactive re-login:
+a loopback TCP port for an OAuth authorization-code redirect, opened by an `aws-login` or
+`aws-web-identity` flow and closed with it (`providers/oauth/callback.rs`, reached from
+`server/bootstrap.rs`). A TCP port has no uid boundary, so what gates the exchange is PKCE and
+the `state` parameter rather than the port. The `credential-endpoint` projection in
+[docs/overview.md](docs/overview.md) is a third thing again: an address run-time tooling fills,
+not a listener the daemon opens.
 
 The contract is [`docs/api/openrpc.json`](docs/api/openrpc.json), described in
 [docs/reference/api.md](docs/reference/api.md). Where the guide and the contract disagree, the
@@ -40,8 +47,8 @@ contract is correct.
 
 ## Request path
 
-`creds` → socket → `server/uds.rs` (accept, peer credentials) → `server/dispatch.rs` (resolve
-the caller, authorize, audit) → `credential_store.rs` (warm cache, background refresh) →
+`creds` → socket → `server/uds.rs` (accept, peer credentials, resolve the caller) →
+`server/dispatch.rs` (authorize, audit) → `credential_store.rs` (warm cache, background refresh) →
 `providers/` (exchange the sealed secret for a session) → response.
 
 The daemon is the only way a CLI invocation obtains credentials. There is no
