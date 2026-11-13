@@ -35,7 +35,7 @@ aws-lc-rs = "1"
 # under vendor/rolesanywhere/. Kept as a path dependency so it can later be swapped for a
 # published crate with a one-line change here. Imported as `rolesanywhere_core`.
 rolesanywhere-core = { path = "../../vendor/rolesanywhere/crates/core" }
-x509-cert = "0.2"
+x509-cert = "0.3"
 tempfile = "3"
 
 [features]
