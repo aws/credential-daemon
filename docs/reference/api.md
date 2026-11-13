@@ -447,15 +447,21 @@ Errors: `ENVIRONMENT_NOT_FOUND` (unauthorized).
 ### `file/revalidate`
 
 Reseal hand-edited config files after review. Takes no selector: a snapshot covers its whole
-file, so every drifted file is shown and resealed together.
+file, so every drifted file is shown and resealed together. Every load-bearing file that is
+present must parse before any of this is reached, whatever the trigger was; one that does not is
+corrected or restored first.
 
 Params: none.
 
 Result: `{}`.
 
 Errors: `APPROVAL_REQUIRED` (gated; the operation happens on approval, see
-[Approval](#methods)); `CONFIG_DRIFTED` (a drifted file does not parse, so no approval can ratify
-it until it is corrected or restored).
+[Approval](#methods)); `CONFIG_DRIFTED` (a load-bearing file that is present does not parse, so
+it has no canonical form and there is nothing a snapshot could ratify; raised before drift is
+classified, so it does not mean that file drifted); `CUSTODY_BROKEN` (custody of the integrity
+record or the enrolled-key registry is broken); `ENVIRONMENT_NOT_FOUND` (unauthorized); `-32602`
+(any field in `params`: the method takes none); `INTERNAL` (reading either file, hashing the base
+state, or a file that is not UTF-8).
 
 ## Errors
 
