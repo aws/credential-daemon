@@ -304,7 +304,10 @@ creds config get <KEY> --environment <ENV>
 
 ### creds config unset
 
-Remove a key, reverting to its default.
+Remove a key, reverting to its default. Two keys are refused: `credential`, which
+`creds bootstrap` owns, and `identity_type`, which is settable but not unsettable because an
+absent value is read as `human`, the most privileged tier — set it to an explicit tier
+instead. See [settable keys](configuration.md#settable-keys).
 
 ```
 creds config unset <KEY> --environment <ENV>

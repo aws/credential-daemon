@@ -99,8 +99,13 @@ role's full permissions.
 `creds config set|get|unset <key> --environment <env>` edits these. `creds config keys` lists
 them. The Variable and AWS config columns name where a consumer that delivers an environment to a
 process — run-time tooling built on the [API](api.md) — places each key: the environment variable
-it exports, and the setting it writes to every section of a generated AWS config. `credential` is
-protected; change a credential with `creds bootstrap`.
+it exports, and the setting it writes to every section of a generated AWS config.
+
+Two keys are restricted, in different ways. `credential` is blocked for read, write, and unset
+alike; change a credential with `creds bootstrap`. `identity_type` is readable and settable but
+cannot be unset: an absent `identity_type` is read as `human`, the most privileged tier, so
+removing it would grant privilege rather than drop it — set it to an explicit
+[tier](#identity-types) instead.
 
 | Key | Type | Variable | AWS config | Meaning |
 |---|---|---|---|---|
