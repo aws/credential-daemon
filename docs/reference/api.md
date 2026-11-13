@@ -130,6 +130,15 @@ it does. For
 identical call be re-sent once within 5 minutes. See [presence and sudo
 approval](../presence.md).
 
+**Drift and custody.** Before a credential is served, and before anything is written to
+`config.toml` or `credentials.toml`, the daemon checks both files against their sealed snapshots
+and checks custody of the integrity record. So `credential/get`, `credential/get_batch`,
+`credential/remove`, `environment/remove`, `environment/bootstrap`, `environment/login`,
+`environment/import`, `config/set` and `config/unset` can each fail with `CONFIG_DRIFTED`,
+`INTEGRITY_UNVERIFIABLE` or `CUSTODY_BROKEN` before doing anything else. `request/approve` and
+`presence/revoke` check custody alone, and can fail with `CUSTODY_BROKEN`. The per-method
+`Errors:` lines below name only what is specific to the method.
+
 ### `credential/get`
 
 Material for one credential. *Strict.*
@@ -267,14 +276,16 @@ Notes:
   even though the credential was saved.
 - `aws_login`: `region` is the Sign-In region. `callback_port` and `remote` are mutually exclusive —
   a remote login binds no loopback listener and the user carries the authorization code back by
-  hand. The client id is one of Sign-In's two fixed devtools clients, picked by `remote`, and it
-  fixes the redirect shape with it — so there is no `client_id` knob.
+  hand. Sending both is `PROVIDER_UNAVAILABLE`, not `-32602`: the provider refuses the pair, and
+  `callback_port` is checked as a param only for its range. The client id is one of Sign-In's two
+  fixed devtools clients, picked by `remote`, and it fixes the redirect shape with it — so there is
+  no `client_id` knob.
 - `env_var` defaults to the credential name, upper-cased (`.`, `-`, `_` folded to `_`; a leading digit gets a `_` prefix).
 - `jwt_bearer` needs a build with the `jwt-bearer` cargo feature, which no published build enables:
-  it is off by default in all three crates and no job in `.github/workflows/` turns it on. A default
-  daemon refuses to bootstrap one with `PROVIDER_UNAVAILABLE`. `source` still reports `jwt_bearer`
-  for a credential a feature build stored, but a default daemon cannot serve it — the store logs a
-  warning and registers no provider for it.
+  it is off by default in every crate that declares it and no job in `.github/workflows/` turns it
+  on. A default daemon refuses to bootstrap one with `PROVIDER_UNAVAILABLE`. `source` still reports
+  `jwt_bearer` for a credential a feature build stored, but a default daemon cannot serve it — the
+  store logs a warning and registers no provider for it.
 
 Result: `{}`.
 
@@ -343,8 +354,8 @@ Read, write, or remove one `config.toml` key of an environment. Keys are those l
 
 Errors: `APPROVAL_REQUIRED` (gated; see [Approval](#methods)); `ENVIRONMENT_NOT_FOUND`
 (unauthorized); `-32602` (bad name, unknown key, invalid value, or the protected key
-`credential`); `CONFIG_DRIFTED`, `INTEGRITY_UNVERIFIABLE`, and `CUSTODY_BROKEN` (`config/set` and
-`config/unset` only, which check before they write); `INTERNAL`.
+`credential`); `INTERNAL`. `config/get` runs no drift or custody check; `config/set` and
+`config/unset` do, as in [Drift and custody](#methods).
 
 A missing environment is not reported uniformly: `config/set` and `config/unset` send `-32602`,
 `config/get` sends `INTERNAL`. A client that branches on a missing environment must accept both

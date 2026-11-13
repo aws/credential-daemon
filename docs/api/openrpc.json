@@ -1986,7 +1986,7 @@
               },
               "callback_port": {
                 "type": "integer",
-                "minimum": 0,
+                "minimum": 1024,
                 "maximum": 65535
               }
             },
