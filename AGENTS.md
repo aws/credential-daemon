@@ -76,8 +76,8 @@ and a separate `target/llvm-cov-target/` build dir, so they do not share artifac
 `cargo build` — alternating between the two rebuilds each time, which is expected, not
 a broken cache. And `tracing` does not evaluate a log macro's field expressions unless
 a subscriber is installed, so audit-record fields read as covered while nothing has
-checked them; use the `LogCapture` helper in the `server/mod.rs` tests to assert on
-emitted records.
+checked them. No test currently installs one, so no audit record's contents are asserted
+anywhere; a test that needs to check emitted fields has to stand up its own subscriber.
 
 ## Toolchain
 
@@ -121,24 +121,39 @@ dir is also under `$HOME`: one writer per directory.
 
 ## Project Structure
 
+Four crates, two binaries, and the crate directory names do not match the binaries:
+`crates/credsd` builds `creds` (the client) and `crates/credsd-daemon` builds `credsd`
+(the daemon).
+
 ```
-src/
-├── main.rs              CLI definition (clap) + subcommand dispatch
-├── lib.rs               Public module declarations
-├── error.rs             DaemonError enum
-├── config/              Configuration parsing, platform paths
-├── storage/             SecureStorage trait + platform backends
-├── providers/           CredentialProvider trait + implementations (SSO, etc.)
-├── server/              HTTP server (axum), routes, middleware
-├── credential_store.rs  In-memory cache + background refresh
-├── credential_env.rs    Credential variable naming + env-var formatting
-├── credential_resolve.rs  Credential fetch strategy (daemon vs standalone)
-├── credentials.rs       Credential data model
-├── encryption.rs        AES-256-GCM envelope encryption
-├── auth.rs              Bearer token generation + validation
-├── bootstrap.rs         Interactive credential setup (+ convenience 1-cred env)
-└── get.rs               Output formatting (credential_process, shell, etc.)
+crates/
+├── credsd-core/src/        shared internals; no server
+│   ├── error.rs            DaemonError enum
+│   ├── config/             config + credential files, platform paths
+│   ├── storage/            SecureStorage trait + platform backends
+│   ├── providers/          CredentialProvider trait + implementations
+│   ├── rpc/                JSON-RPC envelope, codec, method surface, the client-side
+│   │                       UDS call (`rpc/uds.rs`)
+│   ├── encryption.rs       AES-256-GCM envelope encryption
+│   ├── credentials.rs      Credential data model
+│   ├── credential_resolve.rs  Credential fetch over the daemon socket
+│   ├── credential_env.rs   Credential variable naming + env-var formatting
+│   ├── projection.rs       How a credential reaches its consumer
+│   ├── presence.rs         Presence challenge + enrolled-key types
+│   ├── bootstrap.rs        Interactive credential setup
+│   └── get.rs              Output formatting (credential_process, shell, etc.)
+├── credsd-daemon/src/      the `credsd` binary
+│   ├── main.rs             CLI (clap) + subcommand dispatch
+│   ├── server/             UDS accept, caller assessment, dispatch, presence gating
+│   ├── credential_store.rs In-memory cache + background refresh
+│   ├── install.rs          launchd / systemd service install
+│   └── hardening.rs        Process hardening applied before any key is loaded
+├── credsd/src/             the `creds` binary: the unprivileged client CLI
+└── credsd-client/src/      the public Rust client library for the socket protocol
 ```
+
+Per-file detail goes stale faster than it earns its keep; `docs/specs/` and `docs/design/`
+are the authority for behavior, and `ARCHITECTURE.md` for how the crates fit together.
 
 ## Commit Style
 

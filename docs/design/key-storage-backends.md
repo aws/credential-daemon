@@ -25,10 +25,12 @@ hardware-resident. That is a different property with different mechanisms; see
 
 ## Reading this document
 
-Backend posture is split into **current state** and **target state**, because they differ
-materially on macOS and the difference is the point. Current state describes what a build
-of `main` does today, including defects. Target state describes where the design is going
-and is not yet true. The platform constraint section between them is neither — it is a
+Backend posture is split into **current state** and **target state**. Most of the target
+state has landed, so the split now reads as reasoning rather than as a plan: current state
+describes what a build of `main` does today, and target state describes the custody model
+and why each row is the row it is. Where the two disagree, current state is what ships and
+"Gaps to close" names the difference — the one open disagreement is which material the data
+protection keychain holds. The platform constraint section between them is neither — it is a
 property of macOS that both states must live with.
 
 ## The three properties
@@ -94,18 +96,24 @@ trusted, and on macOS it is narrow and enterprise-dependent.
 
 | Backend | Platform | Key at rest | Hardware binding | Who can unwrap | Identity authz | Status on `main` |
 |---|---|---|---|---|---|---|
-| `keychain` | macOS | wrapped in a login keychain | no | the owning login account, keychain unlocked | keychain ACL, account-scoped | shipped; auto-detected unconditionally (defect) |
+| `data-protection-keychain` | macOS | item in the data protection keychain | **yes** (SE-protected keychain hierarchy) | the entitled signed binary, in a login session | `keychain-access-groups` entitlement — **per-binary**, not per-account | shipped; the only backend a user-scoped install may hold a key in |
 | `tpm` | Linux | sealed blob on disk (`0600`) | **yes** (TPM 2.0) | anyone who can open `/dev/tpmrm0` | **none** | shipped; device seam built into the `-tpm` Linux artifacts only |
-| `dpapi` | Windows | DPAPI blob on disk | no | the service account, on this machine | Windows account scope | shipped; auto-detected |
-| `credential-manager` | Windows | Credential Manager vault | no | the service account, interactive logon | Windows account scope | shipped; explicit only |
+| `dpapi` | Windows | DPAPI blob on disk | no | the service account, on this machine | Windows account scope | compiled on Windows, built by no CI row; what resolution *would* pick, except that no Windows install exists |
+| `credential-manager` | Windows | Credential Manager vault | no | the service account, interactive logon | Windows account scope | compiled on Windows, built by no CI row; explicit only |
 | `file` | all | **plaintext** key file (`0600`) | no | the owning uid, and root | filesystem permissions | shipped; explicit only |
 | `kkrs` | Linux | kernel keyring, never on disk | no | the owning uid (keyutils default) | kernel keyring, uid-scoped | on `main` behind the `kkrs` feature; in no published build |
-| `secure-enclave` | macOS | ECIES blob on disk, SE-wrapped | **yes** (SE) | anyone who can read the blob | **none** | prototyped only; the prototype takes a different (Path A) design |
+| `secure-enclave` | macOS | ECIES blob + enclave key blob on disk (`0600`) | **yes** (SE) | anyone who can read the blobs *from the launchd context that minted them* | **none** beyond file mode | shipped from source behind the `secure-enclave` feature; absent from the signed release; the hardware round-trip test is `#[ignore]`d, so CI proves nothing about the enclave itself |
 
-`file` and `kkrs` are reachable only by explicit selection. Auto-detect never falls back
+`file` and `kkrs` are reachable only by explicit selection. Resolution never falls back
 to them: each carries a materially different guarantee, and a silent fallback would be a
-silent posture change. On Linux, auto-detect resolves to `tpm` or to a configuration
-error — never to a weaker backend.
+silent posture change. On Linux, resolution gives `tpm` or a configuration error — never a
+weaker backend.
+
+Resolution happens at `credsd install` and nowhere else. `credsd serve` and `credsd init`
+both require `--storage-backend` and refuse to run without it, so an install fixes the
+backend once and bakes it into the service definition; the daemon never re-resolves one
+between installs. Nothing mints a key implicitly either — see
+[`docs/key-security.md`](../key-security.md), "Changing backend".
 
 ## The shared architecture
 
@@ -130,62 +138,88 @@ rather than the wrong ones. A connection is not a grant. The sole gate is deny-b
 on `callers/<uid>/owner`, keyed to the kernel-reported peer uid from `SO_PEERCRED`, with
 the recorded username re-checked against `getpwuid(uid)` to catch uid reuse.
 
-This is the load-bearing consequence: **an attacker who reaches the `credsd` uid has the
-master key on every platform**, because the key store's own access control is scoped no
-more finely than that account. Hardware binding raises the cost of *offline* attacks. It
-does nothing about that one.
+This is the load-bearing consequence: **an attacker who reaches the account the daemon runs
+as has the master key**, because most key stores' own access control is scoped no more finely
+than that account. Hardware binding raises the cost of *offline* attacks. It does nothing
+about that one.
+
+One backend is the exception, and it is the reason the user-scoped shape exists at all:
+`data-protection-keychain` scopes the item to an entitlement, so reaching the account is
+necessary but not sufficient — see "macOS" below.
 
 ## macOS
 
-`KeychainStorage` stores the master key as a generic password — service
-`aws.identity.credsd`, account `daemon-encryption-key.<ns>` — through
-`security_framework::passwords`, which issues `SecItemAdd`/`SecItemCopyMatching` against
-the **legacy, file-based keychain**. There is no Secure Enclave involvement and no
-hardware binding: the key is wrapped by a key derived from the owning account's password,
-in a file on disk.
+Two backends, and which one a build can reach is decided by its signature.
 
-**This is a consequence of signing, not a free choice of API.** The data protection
-keychain — and therefore the Secure Enclave *as reached through the keychain* — is gated
-behind a `keychain-access-groups` entitlement, which requires a provisioning profile issued
-against a real team identity. An unsigned or ad-hoc-signed build cannot hold that
-entitlement, so the legacy keychain is the only store it can reach. (A second route to the
-Secure Enclave exists that bypasses the keychain and its entitlement entirely; see "The
-macOS constraint", Path C.) The gate is observable in the Path A prototype: every SE key
-there is created
-with `kSecAttrAccessGroup=aws.identity.credsd`, and `SecKeyCreateRandomKey` returns
-`errSecMissingEntitlement` for ad-hoc or unsigned binaries; the `spikes/sep-probe` bundle
-that does work carries an embedded provisioning profile granting
-`keychain-access-groups: [4VU7CJK5G7.aws.identity.credsd]` under team ID `4VU7CJK5G7`.
-Reaching the data protection keychain for a *generic password* item is the same documented
-entitlement gate, though only the SE key path has been measured here.
+`DataProtectionKeychainStorage` stores the master key as a generic password — service
+`com.amazon.aws.credsd` (`storage::SERVICE_NAME`), account `daemon-encryption-key.<ns>` —
+through `security_framework::passwords` with `kSecUseDataProtectionKeychain = true` and **no**
+explicit `kSecAttrAccessGroup`, so the item lands in the daemon's default access group: the
+single entry of its `keychain-access-groups` entitlement,
+`94KV3E626L.com.amazon.aws.credsd.daemon` (`packaging/credsd.entitlements`). The enclave
+protects that keychain's key hierarchy, so a keychain file copied off the disk does not yield
+the key on another machine. How much further that binding goes is not pinned and not measured
+here: the backend sets no `kSecAttrAccessible*`, so the item takes Apple's default protection
+class, and whether a backup or a migration assistant can carry it to another Mac is untested —
+see "Gaps to close". The legacy, file-based keychain is not used by any
+backend; `legacy-keychain` was removed from every build on 2026-10-07
+(`mac-pkg-installation` Requirement 7.6).
 
-### Defect: unconditional keychain selection
+**The entitlement is the access control, which makes signing load-bearing.** A
+`keychain-access-groups` entitlement requires a provisioning profile issued against a real
+team identity, so only the signed release carries it. `creds` deliberately does not
+(`presence-gated-operations` Requirement 7.5), which is what keeps a binary the caller runs
+outside the boundary. A from-source build has no signing identity, holds no entitlement, and
+cannot reach the item at all — not a weaker version of the same custody, no custody. It uses
+`secure-enclave` instead, which reaches the enclave by Path C and needs no entitlement; see
+"The macOS constraint".
 
-`auto_detect()` returns `Ok(Backend::Keychain)` on macOS unconditionally — it does not
-consider the install shape, the signing state of the binary, or whether a usable keychain
-exists. This is a bug, not a design. It is wrong in the common case: the default install
-is a `/Library/LaunchDaemons` plist running as `credsd`, an account with no home directory
-and therefore no login keychain and no unlock event.
+`SecureEnclaveStorage` wraps the master key to an SE-resident P-256 key and persists only
+ciphertext: `<data_dir>/secure-enclave/<key_id>.sekey` holds the enclave key's opaque
+`dataRepresentation` and `<key_id>.sealed` the ECIES-wrapped master key, both `0600` in a
+`0700` directory. The enclave is reached through CryptoKit rather than `SecItem`, because the
+`SecItem` route goes back through the data protection keychain. The key binds to the launchd
+context that minted it and not merely to the uid — a key minted outside launchd fails to
+unwrap inside the service with `key agreement failed (-6)` — which is why a system install
+mints through a one-shot LaunchDaemon (`com.amazon.aws.credsd.mint`) rather than in the
+installing process.
 
-What keeps it from becoming a silent failure is the probe. `create_storage` exercises the
-backend with a real store/delete round-trip before returning it, and on failure emits a
-configuration error steering the operator to a user-scoped install or to `file`. A
-Keychain probe failure returns `Err` rather than silently degrading to `FileStorage`. The
-result is a correct refusal arrived at by accident: the selection is wrong, and a separate
-mechanism catches it.
+### Selection, and why a LaunchDaemon never gets the keychain
 
-Whether the Keychain backend can work at all under a LaunchDaemon is **not established** —
-testing has been inconclusive.
+Selection is a probe, not an assumption, and it happens once per install. Resolution without
+`--storage-backend` is reached only from `credsd install`:
+
+- `credsd install --user` resolves `data-protection-keychain` when the probe succeeds. Any
+  other resolved backend is refused outright, because the keychain is the only keystore a
+  service running as its own caller's uid may hold a key in — `secure-enclave`'s `0600` key
+  file is open to every other process running as that same login uid.
+- `sudo credsd install` pins `secure-enclave` and never considers the keychain. This is now
+  settled rather than inconclusive: the data protection keychain needs a login session and a
+  LaunchDaemon has none, so `reachable_by_system_service` excludes it and an explicit
+  `--storage-backend data-protection-keychain` on a system install is refused.
+
+The probe is a real store/delete round-trip. `create_storage` exercises the backend before
+returning it, and on failure returns a configuration error naming the entitlement
+(`94KV3E626L.com.amazon.aws.credsd.daemon`) and pointing at `secure-enclave`. It never
+degrades silently to `FileStorage`.
 
 ### Residual posture
 
-- The key is wrapped, not hardware-bound. Disk theft plus the account password yields it;
-  FileVault is the control that makes that combination hard, and FileVault is a whole-disk
-  property the daemon does not own.
-- Keychain ACLs bind the item to the owning account, not to the credsd binary. Any process
-  running as that account can read it.
-- `kSecAttrAccessible*` protection classes are meaningless in a daemon context: there is
-  no unlock event for them to gate on.
+- `data-protection-keychain` is device-bound to the extent the gap below records, and the gate
+  is the entitlement rather than the
+  account. A process running as the same uid without the signature cannot read the item,
+  which is what makes the user-scoped install viable at all. What remains is root, and any
+  binary Apple would issue the same entitlement to — which is why the release also runs under
+  the hardened runtime with no `get-task-allow`, so the signed daemon cannot be attached to or
+  injected into. See [`SECURITY.md`](../../SECURITY.md).
+- `secure-enclave` is device-bound but has no identity gate. Within a system install the
+  `credsd` service account owns the blobs and file mode is the whole boundary; within a user
+  install it would be no boundary at all, hence the refusal above.
+- This is the one place the "reach the account, get the key" rule from *The shared
+  architecture* is narrower than on other platforms. For `secure-enclave` it holds exactly:
+  the account is the whole gate. For `data-protection-keychain` it does not — the account is
+  necessary and not sufficient, because the item is also scoped to the entitlement, so the
+  attacker needs code carrying the daemon's signature as well.
 
 ## Linux
 
@@ -208,17 +242,22 @@ All TPM logic — policy, sidecar, recovery, backend wiring — is compiled and 
 feature is therefore off in a default build and on in the `-tpm` Linux release artifacts,
 one per AL2023 and Ubuntu architecture (AL2 has no variant); see
 [`tpm-linux-artifact.md`](tpm-linux-artifact.md). Without the feature, seal and unseal
-return a clear "requires the `tpm` feature" error. Note that `Backend::Tpm.is_available()`
-probes only for the existence of `/dev/tpmrm0` and not for the feature, so on a default
-build on TPM-equipped hardware auto-detect selects `tpm` and the failure surfaces at first
-store rather than at selection.
+return a clear "requires the `tpm` feature" error, but nothing gets that far:
+`Backend::Tpm.is_available()` requires the feature as well as `/dev/tpmrm0`, so a default
+build on TPM-equipped hardware never selects `tpm`. The failure surfaces at selection —
+`credsd install` errors with "no hardware-backed storage available", and an explicit
+`--storage-backend tpm` errors with "not compiled into this build" — rather than at first
+store.
 
 ### Hardware binding: yes
 
 This is the one backend in the set that genuinely has it. The blob is useless on any other
 machine, and a stolen disk yields nothing. Unseal failure is a real operational mode — TPM
-clear or replacement — so the key-init path regenerates
-and then purges the sealed credential artifacts the new key can no longer decrypt.
+clear or replacement — and it stops startup rather than recovering on its own, so that
+nothing destroys a credential the next boot might have opened. The operator runs `credsd
+init --reset --storage-backend tpm`, which quarantines the undecryptable blobs and mints a
+fresh key; see Requirement 3.3 and 3.4 of the
+[TPM backend spec](../specs/tpm-encryption-backend/requirements.md).
 
 ### The authorization gap
 
@@ -429,43 +468,49 @@ unsound.
 
 ## One key model, three custody choices
 
-The three macOS backends are not three architectures. **All of them wrap the master key to
-an SE-resident P-256 key via ECIES and persist only ciphertext; none stores the AES key
-itself.** What varies between them is custody of the enclave key's opaque
-`dataRepresentation` blob — and therefore who can read it.
+The three macOS backends are not three architectures. The custody model that organizes them
+is one envelope — the master key wrapped to an SE-resident P-256 key via ECIES, only the
+ciphertext persisted — with three choices of where the enclave key's opaque
+`dataRepresentation` blob lives, and therefore of who can read it.
 
-| Backend | `.sekey` custody | Reader gate | Install shape | Signing |
+| Backend | Custody of the material on disk | Reader gate | Install shape | Signing |
 |---|---|---|---|---|
-| `secure-enclave` | `0600` file | file mode + the `credsd` service account | system **or** user | irrelevant |
-| `keychain` | legacy keychain | per-item ACL, prompt-mediated | user only | irrelevant |
-| `keychain-dp` | data protection keychain | access group, entitlement-enforced | user only | **required** |
+| `secure-enclave` | the `.sekey` blob, a `0600` file | file mode + the `credsd` service account | system only — a user install is refused | irrelevant |
+| `keychain` | the `.sekey` blob, in the legacy keychain | per-item ACL, prompt-mediated | user only | irrelevant |
+| `data-protection-keychain` | the master key itself, as a keychain item | access group, entitlement-enforced | user only | **required** |
 
 The `keychain` row is a record, not a live option: `legacy-keychain` was removed from every
 build on 2026-10-07 (`mac-pkg-installation` Requirement 7.6). It was reachable only from a
 user-scoped install, which already refused it, and its items are plantable by the uid.
 
+The `data-protection-keychain` row is the one place the envelope is not what ships. The
+backend hands the raw master key to the keychain and the keychain's own SE-protected key
+hierarchy supplies the hardware binding, so the item is device-bound without credsd wrapping
+anything; moving it to `.sekey` custody is an open gap, not a property of the current build.
+
 Three consequences worth holding onto:
 
-**The invariant is uniform.** No configuration of credsd on SE-capable hardware stores the
-AES-256 master key. A bypass of any backend's reader gate yields a *use-oracle* — the
-ability to ask that machine's enclave to unwrap, while you retain read access, on that
-machine — not a portable secret. Compare a design that puts the AES key in a keychain item:
-there, a bypass hands over the key itself, exfiltratable and usable off-device forever. The
-envelope makes every backend fail soft.
+**The envelope is what makes a reader-gate bypass fail soft.** Where it is in place —
+`secure-enclave` — a bypass yields a *use-oracle*: the ability to ask that machine's enclave
+to unwrap, while you retain read access, on that machine. Not a portable secret. Under
+`data-protection-keychain` custody a bypass hands over the AES key itself, and only its
+device binding keeps it from being usable off the machine; that is the gap above, stated as
+what it costs.
 
-**Signing is load-bearing for exactly one backend.** For `keychain-dp` the
+**Signing is load-bearing for exactly one backend.** For `data-protection-keychain` the
 `keychain-access-groups` entitlement *is* the access group, so the signature is the security
 control. For `secure-enclave` signing buys nothing security-relevant — Path C needs no
 entitlement, and the blob carries no code identity — so it is a distribution choice only.
 That is what makes `secure-enclave` the open-source-viable hardware-backed option.
 
 **Custody fixes the install shape.** Both keychains need a login session, so selecting
-keychain custody and selecting the user install are the same decision. File custody is the
-only universal one. A boot-start system daemon can only have file custody.
+keychain custody and selecting the user install are the same decision. File custody is the only
+one a boot-start system daemon can have, and the only one a user install refuses: a `0600` file
+is no boundary against the uid the service itself runs as.
 
-The sealed master key (`.sealed`) stays a `0600` file in every case: it is
+Wherever the envelope is in place, the sealed master key (`.sealed`) stays a `0600` file: it is
 AES-GCM-authenticated ciphertext and inert without the unwrap. Protect the capability, not
-the ciphertext.
+the ciphertext. `data-protection-keychain` has no such file — the key is the keychain item.
 
 ### Selection
 
@@ -474,23 +519,27 @@ rather than assumed.
 
 | # | Install shape | Build | Backend | Hardware binding | Cross-user | Same-uid gate |
 |---|---|---|---|---|---|---|
-| 1 | user install | signed, entitled | `keychain-dp` | **yes** | no | **yes** |
-| 2 | user install | OSS / unsigned | `keychain` | **yes** | no | weak (ACL prompt) |
+| 1 | user install | signed, entitled | `data-protection-keychain` | **yes** | no | **yes** |
+| 2 | ~~user install~~ | ~~OSS / unsigned~~ | ~~`keychain`~~ | — | — | **removed** |
 | 3 | system install | either | `secure-enclave` | **yes** | **yes** | n/a — service account |
 | 4 | system install, no enclave | either | `file` (explicit) | no | **yes** | n/a — service account |
 
-Rows 1 and 2 differ only in reader gate, because the entitlement is what buys the
-access-group scoping. Row 3 reaches the enclave by Path C, which needs no entitlement, so
-signing does not appear in it.
+Row 2 went with `legacy-keychain`. An unsigned build now has no user install at all: the
+entitlement is what buys the access-group scoping, so without it row 1's reader gate cannot
+be approximated, and a user install resolving anything other than `data-protection-keychain`
+is refused rather than downgraded. An OSS build takes row 3 or row 4. Row 3 reaches the
+enclave by Path C, which needs no entitlement, so signing does not appear in it.
 
 ### Row 4: the SE-less fallback is a posture, not a concession
 
 On Macs with no Secure Enclave (2017 and earlier), and on Linux with no TPM, the envelope
 does not exist and the key must be stored. Within the system install `file` is the only
-option — both keychains are user-install-only — so the real question is whether the system
-install is still the right shape when there is no hardware. It is:
+option — the keychain is user-install-only — so the real question is whether the system
+install is still the right shape when there is no hardware. It is. The second column is the
+alternative as it stood when this was decided, kept because it is the comparison the decision
+rests on; `legacy-keychain`'s removal has since taken it off the table outright:
 
-| Threat | system install + `file` | user install + keychain (key at rest) |
+| Threat | system install + `file` | user install + keychain (key at rest, no longer offered) |
 |---|---|---|
 | A live process running as the user | **blocked** — key owned by `credsd` | weak: ACL is prompt-mediated, users click through |
 | Offline disk or backup theft | plaintext key exposed **unless FDE** | key encrypted (password-derived; no SEP on this hardware) |
@@ -528,19 +577,19 @@ recovers it.
 **Pre-login behaviour, for row 3 only.** A daemon that must unseal before any user logs in
 depends on the `Always` protection class, which is deprecated and untested here. If it turns
 out not to work, row 3 still holds for machines where a login precedes first daemon use, but
-a boot-start daemon on an unattended machine falls back to `keychain` or `file`.
+a boot-start daemon on an unattended machine has only `file` left — row 4.
 
 **Whether to depend on an undocumented path at all.** Path C is not blessed by Apple, so row
 3's hardware binding rests on behaviour that could change in a point release with no
 deprecation warning. That is a posture decision, not a technical one — the technical question
 is now answered.
 
-**Whether `keychain-dp` earns its cost.** Under the custody model it is not "the signed,
-therefore stronger, backend" — it is a targeted mitigation for one threat: a hostile process
-running as the user, in the user install. It is the only mechanism on macOS that provides
-that boundary, and it should be justified by naming the threat (a malicious dependency
-postinstall, a compromised agent harness, an editor extension) rather than by appeal to
-signing. Against that threat it is worth the entitlement, the bundle, and the Developer ID.
+**Whether `data-protection-keychain` earns its cost.** Under the custody model it is not
+"the signed, therefore stronger, backend" — it is a targeted mitigation for one threat: a
+hostile process running as the user, in the user install. It is the only mechanism on macOS
+that provides that boundary, and it should be justified by naming the threat (a malicious
+dependency postinstall, a compromised agent harness, an editor extension) rather than by
+appeal to signing. Against that threat it is worth the entitlement, the bundle, and the Developer ID.
 Absent that threat, it pays a paid-identity dependency and a login-session constraint for a
 boundary the system install already gets from the kernel.
 
@@ -550,8 +599,8 @@ behind an AMFI-killed process does not, and an unreachable blob means an unrecov
 key and a forced re-bootstrap. The blast radius is bounded (machine loss already costs a
 re-bootstrap, and SSO seeds are re-derivable), but it is a dependency of *data* on *signing
 validity*, which is a different class of risk from the one being bought. That is the reason
-the system install keeps the plain file even after `keychain-dp` ships — not because the file
-is more secure, but because it is unconditionally readable.
+the system install keeps the plain file alongside `data-protection-keychain` — not because
+the file is more secure, but because it is unconditionally readable.
 
 Note the corollary for the Path A prototype as currently written: because it takes Path A, it is
 structurally limited to a user install. It cannot serve row 3 regardless of how it is
@@ -562,57 +611,78 @@ completed, and under the custody model its SE-key-in-the-keychain design is supe
 
 The current posture is the target posture: `tpm` for hardware binding, the service uid as
 the authorization boundary, `file` and `kkrs` as explicit-only alternatives. The feature and
-its device seam reach customers in the `-tpm` artifacts, so the auto-detected backend is one
-that works — on a host that took that download. On a default build, auto-detect still selects
-`tpm` from the device node alone and fails at first store; that gap is below, not a packaging
-question.
+its device seam reach customers in the `-tpm` artifacts, so the backend an install resolves
+is one that works — on a host that took that download. A default build never resolves `tpm`,
+because `Backend::Tpm.is_available()` requires the feature as well as the device node, so a
+host with `/dev/tpmrm0` and a featureless binary gets a selection-time error rather than a
+seal that fails later.
 
 ## Gaps to close
 
-- **The `--insecure-backend` refusal message is wrong for a system install.** It reads "the
-  file backend stores the encryption key as a plain file readable by your uid — any process
-  you run can exfiltrate sealed credentials", which is false under a dedicated service
-  account: the file is not readable by the invoking user, and no process they run can read
-  it. Its remediation is wrong twice over — it recommends "Keychain on macOS", which is not
-  hardware-backed in this implementation, and on SE-less hardware there is no hardware-backed
-  option at all, so it advises a fix that does not exist on the machine that triggered the
-  error. Make it posture-aware: for row 4 the residual risk to name is plaintext at rest and
-  therefore FileVault, not a same-uid threat the posture already eliminates. As written it
-  trains operators to pass the flag reflexively on the one configuration where its stated
-  justification does not apply.
+- **`data-protection-keychain` holds the master key, not the envelope.**
+  `DataProtectionKeychainStorage` stores the AES-256 key as the keychain item itself, where
+  the custody model asks for the `.sekey` blob there and the master key wrapped to an
+  SE-resident key. The item is device-bound either way, so the posture difference is what a
+  reader-gate bypass yields: the key, rather than the use-oracle the envelope leaves. Closing
+  it means minting through the enclave on the user-install path too, which has no mint
+  LaunchDaemon to borrow.
+- **The `--insecure-backend` refusal message is posture-blind.** It reads "the file backend
+  stores the encryption key as a plain file readable by your uid — any process you run can
+  exfiltrate sealed credentials", which is false under a dedicated service account: the file
+  is owned by `credsd`, and no process the invoking user runs can read it. Its remediation is
+  also wrong on the hardware that triggers it — it names the data protection keychain and the
+  Secure Enclave, and a Mac with no enclave has neither. Make it posture-aware: for row 4 the
+  residual risk to name is plaintext at rest and therefore FileVault, not a same-uid threat
+  the posture already eliminates. As written it trains operators to pass the flag reflexively
+  on the one configuration where its stated justification does not apply.
 - **No FileVault precondition check.** Row 4's argument rests on full-disk encryption. Probe
-  `fdesetup status` and refuse or warn rather than assuming.
-- **`auto_detect()` on macOS ignores install shape and signing state.** It must probe for
-  the Secure Enclave, then a usable keychain, then fall through — instead of returning
-  `Keychain` unconditionally and relying on a downstream probe to refuse.
-- **The Secure Enclave backend is incomplete.** It is not shipped and
-  its behavior is not yet validated end to end; a passing in-process test does not
-  demonstrate that the key is usable by the shape of process that needs it.
-- **Keychain-under-LaunchDaemon is unproven.** Row 3 cannot be specified until this is
-  settled either way.
-- **`Backend::Tpm.is_available()` does not reflect the `tpm` feature**, so auto-detect can
-  select a backend whose seal will fail.
-- **Per-home namespacing** of the keychain / Secure Enclave item must land alongside these
-  (see `docs/specs/storage-backend-per-home/`) so two homes on one machine cannot collide.
-- **The keychain backend does not pin `kSecUseDataProtectionKeychain: false`.**
-  `security_framework::passwords` omits the key entirely and relies on the documented
-  default. On macOS 14.5+ `SecItemAdd` has been reported to target the data protection
-  keychain by default, contrary to TN3137. If that holds, the current backend may be
-  landing items in a keychain no daemon can read — which would be a candidate explanation
-  for the inconclusive daemon testing. Pass the flag explicitly rather than inheriting a
-  default that has already drifted once.
-- **Settle whether CryptoKit SE keys work pre-login from a root LaunchDaemon.** Roughly
-  fifty lines of Swift, one plist, and a reboot with no login. Two traps make casual
-  testing invalid: the CryptoKit default protection class is
-  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, which fails pre-login with
-  `errSecInteractionNotAllowed` (-25308) and needs `kSecAttrAccessibleAlways` — itself
-  `API_DEPRECATED(macos(10.9, 10.14))`; and *any* login invalidates the test, including
-  SSH. A valid test is a daemon that creates the key at boot and logs the result, inspected
-  after logging in later.
-- **Use `privateKeyUsage` only, with no presence flags.** `LAContext` is user-context-only
-  and cannot be moved between security contexts, so adding a user-presence requirement to a
-  daemon key makes it strictly worse. Biometrics are opt-in additional protection, not a
-  prerequisite for SE key use.
+  `fdesetup status` and refuse or warn rather than assuming. Nothing in the tree reads it
+  today.
+- **The keychain item's protection class is left to Apple's default.**
+  `DataProtectionKeychainStorage` sets service, account, and
+  `kSecUseDataProtectionKeychain` and nothing else — no `kSecAttrAccessible*`, no
+  `kSecAttrSynchronizable` — so how far the device binding goes is inherited rather than
+  asserted. A copied keychain file does not yield the key, but whether a backup or a migration
+  assistant can carry the item to another Mac is untested. Pin
+  `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and the claim becomes the code's rather than
+  the platform's. This is the same "inheriting a default that has already drifted once" risk
+  the Closed entry below records for `kSecUseDataProtectionKeychain`.
+- **No automated run touches an enclave.** The backend ships from source and its
+  launchd-context behavior has been observed by hand — that is where `key agreement failed
+  (-6)` and the mint LaunchDaemon come from — but `hardware_round_trip` is `#[ignore]`d
+  because the CI runners are virtualized and expose no enclave. Every green macOS row proves
+  the logic against a fake seam and nothing about the hardware.
+- **The protection class we depend on is deprecated.** `Protection::Always` is the default
+  because it is the only class with no login dependency, and a boot-start daemon has no
+  login; CryptoKit's own default,
+  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, fails pre-login with
+  `errSecInteractionNotAllowed` (-25308). But `kSecAttrAccessibleAlways` is
+  `API_DEPRECATED(macos(10.9, 10.14))`, so the system install rests on an API Apple has
+  already marked for removal, and there is no non-deprecated replacement for the pre-login
+  case. Whether it even works pre-login is the first item under "Open questions".
+
+### Closed
+
+Recorded so they are not reopened, with where each landed:
+
+- **macOS selection ignoring install shape and signing.** `resolve_install_backend` pins the
+  enclave for a system install and `auto_detect` probes the keychain before it; neither
+  returns a backend unconditionally.
+- **Keychain-under-LaunchDaemon.** Settled as impossible, not inconclusive:
+  `reachable_by_system_service` excludes the data protection keychain, and a system install
+  naming it is refused.
+- **`Backend::Tpm.is_available()` not reflecting the `tpm` feature.** It now requires
+  `Backend::COMPILED` to contain `Tpm` as well as the device node.
+- **Per-home namespacing.** The key slot is `daemon-encryption-key.<ns>` via
+  `instance_namespace(home)`, with a proptest on it (`docs/specs/storage-backend-per-home/`).
+- **`kSecUseDataProtectionKeychain` left to the default.** Pinned explicitly — to `true`, via
+  `PasswordOptions::use_protected_keychain`, the data protection keychain now being the
+  intended target rather than the one to avoid.
+- **Presence flags on the master key.** `ACCESS_FLAGS` is `0`: no flags at all. Not even
+  `privateKeyUsage`, which gates signing and is irrelevant to a key-agreement key. User
+  presence on a daemon key would need `LAContext`, which cannot cross security contexts.
+  Presence is a separate mechanism on a separate client-held key
+  (`docs/specs/presence-gated-operations/`).
 
 ---
 
@@ -630,7 +700,7 @@ Backend-specific:
 |---|---|
 | `secure-enclave` | read access to the blob on the live machine — there is no code-identity check (see "The finding that matters most for design") |
 | `tpm` | local execution as the service uid, or in `tss`; unseal loss on TPM clear |
-| `keychain` | no hardware binding; disk plus account password; availability under a daemon unproven |
+| `data-protection-keychain` | local execution as the login uid **with the daemon's code signature**; root; unreachable from a system daemon by design |
 | `dpapi` | no hardware binding; blob plus account credentials |
 | `credential-manager` | no hardware binding; requires an interactive session |
 | `file` | key recoverable from a disk image with no further secret |

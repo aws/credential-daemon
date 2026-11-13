@@ -100,9 +100,11 @@ Paths below are relative to the daemon's data directory; see
   recovers from.
 - **Needs its own download:** the `-tpm` artifacts — `al2023-x64-tpm`, `al2023-aarch64-tpm`,
   `ubuntu-x64-tpm`, `ubuntu-aarch64-tpm` — are the only builds carrying the `tpm` feature.
-  They need the tpm2-tss runtime on the host (`tpm2-tss` on AL2023, `libtss2-dev` on Ubuntu)
-  and do not start without it, which is why they are separate downloads. There is no AL2
-  variant. Any other artifact falls back as described under
+  They need the tpm2-tss runtime libraries on the host — `libtss2-esys.so.0`,
+  `libtss2-mu.so.0`, and `libtss2-tctildr.so.0`, from `tpm2-tss` on AL2023 or `libtss2-dev`
+  on Ubuntu, whose own runtime packages are named per soname and renamed between releases —
+  and do not start without them, which is why they are separate downloads. There is no AL2
+  variant. Any other artifact has to name a backend, as described under
   [how a backend is chosen](#how-a-backend-is-chosen).
 
 ### `kkrs` (Linux, with the `kkrs` feature)
@@ -162,23 +164,29 @@ backend is in use today. Windows install shapes are undecided.
 
 `--storage-backend <name>` (a global `credsd` flag) names a backend. `credsd install
 --storage-backend <name>` bakes it into the service definition, and adds `--insecure-backend`
-when the name is `file`. Without the flag the daemon auto-detects at every start:
+when the name is `file`.
 
-| Platform | Auto-detect |
+`credsd install` is the only command that resolves a backend when the flag is absent. `credsd
+serve` and `credsd init` both require it and refuse to run without it, so a service install
+fixes the backend once, at install time, and the daemon never re-detects one between installs.
+
+| Install | Resolved without the flag |
 |---|---|
-| macOS | `data-protection-keychain` if this binary can write to it, else `secure-enclave` if this binary can reach an enclave, else an error |
-| Linux | `tpm` if this build has the `tpm` feature and `/dev/tpmrm0` exists, else an error |
-| Windows | `dpapi` |
+| macOS, `credsd install --user` | `data-protection-keychain` if this binary is entitled to it, else an error — no other backend may hold a user-scoped service's key |
+| macOS, `sudo credsd install` | `secure-enclave` if this build can reach an enclave, else an error. The data protection keychain is never considered: a LaunchDaemon has no login session, which is the one thing that keychain needs |
+| Linux, `sudo credsd install` | `tpm` if this build has the `tpm` feature and `/dev/tpmrm0` exists, else an error |
+| Windows | would be `dpapi`. No Windows install exists yet, so nothing reaches this |
 
-Auto-detect never picks `kkrs`, `file`, or `credential-manager`. When it
-errors, the daemon does not start; name a backend explicitly to proceed, for example:
+Resolution never picks `kkrs`, `file`, or `credential-manager`. When it errors, `install` fails
+rather than falling back; name a backend explicitly to proceed:
 
 ```bash
-credsd --storage-backend file serve --insecure-backend
+sudo credsd install --storage-backend file         # bakes --insecure-backend too
+credsd --storage-backend file serve --insecure-backend   # running the daemon by hand
 ```
 
 A named backend that is unavailable is an error, never a substitution. A build without the
-`tpm` feature never selects `tpm`, even on a host with `/dev/tpmrm0`: auto-detect errors, and
+`tpm` feature never selects `tpm`, even on a host with `/dev/tpmrm0`: `install` errors, and
 naming it explicitly fails with ``not compiled into this build; rebuild with `--features tpm` ``.
 Sealed credentials from an earlier `tpm` install are left in place.
 
@@ -191,11 +199,12 @@ upgrade the daemon exits with `no encryption key found` until a new key is minte
 `sudo credsd install` for a system install, or `credsd install --user` for a user-scoped
 one (the macOS `.pkg` does this for you), or run `credsd init --storage-backend <name>`.
 `kkrs` is the one backend that mints a new key on start. Credentials sealed under the old
-key then read as `decrypt failed`; re-seal them as in step 4 of
+key then read as `decrypt failed`; re-seal them as in step 3 of
 [Changing backend](#changing-backend).
 
-The old key is not removed, and `credsd purge` does not remove it either: purge deletes only
-the current home's slot. To delete it by hand, remove the item with no suffix:
+The old key is not removed, and `credsd uninstall --purge-key` does not remove it either: the
+purge deletes only the current home's slot. To delete it by hand, remove the item with no
+suffix:
 
 - `data-protection-keychain`: the generic password with service `com.amazon.aws.credsd` and
   account `daemon-encryption-key`, in Keychain Access or with `security delete-generic-password`.
@@ -209,27 +218,47 @@ the current home's slot. To delete it by hand, remove the item with no suffix:
 
 ## Changing backend
 
-The backend is not recorded anywhere; the daemon resolves it at each start. When the resolved
-backend holds no master key:
+The backend is recorded: `credsd install` bakes it into the service definition, and `credsd
+status` prints what the installed service uses. Nothing changes it behind your back, and
+nothing mints a key behind your back either. Three refusals stand between you and a silent
+switch:
 
-1. The daemon creates a new random master key in that backend.
-2. The old key stays in the old backend. Nothing migrates or deletes it, except the Windows
-   `credential-manager` to `dpapi` move above.
-3. Sealed credentials stay on disk, encrypted under the old key. `creds list` shows them as
-   `decrypt failed`, and requests for them fail.
-4. `creds login --env <env>` re-authenticates issuer-backed sources (SSO, OAuth, AWS login).
+- **`serve` never creates a key.** Pointed at a backend holding none, it exits with `no
+  encryption key found for backend '<name>'` and names `credsd init` and `sudo credsd install`
+  as the two ways to mint one. `kkrs` is the sole exception, where a cleared keyring on reboot
+  is normal startup — see [If you lose the machine](#if-you-lose-the-machine).
+- **`init` refuses when another backend holds a key.** `refusing to mint a new key: backend
+  'X' has no key but 'Y' does` — because minting would orphan everything sealed under `Y`. It
+  only sees backends compiled into this build, so a key left by a backend this build omits is
+  invisible to the check.
+- **`install` refuses to change the baked backend.** A reinstall naming a different one errors
+  with `refusing to install: the installed service uses the 'X' keystore and this install
+  would switch it to 'Y'`.
+
+So a deliberate switch is three steps, and it costs every sealed credential:
+
+```bash
+sudo credsd uninstall --purge-key --storage-backend <old>   # quarantines, then deletes the key
+sudo credsd install --storage-backend <new>                 # mints a fresh key
+creds login --env <env>                                     # re-seals under it, as yourself
+```
+
+1. `uninstall --purge-key` moves every sealed credential to `<data-dir>/quarantine/` and then
+   deletes the old key. Nothing migrates; the quarantined files can never be opened again.
+2. `install --storage-backend <new>` mints a new random master key in the new backend.
+3. `creds login --env <env>` re-authenticates issuer-backed sources (SSO, OAuth, AWS login).
    Secrets you entered yourself, such as IAM access keys or static secrets, need
    `creds bootstrap` again with the secret in hand. Either one re-seals under the new key.
 
-Switching back to the old backend makes credentials readable again, if they were not
-re-sealed in between.
+Skip the purge and there is no way through: `install` refuses the switch, and if you force the
+backend on a hand-run `serve` instead, it finds no key and exits.
 
-Auto-detect can change the backend without any setting changing. On macOS, a daemon that
-loses access to the data protection keychain falls through to `secure-enclave`, and a new key
-is created. Pass `--storage-backend` explicitly to make that a startup error instead.
+The Windows `credential-manager` to `dpapi` move described above is the one automatic
+migration, and it moves the key rather than minting a new one.
 
-The two keychain backends and `credential-manager` treat a key credsd cannot read as missing,
-and store a new key under the same name.
+The two keychain backends and `credential-manager` report a key credsd cannot read as absent
+rather than as unreadable. `serve` therefore treats it as a missing key and exits; `init` would
+mint a new one under the same name.
 
 ## What an attacker would need
 
@@ -263,20 +292,42 @@ Issuer-backed sources cost one re-authentication. Long-term IAM keys and static 
 entered by hand are gone unless you keep them elsewhere; otherwise rotate them at the
 provider.
 
-On `tpm` and `kkrs`, the daemon recovers by itself. It logs that re-authentication is
-required, moves every sealed credential to `quarantine/<timestamp>/` (it keeps the newest
-three), and creates a new key. Credentials then show `no session`.
+On `kkrs` alone, the daemon recovers by itself, because a cleared keyring after a reboot is
+that backend's normal startup. It logs that re-authentication is required, moves every sealed
+credential to `quarantine/<timestamp>/` (it keeps the newest three generations), and creates a
+new key. Credentials then show `no session`.
 
-`secure-enclave` and `file` refuse to start when the key is present but unusable, and leave the
-files in place. For the keychain backends and `credential-manager`, see
+On `tpm` a key that will not unseal stops startup. The daemon reports the TPM error and the
+likely causes — the TPM was cleared or replaced, the key was sealed under a policy this build
+does not support, or `/dev/tpmrm0` is unreachable — and leaves every file in place. Recovery is
+explicit, so that nothing destroys a credential the next boot might have opened:
+
+```bash
+sudo credsd init --reset --storage-backend tpm
+```
+
+It prints a warning and reads a typed `yes` from the terminal first, because the quarantined
+blobs are abandoned for good. `--reset` is Linux and `tpm` only; for any other backend,
+re-running `sudo credsd install` is the reinitialization path.
+
+A reset quarantines the undecryptable blobs and mints a fresh key. Each user's integrity record
+was sealed under the old key and will not open either, so each user then runs `creds
+revalidate` (its approval replaces the record) and re-bootstraps each environment with
+`creds bootstrap --env <env>`.
+
+`secure-enclave` and `file` also refuse to start when the key is present but unusable, and
+leave the files in place. For the keychain backends and `credential-manager`, see
 [Changing backend](#changing-backend).
 
 ## When credsd refuses to start
 
 | Message contains | Cause | Remedy |
 |---|---|---|
-| `no hardware-backed storage available` | Linux auto-detect found no `/dev/tpmrm0`, or the build lacks the `tpm` feature | Use a `-tpm` artifact on a host with a TPM; otherwise name `file` explicitly and enable full-disk encryption |
-| `no hardware-backed storage available (no entitled data protection keychain, no reachable Secure Enclave)` | macOS auto-detect found neither | On a Mac without an enclave, a system install with a `file`-feature build and `--storage-backend file` |
+| `no hardware-backed storage available` | `credsd install` on Linux found no `/dev/tpmrm0`, or the build lacks the `tpm` feature | Use a `-tpm` artifact on a host with a TPM; otherwise name `file` explicitly and enable full-disk encryption |
+| `no hardware-backed storage available (no entitled data protection keychain, no reachable Secure Enclave)` | `credsd install` on macOS found neither | On a Mac without an enclave, a system install with a `file`-feature build and `--storage-backend file` |
+| `credsd serve requires --storage-backend` | `serve` was run with no backend named | Re-run `sudo credsd install` so the service definition carries one, or pass the flag by hand |
+| `no encryption key found for backend` | `serve` found no master key: `init` never ran, or the keystore was wiped | `credsd init --storage-backend <name>`, or re-run `sudo credsd install` |
+| `refusing to mint a new key` | `init` found a key under a different compiled backend, which minting would orphan | Re-run with that backend, or delete its key first — see [Changing backend](#changing-backend) |
 | `the file backend stores the encryption key as a plain file` | `file` without `--insecure-backend` | Add `--insecure-backend`, or use a hardware backend |
 | `storage backend '…' is not compiled into this build` | The build lacks the feature for that backend: `secure-enclave` or `file` on macOS, `tpm` or `kkrs` on Linux | Use a build with the feature the message names (on Linux, a `-tpm` artifact) |
 | `storage backend 'secure-enclave' is unavailable` | The Mac has no enclave | On a system install, a `file`-feature build and `--storage-backend file` |

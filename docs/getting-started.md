@@ -14,7 +14,7 @@
 |---|---|---|
 | macOS (Apple Silicon) | Official signed release (`credsd-macos-aarch64.pkg`) | [A: user-scoped install](#path-a-macos-official-signed-release) |
 | macOS | Built from this repository | [B: system install](#path-b-macos-open-source-build) |
-| Linux | Any | [C: system install](#path-c-linux) |
+| Linux (x86_64, aarch64) | Published archive, or built from this repository | [C: system install](#path-c-linux) |
 
 Windows install shapes are not yet decided. [Install](install.md) explains what each shape
 protects.
@@ -71,11 +71,52 @@ credsd status
 
 ## Path C: Linux
 
-Needs a Rust toolchain, `pkg-config`, and the tpm2-tss development libraries, on a host with
-`/dev/tpmrm0`.
+Pick the archive for your distribution and architecture. The `-tpm` ones are the only builds
+that can use the TPM, and they need the tpm2-tss runtime libraries on the host (`tpm2-tss` on
+AL2023, `libtss2-dev` on Ubuntu):
+
+| | x86_64 | aarch64 |
+|---|---|---|
+| Amazon Linux 2023 | `credsd-al2023-x64.tar.gz` | `credsd-al2023-aarch64.tar.gz` |
+| Amazon Linux 2023, TPM | `credsd-al2023-x64-tpm.tar.gz` | `credsd-al2023-aarch64-tpm.tar.gz` |
+| Ubuntu | `credsd-ubuntu-x64.tar.gz` | `credsd-ubuntu-aarch64.tar.gz` |
+| Ubuntu, TPM | `credsd-ubuntu-x64-tpm.tar.gz` | `credsd-ubuntu-aarch64-tpm.tar.gz` |
 
 ```bash
-cargo build --release --features credsd-core/tpm
+base=https://github.com/aws/credential-daemon/releases/latest/download
+archive=credsd-ubuntu-x64-tpm.tar.gz
+
+curl -fLO "$base/$archive"
+curl -fLO "$base/$archive.sig"
+curl -fLO "$base/SHA256SUMS"
+curl -fLO "$base/SHA256SUMS.sig"
+
+curl -fsSL https://raw.githubusercontent.com/aws/credential-daemon/main/KEYS | gpg --import
+gpg --verify "$archive.sig" "$archive"
+gpg --verify SHA256SUMS.sig SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+
+tar xzf "$archive"
+cd "${archive%.tar.gz}"
+sha256sum -c creds.sha256 credsd.sha256
+sudo install -m 0755 credsd creds /usr/local/bin/
+sudo credsd install
+credsd status
+```
+
+`gpg` reports the freshly imported key as uncertified; the line to read is `Good signature
+from "AWS Credential Daemon <aws-credential-daemon@amazon.com>"`.
+
+On a `-tpm` build with `/dev/tpmrm0` present, `install` resolves the `tpm` backend. Anywhere
+else it fails rather than falling back: pass `--storage-backend file` and use LUKS. See
+[Install](install.md#linux-system-install).
+
+**From source** instead — needs a Rust toolchain, `pkg-config`, and the tpm2-tss development
+libraries. Two build invocations, so that only the daemon links tpm2-tss:
+
+```bash
+cargo build --release -p credsd-daemon --features tpm
+cargo build --release -p creds
 sudo install -m 0755 target/release/credsd target/release/creds /usr/local/bin/
 sudo credsd install
 credsd status

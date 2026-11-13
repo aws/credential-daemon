@@ -1,102 +1,102 @@
 # Architecture
 
-## Overview
+What credsd is and what it promises is [docs/overview.md](docs/overview.md). This page is the
+contributor's orientation: where the code lives and which document is authoritative for each
+part of it.
 
-credsd is a cross-platform daemon that vends short-lived AWS credentials via a
-local HTTP endpoint. It holds long-lived secrets (SSO tokens, IAM keys) in
-platform-specific secure storage, exchanges them for temporary session
-credentials, and serves those credentials to local processes using the ECS
-container credentials protocol.
-
-## Module Map
+## Crates
 
 ```
-src/
-├── main.rs              CLI (clap) + subcommand dispatch
-├── lib.rs               Public module declarations
-├── error.rs             DaemonError enum + Result alias
-├── config/
-│   ├── mod.rs           DaemonConfig, EnvConfig, serialization
-│   └── platform.rs      Platform-specific paths (config dir, data dir)
-├── credentials.rs       Credential data model (session creds, expiry)
-├── encryption.rs        AES-256-GCM envelope encryption (EncryptionService)
-├── storage/
-│   ├── mod.rs           SecureStorage trait + backend selection
-│   ├── macos.rs         macOS Keychain backend
-│   ├── windows.rs       Windows Credential Manager backend (deferred, untested)
-│   └── file.rs          Plaintext file fallback (CI, dev)
-├── providers/
-│   ├── mod.rs           CredentialProvider trait
-│   └── sso.rs           AWS SSO (IAM Identity Center) provider
-├── credential_store.rs  In-memory cache + background refresh
-├── credential_resolve.rs  Fetch creds from daemon or provider directly
-├── credential_env.rs    Env var assembly for child processes
-├── auth.rs              Bearer token generation + persistence
-├── bootstrap.rs         Interactive env setup (SSO device auth flow)
-├── get.rs               Output formatting (credential_process, shell, fish)
-└── server/
-    ├── mod.rs           Axum app setup, AppState
-    ├── routes.rs        HTTP handlers (ECS credential endpoint)
-    ├── middleware.rs    Bearer token auth middleware
-    └── response.rs      Credential JSON response types
+crates/
+├── credsd-core     shared internals: storage backends, encryption, providers, RPC codec and
+│                   the client half of the socket transport, config, projections, presence
+│                   types. No server.
+├── credsd-daemon   the `credsd` binary: the UDS server, caller assessment, presence
+│                   gating, the credential store's background refresh, and `install`.
+├── credsd          the `creds` binary: the unprivileged client CLI.
+└── credsd-client   the public Rust client library for the socket protocol.
 ```
 
-## Data Flow
+Two binaries, and the names do not match their crates: `crates/credsd` builds `creds` and
+`crates/credsd-daemon` builds `credsd`. `creds` carries no entitlement and never opens the
+keystore; the only key material it holds is the enclave-wrapped presence key in
+`~/.credsd/presence-key.json`. It is a client like any other.
 
-```
-credsd bootstrap ──► SSO device auth ──► encrypted token on disk
-                                            │
-credsd serve ──► loads config + token ──► starts HTTP on 127.0.0.1:PORT
-                                            │
-AWS CLI/SDK ──► GET /credentials ──► bearer auth ──► decrypt token
-               (container creds URI)                     │
-                                               STS GetRoleCredentials
-                                                         │
-                                               ◄── session credentials
-```
+Workspace lints in `Cargo.toml` deny `unwrap_used`, `panic`, `indexing_slicing`, and
+`arithmetic_side_effects` across every crate. `vendor/` is excluded from the workspace so those
+lints do not apply to code we do not own.
 
-## Platform Support
+## Transport
 
-| Platform | Secure Storage | Service Manager |
-|----------|---------------|-----------------|
-| macOS (aarch64, x86_64) | Keychain (`security-framework`) | launchd |
-| Linux (x86_64, aarch64) | TPM 2.0; `file` only if explicitly requested | systemd |
-| Windows (x86_64) | Credential Manager / DPAPI (Win32 API) — deferred | none |
+The daemon serves line-delimited JSON-RPC 2.0 over a Unix domain socket. That socket is the
+whole RPC surface — there is no HTTP transport — and it carries no bearer token: the daemon
+reads the connecting process's uid from the kernel, so there is no credential to steal. A system
+install is socket-activated by launchd or systemd.
 
-**Windows is deferred.** The storage backends exist as code and are gated behind
-`#[cfg(target_os = "windows")]`, but there is no Windows CI row, so the round-trip tests in
-`storage/windows.rs` and `storage/dpapi.rs` never execute anywhere; nothing about the backends
-is verified. There is no service-manager path either — `install.rs` covers launchd and systemd
-only. And `serve` has no Windows transport: a Named Pipe with a user-restricted ACL is the
-equivalent boundary to the Unix socket, and it is not implemented, which (given that the daemon
-is the only credential source) takes `run`, `get`, `exec`, and `import` with it. The code stays in the
-tree for now.
+The daemon does bind one other listener, and only during a bootstrap or an interactive re-login:
+a loopback TCP port for an OAuth authorization-code redirect, opened by an `aws-login` or
+`aws-web-identity` flow and closed with it (`providers/oauth/callback.rs`, reached from
+`server/bootstrap.rs`). A TCP port has no uid boundary, so what gates the exchange is PKCE and
+the `state` parameter rather than the port. The `credential-endpoint` projection in
+[docs/overview.md](docs/overview.md) is a third thing again: an address run-time tooling fills,
+not a listener the daemon opens.
 
-## Key Design Decisions
+The contract is [`docs/api/openrpc.json`](docs/api/openrpc.json), described in
+[docs/reference/api.md](docs/reference/api.md). Where the guide and the contract disagree, the
+contract is correct.
 
-**ECS container credentials protocol**: The daemon implements the same HTTP
-protocol that ECS uses to vend credentials to containers. This means any AWS
-SDK works out of the box — just set `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
-`AWS_CONTAINER_AUTHORIZATION_TOKEN`.
+## Request path
 
-**Encryption at rest**: SSO tokens are encrypted with AES-256-GCM using a key
-stored in platform secure storage. The encryption key never touches disk in
-plaintext (on macOS; the Windows backends intend the same but are deferred and
-unverified). The `file` backend stores the key as a plaintext file for
-environments without OS credential stores.
+`creds` → socket → `server/uds.rs` (accept, peer credentials, resolve the caller) →
+`server/dispatch.rs` (authorize, audit) → `credential_store.rs` (warm cache, background refresh) →
+`providers/` (exchange the sealed secret for a session) → response.
 
-**Single-binary deployment**: No runtime dependencies beyond the OS. TLS uses
-`rustls` (compiled in), not OpenSSL. The release binary is statically linked
-where possible.
+The daemon is the only way a CLI invocation obtains credentials. There is no
+direct-from-provider fallback, because one would reach the same material without the caller
+assessment `serve` performs — see the module comment in `credsd-core/src/credential_resolve.rs`.
 
-**The daemon is the only credential source**: `credsd run` and `credsd get` both
-require a running `credsd serve`. There is no direct-from-provider mode. The
-daemon is where a request is assessed, classified, and audited, so a path around
-it would make that record optional — and, once caller verification enforces
-rather than observes, would turn a denial into a success.
+Changing a credential or configuration is not on this path. Those operations are held as a
+pending request and performed only after a Touch ID signature or a `sudo` approval, from the
+record the daemon made rather than from anything a client re-sends. See
+[docs/presence.md](docs/presence.md) and `docs/specs/presence-gated-operations/`.
 
-## Dependencies
+## Key custody
 
-Core: tokio, axum, clap, serde, ring, zeroize, tracing
-AWS: aws-config, aws-sdk-sso, aws-sdk-ssooidc (all with rustls)
-Platform: security-framework (macOS), windows (Windows — deferred, built by no CI row)
+Every secret is sealed with AES-256-GCM under one master key, and the storage backend decides
+who can open that key. The backends live in `credsd-core/src/storage/`; which one an install
+resolves, what each protects, and what an attacker would need are in
+[docs/key-security.md](docs/key-security.md) and `docs/design/key-storage-backends.md`.
+
+## Platforms
+
+| Platform | Backends shipped | Service |
+|---|---|---|
+| macOS, signed release (Apple Silicon) | `data-protection-keychain` | launchd LaunchAgent |
+| macOS, built from source | `data-protection-keychain` (compiled, unusable), `secure-enclave`, and `file` with the `file` feature | launchd LaunchDaemon |
+| Linux (x86_64, aarch64) | `tpm` with the `tpm` feature, `file` | systemd service + socket |
+| Windows | `dpapi`, `credential-manager` — deferred | none |
+
+`data-protection-keychain` compiles on every macOS build — the `cfg` is the target, not a
+feature — but only the signed release can open it. The access group
+`94KV3E626L.com.amazon.aws.credsd.daemon` is authorized by the release's provisioning profile,
+so a build with no Apple signing identity carries no such entitlement and its availability
+probe fails. `credsd install --user` then resolves something else and is refused, because the
+keychain is the only keystore a service running as its own caller's uid may hold a key in. From
+source the usable set is `secure-enclave` and, with the feature, `file`. The signed release is
+the inverse: it drops `secure-enclave` so that `sudo credsd install` cannot resolve a backend a
+LaunchAgent-only artifact would never reach.
+
+**Windows is deferred.** The storage backends compile behind `#[cfg(target_os = "windows")]`,
+but no CI row builds them, so nothing about them is verified. `serve` has no Windows transport
+either, which takes every command that reaches the daemon with it. The code stays in the tree.
+
+[docs/install.md](docs/install.md) covers each shape, and
+`docs/design/tpm-linux-artifact.md` covers why Linux ships a second `-tpm` artifact per distro
+and architecture.
+
+## Where to read next
+
+- [docs/overview.md](docs/overview.md) — what credsd does and what it is not
+- [AGENTS.md](AGENTS.md) — build commands, code style, persisted-format rules
+- `.agents/rules/` — the minimalism ladder, how to write a spec, platform one-way doors
+- `docs/specs/` — requirements and design per feature; the authority for behavior
