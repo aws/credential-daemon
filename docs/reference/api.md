@@ -250,7 +250,7 @@ environment's existing value (`human` for a new one).
 | `aws_iam_user` | `access_key_id`, `secret_access_key`, `region` | `duration_seconds`, `mfa_serial` |
 | `aws_roles_anywhere` | `trust_anchor_arn`, `profile_arn`, `role_arn`, `cert_der`, `key_der`, `key_tag` | `chain_der` (array), `region`, `duration_seconds`, `role_session_name`, `endpoint_url` |
 | `aws_web_identity` | `authorization_endpoint`, `token_endpoint`, `client_id`, `role_arn`, `region` | `scopes` (default `["openid"]`), `duration_seconds`, `role_session_name`, `callback_port` |
-| `aws_login` | `region` | `callback_port`, `remote`, `identity_type` |
+| `aws_login` | `region` | `callback_port`, `remote` |
 | `jwt` | `jwt` | `env_var` |
 | `oauth` | `token_url`, `client_id`, and `client_secret` or `private_key_pem` | `scope` |
 | `jwt_bearer` | `token_url`, `assertion` | `client_id`, `scope` |
@@ -267,8 +267,14 @@ Notes:
   even though the credential was saved.
 - `aws_login`: `region` is the Sign-In region. `callback_port` and `remote` are mutually exclusive —
   a remote login binds no loopback listener and the user carries the authorization code back by
-  hand. The client id and redirect shape are fixed to the AWS CLI's, so there is no `client_id`.
+  hand. The client id is one of Sign-In's two fixed devtools clients, picked by `remote`, and it
+  fixes the redirect shape with it — so there is no `client_id` knob.
 - `env_var` defaults to the credential name, upper-cased (`.`, `-`, `_` folded to `_`; a leading digit gets a `_` prefix).
+- `jwt_bearer` needs a build with the `jwt-bearer` cargo feature, which no published build enables:
+  it is off by default in all three crates and no job in `.github/workflows/` turns it on. A default
+  daemon refuses to bootstrap one with `PROVIDER_UNAVAILABLE`. `source` still reports `jwt_bearer`
+  for a credential a feature build stored, but a default daemon cannot serve it — the store logs a
+  warning and registers no provider for it.
 
 Result: `{}`.
 
@@ -276,8 +282,8 @@ Errors: `APPROVAL_REQUIRED` (gated; see [Approval](#methods)); `-32602` (bad par
 `provider.type`, empty secret, bad `identity_type`, `callback_port` out of range, undecodable
 DER); `ENVIRONMENT_NOT_FOUND` (unauthorized); `AUTH_TIMEOUT`; `AUTH_CANCELLED`;
 `PROVIDER_UNAVAILABLE` (flow already in flight, no accounts or roles, seal or federation
-failure); `REAUTH_REQUIRED` (`aws_web_identity` saved but cannot federate; no `remediation`);
-`INTERNAL`.
+failure, provider feature not compiled into this build); `REAUTH_REQUIRED` (`aws_web_identity`
+saved but cannot federate; no `remediation`); `INTERNAL`.
 
 ### `environment/bootstrap/respond`
 
@@ -337,7 +343,8 @@ Read, write, or remove one `config.toml` key of an environment. Keys are those l
 
 Errors: `APPROVAL_REQUIRED` (gated; see [Approval](#methods)); `ENVIRONMENT_NOT_FOUND`
 (unauthorized); `-32602` (bad name, unknown key, invalid value, or the protected key
-`credential`); `INTERNAL`.
+`credential`); `CONFIG_DRIFTED`, `INTEGRITY_UNVERIFIABLE`, and `CUSTODY_BROKEN` (`config/set` and
+`config/unset` only, which check before they write); `INTERNAL`.
 
 A missing environment is not reported uniformly: `config/set` and `config/unset` send `-32602`,
 `config/get` sends `INTERNAL`. A client that branches on a missing environment must accept both
@@ -483,7 +490,7 @@ Numeric codes describe the message. Every domain failure is `-32000` with `data.
 | `WRONG_CREDENTIAL_TYPE` | Material of a kind the projection cannot use. Reserved: no method sends it today, and a client that recognizes it keeps working against a daemon that starts to | Use a credential of the right kind |
 | `PROVIDER_UNAVAILABLE` | Upstream or provider failure, or a flow already in flight | Retry; the message says what failed |
 | `INTERNAL` | Daemon-side failure (config, storage, encryption, I/O) | See the daemon log |
-| `CONFIG_DRIFTED` | The caller's `config.toml` or `credentials.toml` no longer matches its sealed snapshot. Credential operations are blocked; the message names the file | Read the contents, then `creds revalidate` |
+| `CONFIG_DRIFTED` | The caller's `config.toml` or `credentials.toml` no longer matches its sealed snapshot. Credential operations are blocked, as is every write to either file; the message names the environment or the file | Read the contents, then `creds revalidate` |
 | `INTEGRITY_UNVERIFIABLE` | The caller's integrity record will not open, so neither file can be checked | `creds revalidate`; its approval shows both files in full and replaces the record |
 | `CUSTODY_BROKEN` | Ownership or modes on the integrity record or the enrolled-key registry are wrong. Nothing they govern is served, written, or approved | None. An operator restores ownership and modes and restarts the daemon; a client that retries or re-prompts loops |
 | `AUTH_TIMEOUT` | Sign-in or selection not completed in time | Run the flow again |

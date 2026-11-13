@@ -58,15 +58,6 @@
         },
         {
           "$ref": "#/components/errors/Internal"
-        },
-        {
-          "$ref": "#/components/errors/ConfigDrifted"
-        },
-        {
-          "$ref": "#/components/errors/IntegrityUnverifiable"
-        },
-        {
-          "$ref": "#/components/errors/CustodyBroken"
         }
       ],
       "x-carriers": [
@@ -2019,7 +2010,7 @@
               },
               "callback_port": {
                 "type": "integer",
-                "minimum": 0,
+                "minimum": 1024,
                 "maximum": 65535
               },
               "remote": {
@@ -2040,7 +2031,19 @@
             "required": [
               "type",
               "region"
-            ]
+            ],
+            "not": {
+              "properties": {
+                "remote": {
+                  "const": true
+                }
+              },
+              "required": [
+                "remote",
+                "callback_port"
+              ]
+            },
+            "description": "A remote login binds no loopback listener, so `remote` and `callback_port` together are refused."
           },
           {
             "type": "object",
@@ -2401,7 +2404,7 @@
       },
       "WrongCredentialType": {
         "code": -32000,
-        "message": "The credential's kind cannot be projected onto the requested shape. Reserved: no method declares it today.",
+        "message": "The credential's kind cannot be projected onto the requested shape.",
         "data": {
           "code": "WRONG_CREDENTIAL_TYPE"
         }

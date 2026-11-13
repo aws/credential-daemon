@@ -1046,8 +1046,8 @@ pub struct ProviderParamsAwsWebIdentity {
 }
 
 /// `aws-login` provider params — no secrets, safe to Debug. The client id and redirect shape are
-/// fixed to the AWS CLI's, so the only knobs are the Sign-In region, the callback port, and which
-/// of the two login flows to run.
+/// fixed by `remote`, which picks one of Sign-In's two devtools clients, so the only knobs are the
+/// Sign-In region, the callback port, and which of the two login flows to run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderParamsAwsLogin {
     /// Sign-In region. Required, with no default: a missing region is a parse error, not a guess.
