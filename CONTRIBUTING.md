@@ -32,6 +32,10 @@ We welcome the use of AI coding tools (Copilot, Claude, coding agents, etc.) as 
 
 ## Development Setup
 
+Needs `rustup` (the toolchain version comes from `rust-toolchain.toml`). On macOS it also
+needs the Xcode Command Line Tools: the default feature set builds a Swift Secure Enclave
+shim, so `cargo build` fails without them.
+
 ```bash
 # Install pre-commit hook (one-time)
 ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
@@ -43,8 +47,18 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-`scripts/install.sh` builds and symlinks the daemon onto PATH in one step. It links
-`credsd` only — the `creds` client is not installed by it.
+`scripts/install.sh` builds the workspace and symlinks the daemon onto PATH in one step. It
+links `credsd` only, so link the `creds` client alongside it to run the client examples
+below:
+
+```bash
+./scripts/install.sh
+sudo ln -sfn "$PWD/target/debug/creds" /usr/local/bin/creds
+```
+
+Both links point into `target/`, so a rebuild lands behind them with no reinstall. See
+[docs/getting-started.md](docs/getting-started.md) for the installed-copy paths a user
+follows instead.
 
 ## Code Style
 
@@ -54,7 +68,7 @@ Use helper constructors on `DaemonError`:
 
 ```rust
 // Good
-DaemonError::config("profile 'dev' not found")
+DaemonError::config("env 'dev' not found")
 DaemonError::provider("SSO session expired")
 
 // Avoid — use helpers instead of direct variant construction
@@ -65,11 +79,11 @@ Error messages: lowercase start, no trailing period, include actionable context.
 
 ```rust
 // Good
-"env '{}' not found. Run 'credsd bootstrap' first"
+"env '{}' not found. Run 'creds bootstrap' first"
 "storage backend '{}' is not compiled into this build; rebuild with `--features {}`"
 
 // Bad
-"Profile not found."
+"Env not found."
 "Error occurred"
 ```
 
@@ -213,16 +227,16 @@ Requirements use RFC 2119 keywords (MUST, MUST NOT, SHALL, SHALL NOT, SHOULD, SH
 
 **Example:**
 ```markdown
-1. THE CLI MUST provide a `remove` subcommand that accepts `--profile <name>`.
-2. WHEN the named profile does not exist, THE command MUST exit with code 1 and print "profile '<name>' not found" to stderr.
+1. THE CLI MUST provide a `remove` subcommand that accepts `--environment <name>`.
+2. WHEN the named env does not exist, THE command MUST exit with code 1 and print "env '<name>' not found" to stderr.
 3. THE command SHOULD prompt for confirmation unless `--force` is provided.
-4. THE command MUST NOT delete the storage backend encryption key (shared across profiles).
+4. THE command MUST NOT delete the storage backend encryption key (shared across envs).
 ```
 
 ### `requirements.md`
 
 - **Introduction**: One or two paragraphs explaining what problem this solves and why it matters. Provide enough context that a reader unfamiliar with the project can understand the motivation.
-- **Glossary**: Define domain terms used in the requirements. Each term should be capitalized consistently throughout the document (e.g., `Config_File`, `Profile_Data_Dir`).
+- **Glossary**: Define domain terms used in the requirements. Each term should be capitalized consistently throughout the document (e.g., `Config_File`, `Env_Data_Dir`).
 - **Requirements**: Numbered sections, each with:
   - A user story: "As a [role], I want [capability], so that [benefit]."
   - Acceptance criteria: Numbered list using RFC 2119 keywords. Each criterion is independently verifiable.
