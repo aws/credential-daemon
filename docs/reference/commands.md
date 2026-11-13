@@ -266,7 +266,8 @@ your caller root at once.
 ### creds config
 
 Read and change an environment's settings in `config.toml`. Keys are listed in
-[configuration](configuration.md#configtoml).
+[configuration](configuration.md#configtoml). `credential` is refused by `set`, `get` and
+`unset` alike; change a credential with `creds bootstrap`.
 
 ### creds config path
 
@@ -304,10 +305,8 @@ creds config get <KEY> --environment <ENV>
 
 ### creds config unset
 
-Remove a key, reverting to its default. Two keys are refused: `credential`, which
-`creds bootstrap` owns, and `identity_type`, which is settable but not unsettable because an
-absent value is read as `human`, the most privileged tier — set it to an explicit tier
-instead. See [settable keys](configuration.md#settable-keys).
+Remove a key, reverting to its default. `identity_type` is settable but not unsettable — set it
+to an explicit tier instead. See [settable keys](configuration.md#settable-keys).
 
 ```
 creds config unset <KEY> --environment <ENV>
