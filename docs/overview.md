@@ -66,13 +66,17 @@ Most credential types store a secret whose only purpose is to be exchanged:
 | `aws-web-identity` | An OAuth 2.0 sign-in | Role credentials through `AssumeRoleWithWebIdentity` |
 | `aws-login` | An AWS Sign-In session (`aws login`) | Raw AWS credentials from the Sign-In token endpoint, rotated on each refresh |
 | `oauth` | A client secret or signing key | An OAuth 2.0 access token (client credentials) |
-| `jwt-bearer` | A signed assertion | An access token (JWT bearer grant) |
+| `jwt-bearer` † | A signed assertion | An access token (JWT bearer grant) |
 | `jwt`, `static-secret` | A token or secret | Nothing: delivered as stored, until it expires |
 
 The daemon caches the short-lived result and refreshes it in the background, so a long-running
 task keeps working without holding anything long-lived. The last row is the plain vaulting case,
 and it is the exception. Field-level detail is in the
 [configuration reference](reference/configuration.md#credentialstoml).
+
+† `jwt-bearer` is experimental and no published build enables it; it needs a build from source
+with `--features jwt-bearer`. See
+[`jwt-bearer`](reference/configuration.md#jwt-bearer) in the configuration reference.
 
 ### Environment definitions
 
