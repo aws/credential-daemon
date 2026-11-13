@@ -121,10 +121,11 @@ Every method that takes `request_id` treats it as an opaque correlation string.
 **Approval.** `config/set`, `config/unset` (when the key is set), `credential/remove`,
 `environment/remove`, `environment/bootstrap` (when it would replace a credential or repoint an
 environment), `environment/import` (when a profile would bind into an existing environment, or
-replace sealed material left behind), `file/revalidate` (when a file has drifted) are gated. A
-gated call is not performed: it fails with `APPROVAL_REQUIRED`, whose `data.challenge` names a
-pending request, and the operation happens when [`request/approve`](#requestapprove) satisfies
-it. [`presence/enroll`](#presenceenroll) is gated too, but returns its challenge in a successful
+replace sealed material left behind), and `file/revalidate` (when a file has drifted, a file has
+been deleted, or the integrity record will not open) are gated. A gated call is not performed: it
+fails with `APPROVAL_REQUIRED`, whose `data.challenge` names a pending request, and the operation
+happens when [`request/approve`](#requestapprove) satisfies it.
+[`presence/enroll`](#presenceenroll) is gated too, but returns its challenge in a successful
 result, since raising the request is all it does. For `environment/bootstrap` and
 `environment/import`, approval performs nothing; it lets the identical call be re-sent once
 within 5 minutes. See [presence and sudo approval](../presence.md).
@@ -452,7 +453,9 @@ Params: none.
 
 Result: `{}`.
 
-Errors: `APPROVAL_REQUIRED` (gated; the operation happens on approval, see [Approval](#methods)).
+Errors: `APPROVAL_REQUIRED` (gated; the operation happens on approval, see
+[Approval](#methods)); `CONFIG_DRIFTED` (a drifted file does not parse, so no approval can ratify
+it until it is corrected or restored).
 
 ## Errors
 

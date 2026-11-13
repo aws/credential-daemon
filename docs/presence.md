@@ -36,7 +36,7 @@ The list is fixed in the daemon. No configuration adds to it or removes from it.
 | `creds import` | a profile would bind into an existing environment, or replace sealed material left behind |
 | `creds remove --credential` | always |
 | `creds remove --environment` | always |
-| `creds revalidate` | a file has drifted, since the approval is where its contents are disclosed in full |
+| `creds revalidate` | a file that still parses has drifted, a file has been deleted, or the integrity record will not open |
 | `creds presence enroll` | always, and only `sudo` can approve it |
 
 An operation that changes nothing needs no approval, so a first bootstrap, a first import, and
