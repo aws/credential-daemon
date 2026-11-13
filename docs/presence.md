@@ -36,6 +36,7 @@ The list is fixed in the daemon. No configuration adds to it or removes from it.
 | `creds import` | a profile would bind into an existing environment, or replace sealed material left behind |
 | `creds remove --credential` | always |
 | `creds remove --environment` | always |
+| `creds revalidate` | a file has drifted, since the approval is where its contents are disclosed in full |
 | `creds presence enroll` | always, and only `sudo` can approve it |
 
 An operation that changes nothing needs no approval, so a first bootstrap, a first import, and
@@ -226,4 +227,4 @@ as you can change either one's wording. It still cannot approve without your fin
   the enrolled-key registry, is writable by every process running as you, so none of this holds.
   Use a system install (`sudo credsd install`) instead; see [install](install.md).
 
-See the [command reference](reference/commands.md#creds-approve) for every flag.
+See the [command reference](reference/commands.md#creds-request-approve) for every flag.
