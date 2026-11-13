@@ -113,8 +113,8 @@ gets `PROVIDER_UNAVAILABLE`. A client reads lines until one carries its request 
 
 Wire values: `kind` is `session_credentials` or `access_token`. `status` is one of `active`,
 `expiring`, `expired`, `sign_in_required`, `no_session`, `corrupt`, `unreadable`, `decrypt_failed`, `unknown`.
-`source` is one of `aws_idc_sso`, `aws_iam_user`, `aws_roles_anywhere`, `aws_web_identity`, `jwt`, `oauth`,
-`jwt_bearer`, `static_secret`, `unsupported`. Each value set may grow.
+`source` is one of `aws_idc_sso`, `aws_iam_user`, `aws_roles_anywhere`, `aws_web_identity`,
+`aws_login`, `jwt`, `oauth`, `jwt_bearer`, `static_secret`, `unsupported`. Each value set may grow.
 
 Every method that takes `request_id` treats it as an opaque correlation string.
 
@@ -250,6 +250,7 @@ environment's existing value (`human` for a new one).
 | `aws_iam_user` | `access_key_id`, `secret_access_key`, `region` | `duration_seconds`, `mfa_serial` |
 | `aws_roles_anywhere` | `trust_anchor_arn`, `profile_arn`, `role_arn`, `cert_der`, `key_der`, `key_tag` | `chain_der` (array), `region`, `duration_seconds`, `role_session_name`, `endpoint_url` |
 | `aws_web_identity` | `authorization_endpoint`, `token_endpoint`, `client_id`, `role_arn`, `region` | `scopes` (default `["openid"]`), `duration_seconds`, `role_session_name`, `callback_port` |
+| `aws_login` | `region` | `callback_port`, `remote`, `identity_type` |
 | `jwt` | `jwt` | `env_var` |
 | `oauth` | `token_url`, `client_id`, and `client_secret` or `private_key_pem` | `scope` |
 | `jwt_bearer` | `token_url`, `assertion` | `client_id`, `scope` |
@@ -264,6 +265,9 @@ Notes:
 - `aws_web_identity` and `jwt_bearer` endpoints must be `https://` with no userinfo. `scopes` always
   gains `openid`. After sealing, `aws_web_identity` federates once; failure there returns an error
   even though the credential was saved.
+- `aws_login`: `region` is the Sign-In region. `callback_port` and `remote` are mutually exclusive —
+  a remote login binds no loopback listener and the user carries the authorization code back by
+  hand. The client id and redirect shape are fixed to the AWS CLI's, so there is no `client_id`.
 - `env_var` defaults to the credential name, upper-cased (`.`, `-`, `_` folded to `_`; a leading digit gets a `_` prefix).
 
 Result: `{}`.
@@ -332,8 +336,12 @@ Read, write, or remove one `config.toml` key of an environment. Keys are those l
 | `config/unset` | `environment`, `key` | `{}` |
 
 Errors: `APPROVAL_REQUIRED` (gated; see [Approval](#methods)); `ENVIRONMENT_NOT_FOUND`
-(unauthorized, or no such environment); `-32602` (bad name, unknown key, invalid value, or the
-protected key `credential`); `INTERNAL`.
+(unauthorized); `-32602` (bad name, unknown key, invalid value, or the protected key
+`credential`); `INTERNAL`.
+
+A missing environment is not reported uniformly: `config/set` and `config/unset` send `-32602`,
+`config/get` sends `INTERNAL`. A client that branches on a missing environment must accept both
+from these three methods, and must not read `INTERNAL` here as a daemon fault.
 
 ### `system/health`
 
@@ -472,9 +480,12 @@ Numeric codes describe the message. Every domain failure is `-32000` with `data.
 |---|---|---|
 | `ENVIRONMENT_NOT_FOUND` | No such environment or credential, a credential the environment does not reference, or the caller is not authorized. Indistinguishable by design | Bootstrap the environment |
 | `REAUTH_REQUIRED` | No valid session | From `credential/get` and `credential/get_batch`, `data.environment` and `data.remediation`, currently the string `credsd login --environment <env>`; the client command is `creds login` |
-| `WRONG_CREDENTIAL_TYPE` | Material of a kind the projection cannot use. No socket method returns it today; the ephemeral container-credentials proxy does, for an access token | Use a credential of the right kind |
+| `WRONG_CREDENTIAL_TYPE` | Material of a kind the projection cannot use. Reserved: no method sends it today, and a client that recognizes it keeps working against a daemon that starts to | Use a credential of the right kind |
 | `PROVIDER_UNAVAILABLE` | Upstream or provider failure, or a flow already in flight | Retry; the message says what failed |
 | `INTERNAL` | Daemon-side failure (config, storage, encryption, I/O) | See the daemon log |
+| `CONFIG_DRIFTED` | The caller's `config.toml` or `credentials.toml` no longer matches its sealed snapshot. Credential operations are blocked; the message names the file | Read the contents, then `creds revalidate` |
+| `INTEGRITY_UNVERIFIABLE` | The caller's integrity record will not open, so neither file can be checked | `creds revalidate`; its approval shows both files in full and replaces the record |
+| `CUSTODY_BROKEN` | Ownership or modes on the integrity record or the enrolled-key registry are wrong. Nothing they govern is served, written, or approved | None. An operator restores ownership and modes and restarts the daemon; a client that retries or re-prompts loops |
 | `AUTH_TIMEOUT` | Sign-in or selection not completed in time | Run the flow again |
 | `AUTH_CANCELLED` | The client closed the connection during a flow | Run the flow again |
 | `APPROVAL_REQUIRED` | The operation is gated and was not performed. `data.challenge` is the pending request's challenge, as in [`request/get`](#requestget-requestlist) | `data.remediation`, e.g. `sudo creds request approve <id>` |

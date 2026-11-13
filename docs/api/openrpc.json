@@ -10,6 +10,7 @@
     {
       "name": "config/get",
       "summary": "Read an environment setting.",
+      "description": "A missing environment is reported as INTERNAL here, and as -32602 by config/set and config/unset. ENVIRONMENT_NOT_FOUND covers only an unauthorized caller.",
       "paramStructure": "by-name",
       "params": [
         {
@@ -54,6 +55,9 @@
         },
         {
           "$ref": "#/components/errors/EnvironmentNotFound"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
         },
         {
           "$ref": "#/components/errors/ConfigDrifted"
@@ -249,9 +253,6 @@
           "$ref": "#/components/errors/ReauthRequired"
         },
         {
-          "$ref": "#/components/errors/WrongCredentialType"
-        },
-        {
           "$ref": "#/components/errors/ProviderUnavailable"
         },
         {
@@ -332,9 +333,6 @@
         },
         {
           "$ref": "#/components/errors/ReauthRequired"
-        },
-        {
-          "$ref": "#/components/errors/WrongCredentialType"
         },
         {
           "$ref": "#/components/errors/ProviderUnavailable"
@@ -2403,7 +2401,7 @@
       },
       "WrongCredentialType": {
         "code": -32000,
-        "message": "The credential's kind cannot be projected onto the requested shape.",
+        "message": "The credential's kind cannot be projected onto the requested shape. Reserved: no method declares it today.",
         "data": {
           "code": "WRONG_CREDENTIAL_TYPE"
         }
