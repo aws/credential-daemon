@@ -8,16 +8,42 @@
 
 # Overview
 
-credsd is a local credential daemon. It holds the long-lived secrets a developer works with,
-exchanges them for the short-lived credentials a task actually needs, and delivers those to the
-one process that asked, in the form that process expects to find them. It is built for a
-developer's own machine and for the agents and tools that developer runs there.
+AWS Credential Daemon (credsd) is a local credential manager. It holds the long-lived secrets a
+developer works with, exchanges them for the short-lived credentials a task actually needs, and
+delivers those to the one process that asked, in the form that process expects to find them. It
+is built for a developer's own machine and for the agents and tools that developer runs there.
 
-## The premise
+Securing local credentials should not require you to learn new commands or rewrite application
+code, so credsd answers where the AWS CLI and SDKs already look.
 
-Every process you run as your user can read every file your user can read. A long-lived AWS key
-in `~/.aws/credentials`, an SSO token in a cache directory, an API key in a dotfile: each is
-available to any script, dependency, or agent running as you, for as long as it sits there.
+- **If you are a developer,** you keep the sign-in and command-line workflow you already use.
+  credsd refreshes sessions for you and hands each tool the credential it expects to find.
+- **If you are responsible for a fleet,** the long-lived material behind those sessions moves
+  into a keystore that the processes running as your developers cannot open, and every request
+  for a credential is assessed and audited on the host.
+
+## The problem
+
+Developers authenticate to AWS from laptops, build servers, and virtual machines. The AWS CLI
+and SDKs have historically kept long-lived access keys, sign-in sessions, and session caches in
+plaintext files under `~/.aws/`.
+
+Operating-system file permissions keep other users of a shared machine out of those files. They
+do not distinguish between programs running as the same developer. Every local script,
+third-party dependency, and AI coding assistant running under your account can read every
+credential file on your disk.
+
+Two shifts made that model untenable:
+
+- **Local AI coding agents.** An agent reads files and runs commands chosen at run time rather
+  than following a fixed code path. Content it was never meant to trust — a repository issue, a
+  pull request title, a web page — can induce it to read and disclose the credentials sitting
+  in `~/.aws/`.
+- **Longer sign-in sessions.** As organizations adopt extended AWS sign-in sessions of up to 90
+  days to cut daily re-authentication, one copied session file becomes months of access from
+  any machine.
+
+## The boundary credsd adds
 
 credsd moves those secrets behind a boundary your user account does not cross:
 
@@ -33,6 +59,26 @@ credsd moves those secrets behind a boundary your user account does not cross:
 - **Changes need more than your uid.** Changing an existing configuration or credential needs a
   Touch ID signature or a `sudo` approval, so a process running as you cannot quietly do it. See
   [presence and sudo approval](presence.md).
+
+## When to use credsd
+
+**Safely empower local AI coding agents.** Run autonomous coding assistants and local scripts
+alongside your normal developer environment without leaving readable credentials on disk or
+handing an agent unrestricted access. Give the agent's environment its own IAM role, or pair
+credsd with a sandbox such as [Strands Box](https://github.com/strands-agents/box) when the agent
+should not hold a credential at all.
+
+**Eliminate plaintext credential files on developer workstations.** Protect laptops from local
+credential harvesting by sealing session material under a hardware-backed key. Applications and
+CLI commands fetch short-lived credentials from the local daemon over a Unix domain socket rather
+than reading credential files or a cache. Because the AWS SDKs resolve ambient environment
+variables and plaintext files before they consult `credential_process`, importing and removing
+what is already on the host is part of installing.
+
+**Unify custody across AWS and third-party credentials.** Hold the OAuth tokens, bearer JWTs and
+static API keys your tools use alongside their AWS credentials, establishing a single local
+security boundary across every service a machine authenticates to rather than maintaining
+separate solutions per provider.
 
 ## What credsd does
 
@@ -132,6 +178,13 @@ belongs to one user on one machine, and its master key cannot be exported or bac
 IAM role or policy behind it. credsd chooses which credential a process receives; it does not
 narrow what that credential permits. `agent` credentials are not yet scoped down and carry their
 role's full permissions.
+
+> **Planned: a scope-down ceiling.** An environment will be able to carry a ceiling that credsd
+> applies as an inline policy at issuance, through `sts:GetScopedCredentials`, so the session
+> AWS returns is already narrower than the role behind it. Because AWS applies the limit when
+> the credential is minted rather than the daemon enforcing it locally, the limit travels with
+> the credential and nothing holding that session can widen it. This is in development and no
+> release carries it yet; the paragraph above describes current behavior.
 
 **Not a sandbox.** A process that receives a credential can use it however it likes, and so can
 anything that process passes it to. credsd limits what is handed out and records who asked; it
