@@ -6,26 +6,48 @@
 > ease of use only: there is no process-tree assessment, and `serve` does not run there yet.
 <!-- /maturity-notice -->
 
-# credsd
+# AWS Credential Daemon (credsd)
 
-credsd is a local credential daemon for developers and for the agents and tools they run. It
-holds long-lived secrets — SSO sessions, IAM user keys, Roles Anywhere private keys, OAuth and
-bearer tokens — sealed under a master key in a hardware or OS keystore, and vends short-lived
-material to processes on request. The daemon is the only process that opens the keystore;
-the client asks it over a Unix socket, the daemon authorizes the caller by kernel-verified
-peer uid, and every request is assessed and audited there.
+AWS Credential Daemon (credsd) is a local background service that vaults, refreshes, and vends
+short-term credentials, eliminating plaintext keys and cached session tokens from disk.
+Developers and local AI agents get uninterrupted, low-friction access to AWS APIs and external
+services, while security teams set permission ceilings per host and maintain clear audit trails.
 
-credsd is not a general-purpose secret store like HashiCorp Vault, and not a password manager.
-Holding secrets is one part of what it does. It also exchanges them for short-lived
-credentials, groups credentials into named environments, delivers each one in the form its
-consumer reads, and requires a Touch ID or `sudo` approval before anything changes them.
-Everything it holds belongs to one user on one machine. See the [overview](docs/overview.md).
+credsd works with the AWS CLI, AWS SDKs, and existing authentication workflows including IAM
+Identity Center (SSO), `aws login`, and IAM Roles Anywhere. Instead of sharing static credential
+files or broad session tokens across local tools, the daemon seals long-lived secrets under a
+master key in a hardware-backed keystore and vends short-lived credentials from memory.
+
+## Key benefits
+
+- **Developers move fast without token interruptions.** Eliminate expired-session errors and the
+  daily re-authentication loop. credsd refreshes short-lived credentials in the background,
+  keeping local CLI workflows and coding agents running without anyone managing cache files, and
+  prompts for re-authentication only when an underlying session reaches its maximum lifetime.
+
+- **Keep credentials off disk.** Replace plaintext long-term keys and cached session tokens with
+  encrypted files sealed under a master key in the Secure Enclave, a TPM 2.0, or the macOS data
+  protection keychain, while caching only short-lived credentials in memory. What a process
+  receives is a session that expires, never the key that minted it.
+
+- **Works with your existing AWS authentication and audit tools.** Keep the authentication
+  methods and observability workflows you rely on. credsd logs the kernel-verified process tree —
+  uid, pid, executable path — for every credential request, and uses heuristic matching to tag
+  known agent harnesses in local logs. Local process classification is best-effort telemetry. To
+  distinguish an AI agent's actions from a developer's in AWS CloudTrail, and to enforce least
+  privilege, provision a dedicated credential and IAM role for the agent.
+
+credsd is not a general-purpose secret store: it has no API for applications to store and read
+arbitrary values, and everything it holds belongs to one user on one machine. What it does beyond
+holding secrets — exchanging credentials, composing environments, projecting each credential into
+the form its consumer reads, gating changes on approval, and the planned permission ceiling — is
+described in the [overview](docs/overview.md).
 
 ## The two binaries
 
 | Binary | Role | Subcommands |
 |---|---|---|
-| `creds` | Client | `bootstrap`, `login`, `get`, `list`, `remove`, `config`, `import`, `request`, `presence` |
+| `creds` | Client | `bootstrap`, `login`, `get`, `list`, `remove`, `revalidate`, `config`, `import`, `request`, `presence` |
 | `credsd` | Daemon | `serve`, `init`, `install`, `uninstall`, `status` |
 
 ## Choose your path
@@ -46,7 +68,10 @@ Everything it holds belongs to one user on one machine. See the [overview](docs/
 | macOS, official signed release (`credsd-macos-aarch64.pkg`) | User-scoped (LaunchAgent), `credsd install --user` | `data-protection-keychain` |
 | macOS, built from source | System (LaunchDaemon), `sudo credsd install` | `secure-enclave` |
 | Linux | System (systemd) | `tpm` |
-| Windows | Not yet decided | — |
+| Windows | On the roadmap for H1 2027 | — |
+
+Windows is on the roadmap for H1 2027: the storage backends exist in the code, and the service
+transport and install shape are still being designed.
 
 See [Install](docs/install.md) for what each shape protects.
 
