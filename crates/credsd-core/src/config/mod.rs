@@ -183,8 +183,9 @@ pub struct AwsWebIdentityConfig {
 }
 
 /// AWS Sign-In login (`aws login`): OAuth2 + PKCE + DPoP, federated to raw AWS credentials with
-/// no STS call. The client id is fixed to the AWS CLI's; tokens and the DPoP key are sealed under
-/// `callers/<uid>/credentials/<name>/`, never in `credentials.toml`.
+/// no STS call. The client id is one of Sign-In's two devtools clients, picked by `remote`; tokens
+/// and the DPoP key are sealed under `callers/<uid>/credentials/<name>/`, never in
+/// `credentials.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AwsLoginConfig {
     /// Sign-In region; selects `https://{region}.signin.aws.amazon.com`. Required, with no default.

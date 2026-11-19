@@ -10,6 +10,7 @@
     {
       "name": "config/get",
       "summary": "Read an environment setting.",
+      "description": "A missing environment is reported as INTERNAL here, and as -32602 by config/set and config/unset. ENVIRONMENT_NOT_FOUND covers only an unauthorized caller.",
       "paramStructure": "by-name",
       "params": [
         {
@@ -56,13 +57,7 @@
           "$ref": "#/components/errors/EnvironmentNotFound"
         },
         {
-          "$ref": "#/components/errors/ConfigDrifted"
-        },
-        {
-          "$ref": "#/components/errors/IntegrityUnverifiable"
-        },
-        {
-          "$ref": "#/components/errors/CustodyBroken"
+          "$ref": "#/components/errors/Internal"
         }
       ],
       "x-carriers": [
@@ -249,9 +244,6 @@
           "$ref": "#/components/errors/ReauthRequired"
         },
         {
-          "$ref": "#/components/errors/WrongCredentialType"
-        },
-        {
           "$ref": "#/components/errors/ProviderUnavailable"
         },
         {
@@ -332,9 +324,6 @@
         },
         {
           "$ref": "#/components/errors/ReauthRequired"
-        },
-        {
-          "$ref": "#/components/errors/WrongCredentialType"
         },
         {
           "$ref": "#/components/errors/ProviderUnavailable"
@@ -1997,7 +1986,7 @@
               },
               "callback_port": {
                 "type": "integer",
-                "minimum": 0,
+                "minimum": 1024,
                 "maximum": 65535
               }
             },
@@ -2021,7 +2010,7 @@
               },
               "callback_port": {
                 "type": "integer",
-                "minimum": 0,
+                "minimum": 1024,
                 "maximum": 65535
               },
               "remote": {
@@ -2042,7 +2031,19 @@
             "required": [
               "type",
               "region"
-            ]
+            ],
+            "not": {
+              "properties": {
+                "remote": {
+                  "const": true
+                }
+              },
+              "required": [
+                "remote",
+                "callback_port"
+              ]
+            },
+            "description": "A remote login binds no loopback listener, so `remote` and `callback_port` together are refused."
           },
           {
             "type": "object",
