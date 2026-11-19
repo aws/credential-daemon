@@ -121,14 +121,14 @@ Every method that takes `request_id` treats it as an opaque correlation string.
 **Approval.** `config/set`, `config/unset` (when the key is set), `credential/remove`,
 `environment/remove`, `environment/bootstrap` (when it would replace a credential or repoint an
 environment), `environment/import` (when a profile would bind into an existing environment, or
-replace sealed material left behind) are gated. A gated call is not performed: it fails with
-`APPROVAL_REQUIRED`, whose `data.challenge` names a pending request, and the operation happens
-when [`request/approve`](#requestapprove) satisfies it. [`presence/enroll`](#presenceenroll) is
-gated too, but returns its challenge in a successful result, since raising the request is all
-it does. For
-`environment/bootstrap` and `environment/import`, approval performs nothing; it lets the
-identical call be re-sent once within 5 minutes. See [presence and sudo
-approval](../presence.md).
+replace sealed material left behind), and `file/revalidate` (when a file has drifted, a file has
+been deleted, or the integrity record will not open) are gated. A gated call is not performed: it
+fails with `APPROVAL_REQUIRED`, whose `data.challenge` names a pending request, and the operation
+happens when [`request/approve`](#requestapprove) satisfies it.
+[`presence/enroll`](#presenceenroll) is gated too, but returns its challenge in a successful
+result, since raising the request is all it does. For `environment/bootstrap` and
+`environment/import`, approval performs nothing; it lets the identical call be re-sent once
+within 5 minutes. See [presence and sudo approval](../presence.md).
 
 **Drift and custody.** Before a credential is served, and before anything is written to
 `config.toml` or `credentials.toml`, the daemon checks both files against their sealed snapshots
@@ -473,13 +473,21 @@ Errors: `ENVIRONMENT_NOT_FOUND` (unauthorized).
 ### `file/revalidate`
 
 Reseal hand-edited config files after review. Takes no selector: a snapshot covers its whole
-file, so every drifted file is shown and resealed together.
+file, so every drifted file is shown and resealed together. Every load-bearing file that is
+present must parse before any of this is reached, whatever the trigger was; one that does not is
+corrected or restored first.
 
 Params: none.
 
 Result: `{}`.
 
-Errors: `APPROVAL_REQUIRED` (gated; the operation happens on approval, see [Approval](#methods)).
+Errors: `APPROVAL_REQUIRED` (gated; the operation happens on approval, see
+[Approval](#methods)); `CONFIG_DRIFTED` (a load-bearing file that is present does not parse, so
+it has no canonical form and there is nothing a snapshot could ratify; raised before drift is
+classified, so it does not mean that file drifted); `CUSTODY_BROKEN` (custody of the integrity
+record or the enrolled-key registry is broken); `ENVIRONMENT_NOT_FOUND` (unauthorized); `-32602`
+(any field in `params`: the method takes none); `INTERNAL` (reading either file, hashing the base
+state, or a file that is not UTF-8).
 
 ## Errors
 

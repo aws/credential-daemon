@@ -36,11 +36,16 @@ The list is fixed in the daemon. No configuration adds to it or removes from it.
 | `creds import` | a profile would bind into an existing environment, or replace sealed material left behind |
 | `creds remove --credential` | always |
 | `creds remove --environment` | always |
+| `creds revalidate` | a file has drifted, a file has been deleted, or the integrity record will not open |
 | `creds presence enroll` | always, and only `sudo` can approve it |
 
 An operation that changes nothing needs no approval, so a first bootstrap, a first import, and
 an unset of a key that is not set all go straight through. Reading credentials (`creds get`,
 `creds list`) is never gated.
+
+`creds revalidate` raises no challenge at all while a load-bearing file that is present does not
+parse, whatever the trigger was: a file with no canonical form has nothing a snapshot could
+ratify, so correct or restore it first.
 
 ## How an approval works
 
@@ -226,4 +231,4 @@ as you can change either one's wording. It still cannot approve without your fin
   the enrolled-key registry, is writable by every process running as you, so none of this holds.
   Use a system install (`sudo credsd install`) instead; see [install](install.md).
 
-See the [command reference](reference/commands.md#creds-approve) for every flag.
+See the [command reference](reference/commands.md#creds-request-approve) for every flag.
