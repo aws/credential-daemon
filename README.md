@@ -11,7 +11,8 @@
 AWS Credential Daemon (credsd) is a local background service that vaults, refreshes, and vends
 short-term credentials, eliminating plaintext keys and cached session tokens from disk.
 Developers and local AI agents get uninterrupted, low-friction access to AWS APIs and external
-services, while security teams set permission ceilings per host and maintain clear audit trails.
+services, while security teams maintain clear audit trails and, soon, set permission ceilings per
+host.
 
 credsd works with the AWS CLI, AWS SDKs, and existing authentication workflows including IAM
 Identity Center (SSO), `aws login`, and IAM Roles Anywhere. Instead of sharing static credential
@@ -30,8 +31,8 @@ master key in a hardware-backed keystore and vends short-lived credentials from 
   protection keychain, while caching only short-lived credentials in memory. What a process
   receives is a session that expires, never the key that minted it.
 
-- **Works with your existing AWS authentication and audit tools.** Keep the authentication
-  methods and observability workflows you rely on. credsd logs the kernel-verified process tree —
+- **Works with your existing AWS authentication, and adds local audit logs for every request.**
+  Keep the authentication methods you rely on. credsd logs the kernel-verified process tree —
   uid, pid, executable path — for every credential request, and uses heuristic matching to tag
   known agent harnesses in local logs. Local process classification is best-effort telemetry. To
   distinguish an AI agent's actions from a developer's in AWS CloudTrail, and to enforce least
