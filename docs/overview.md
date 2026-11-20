@@ -89,7 +89,7 @@ receives and how it receives it.
 |---|---|---|
 | Vaulting | Seals long-lived secrets at rest under a master key in a hardware or OS keystore. | Chosen at install: [key security](key-security.md) |
 | Credential exchange | Trades a held secret for a short-lived credential from its issuer, and refreshes it before it expires. | `credentials.toml`, through `creds bootstrap` |
-| Credential projection | Delivers each credential in the form its consumer reads: an AWS profile, an environment variable, or a credential endpoint. | The credential type's default, or a declaration in `config.toml` or `credentials.toml` |
+| Credential projection | Delivers each credential in the form its consumer reads: an AWS profile or an environment variable. | The credential type's default |
 | Lightweight authorization | Decides who may ask: kernel-verified caller identity, per-user isolation, identity-type rules, and approval for changes. | Fixed in the daemon; not configurable |
 
 ### Vaulting
@@ -141,11 +141,7 @@ delivered through one:
   config holds no secrets.
 - **`env-var`.** A token or secret under the variable its consumer reads. `creds get --format
   shell` prints it for `eval`.
-- **`credential-endpoint`.** A loopback endpoint behind a bearer token, for consumers that only
-  discover credentials that way.
-
-Each credential type has a default projection, and its credential configuration can declare
-another. `creds get` serves the named credential.
+Each credential type has a fixed default projection. `creds get` serves the named credential.
 
 ### Lightweight authorization
 

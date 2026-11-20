@@ -60,6 +60,7 @@ real reason. Exceptions:
 - `system/health` requires no authorization.
 - `credential/bootstrap` and `credential/import` provision `callers/<uid>/owner` for a uid
   that has never been provisioned, then proceed.
+- `credential/list` from a uid that has never been provisioned returns an empty list.
 
 Every method acts only on the caller's own `callers/<uid>/` tree. See
 [configuration](configuration.md) for the data directory per install shape.
@@ -107,8 +108,8 @@ A client responds with a notification, not a request:
 ```
 
 The daemon waits 300 seconds for a selection (`AUTH_TIMEOUT`). Closing the connection cancels
-the flow (`AUTH_CANCELLED`). One bootstrap or login may be in flight per connection; a second
-gets `PROVIDER_UNAVAILABLE`. A client reads lines until one carries its request `id`.
+the flow (`AUTH_CANCELLED`). One bootstrap or login may be in flight per connection, and one per uid
+across all connections; a second gets `PROVIDER_UNAVAILABLE`. A client reads lines until one carries its request `id`.
 
 ## Methods
 
@@ -186,8 +187,8 @@ approval; any other pair is `ROLE_NOT_ALLOWED`. A listed role the user does not 
 → {"jsonrpc":"2.0","id":1,"method":"credential/get","params":{"credential":"sso.acme","account_id":"111111111111","role_name":"ReadOnly"}}
 ```
 
-Errors: `-32602`, `CREDENTIAL_NOT_FOUND`, `REAUTH_REQUIRED`,
-`PROVIDER_UNAVAILABLE`, `CONFIG_INVALID`, `INTERNAL`.
+Errors: `-32602`, `CREDENTIAL_NOT_FOUND`, `REAUTH_REQUIRED`, `ROLE_NOT_ALLOWED`,
+`ROLE_SELECTION_UNSUPPORTED`, `PROVIDER_UNAVAILABLE`, `CONFIG_INVALID`, `INTERNAL`.
 
 ### `credential/list`
 
@@ -255,7 +256,7 @@ The CLI equivalent is `creds logout --credential <name>`.
 
 ### `credential/tag`
 
-Set and unset a credential's tags in one write. Ungated: tags are labels and carry no authority.
+Set and unset a credential's tags in one write. *Strict.* Ungated: tags are labels and carry no authority.
 Keys not named keep their values, and a key in `set` that already exists takes the new value;
 `credential/bootstrap` with `tags` instead replaces the whole set.
 
@@ -358,7 +359,8 @@ Errors: `APPROVAL_REQUIRED` (gated; see [Approval](#methods)); `-32602` (bad par
 DER); `CREDENTIAL_NOT_FOUND` (unauthorized); `AUTH_TIMEOUT`; `AUTH_CANCELLED`;
 `PROVIDER_UNAVAILABLE` (flow already in flight, no accounts or roles, seal or federation
 failure, provider feature not compiled into this build); `REAUTH_REQUIRED` (`aws_web_identity`
-saved but cannot federate; no `remediation`); `INTERNAL`.
+saved but cannot federate; no `remediation`); `APPROVAL_REFUSED` (an approved re-send whose
+records could not be read); `INTERNAL`.
 
 ### `credential/bootstrap/respond`
 
@@ -399,7 +401,7 @@ environment. A client importing several profiles makes one call per profile. Not
 
 | Param | Type | |
 |---|---|---|
-| `credential` | string | the credential to create |
+| `credential` | string | required; the credential to create |
 | `access_key_id` | string | required |
 | `secret_access_key` | string | required |
 | `region` | string | required |
@@ -467,7 +469,8 @@ has been modified since, it is discarded unperformed (`APPROVAL_REFUSED`, reason
 `base_state_changed`).
 
 Errors: `APPROVAL_REFUSED`; `REQUEST_NOT_FOUND`; `-32602` (`signature` is not hex);
-`CREDENTIAL_NOT_FOUND` (unauthorized, on a connection whose uid is not 0).
+`CREDENTIAL_NOT_FOUND` (unauthorized, on a connection whose uid is not 0); `-32603` (an approved
+enrollment whose key could not be persisted; no `data.code`).
 
 ### `request/withdraw`
 
@@ -503,8 +506,8 @@ Params: none.
 
 Result: `{revoked}`, the removed key's fingerprint.
 
-Errors: `-32602` (no key enrolled); `INTERNAL` (the enrolled-key registry did not open or could
-not be written); `CREDENTIAL_NOT_FOUND` (unauthorized).
+Errors: `-32602` (no key enrolled); `-32603` (the enrolled-key registry did not open or could
+not be written; no `data.code`); `CREDENTIAL_NOT_FOUND` (unauthorized).
 
 ### `presence/status`
 
@@ -524,7 +527,7 @@ Errors: `CREDENTIAL_NOT_FOUND` (unauthorized).
 
 ### `file/revalidate`
 
-Reseal hand-edited config files after review. Takes no selector: a snapshot covers its whole
+Reseal hand-edited config files after review. *Strict.* Takes no selector: a snapshot covers its whole
 file, so every drifted file is shown and resealed together. Every load-bearing file that is
 present must parse before any of this is reached, whatever the trigger was; one that does not is
 corrected or restored first.
@@ -537,7 +540,8 @@ Errors: `APPROVAL_REQUIRED` (gated; the operation happens on approval, see
 [Approval](#methods)); `CONFIG_DRIFTED` (a load-bearing file that is present does not parse, so
 it has no canonical form and there is nothing a snapshot could ratify; raised before drift is
 classified, so it does not mean that file drifted); `CUSTODY_BROKEN` (custody of the integrity
-record or the enrolled-key registry is broken); `CREDENTIAL_NOT_FOUND` (unauthorized); `-32602`
+record or the enrolled-key registry is broken); `INTEGRITY_UNVERIFIABLE` (a snapshot cannot be
+assessed); `CREDENTIAL_NOT_FOUND` (unauthorized); `-32602`
 (any field in `params`: the method takes none); `INTERNAL` (reading either file, hashing the base
 state, or a file that is not UTF-8).
 
@@ -549,7 +553,7 @@ state, or a file that is not UTF-8).
 | `-32600` | JSON but not a valid request (missing or `null` `id`, array `params`) |
 | `-32601` | Unknown method |
 | `-32602` | Bad params, or a JSON-RPC batch |
-| `-32603` | Internal envelope failure |
+| `-32603` | Internal failure with no `data.code`, such as a presence registry that cannot be read or written |
 | `-32000` | Domain failure; read `data.code` |
 
 Numeric codes describe the message. Every domain failure is `-32000` with `data.code`:

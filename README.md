@@ -48,7 +48,7 @@ reads, gating changes on approval, and the planned permission ceiling — is des
 
 | Binary | Role | Subcommands |
 |---|---|---|
-| `creds` | Client | `bootstrap`, `login`, `get`, `list`, `remove`, `revalidate`, `config`, `import`, `request`, `presence` |
+| `creds` | Client | `bootstrap`, `login`, `logout`, `get`, `list`, `tag`, `remove`, `revalidate`, `config`, `import`, `request`, `presence` |
 | `credsd` | Daemon | `serve`, `init`, `install`, `uninstall`, `status` |
 
 ## Choose your path

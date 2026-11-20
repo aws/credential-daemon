@@ -56,8 +56,8 @@ user's first bootstrap. Files are written mode 0600, and credsd warns when it fi
 permissive. Where the master key lives depends on the storage backend; see
 [key security](../key-security.md).
 
-Credential names are 1–64 characters of letters, digits, `.`, `_`, `-`, and
-do not start with `.`.
+Credential names are 1–64 characters of letters, digits, `.`, `_`, `-`, do
+not start with `.`, and are not `default`.
 
 ## config.toml
 
@@ -124,7 +124,9 @@ them.
 
 One table per credential, keyed by name, tagged by `type`. Secrets are never in this file: each
 is sealed under `credentials/<name>/`. Every type also takes `identity_type`
-(default `human`). An unknown `type` loads as unsupported rather than failing the file.
+(default `human`) and `tags`, an inline table of string values. Tag keys are folded to
+lowercase; two keys that fold to the same key are refused, as are more than 32 tags. An unknown
+`type` loads as unsupported rather than failing the file.
 
 ```toml
 [work-sso]
@@ -143,6 +145,7 @@ role_name = "Developer"
 | `sso_region` | yes | SSO region. |
 | `account_id` | yes | Account. |
 | `role_name` | yes | Role. |
+| `allowed_roles` | no | Other `{ account_id, role_name }` pairs a request may select. The account is 12 digits. Set by `--allow-role` on bootstrap. Default: only the stored pair. |
 
 Sealed: `sso_token.enc`.
 
@@ -198,13 +201,13 @@ AWS Sign-In (`aws login`). No role and no STS call: the token endpoint returns c
 | `remote` | no | Boolean. Cross-device login: no loopback listener; the authorization code is pasted back. Default `false`. |
 | `identity_type` | no | Who the credential is for. Default `human`. |
 
-Sealed: `aws_login_token.enc` (includes the DPoP key).
+Sealed: `aws_login_token.enc`, `dpop_key.enc` (the DPoP key), and `identity.enc` (who signed in).
 
 ### jwt
 
 | Field | Required | Meaning |
 |---|---|---|
-| `env_var` | no | Variable the token is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_` (`my-token` exports `MY_TOKEN`). |
+| `env_var` | no | Variable the token is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_`, and a leading `_` when it would start with a digit (`my-token` exports `MY_TOKEN`). |
 
 Sealed: `jwt.enc`. Expiry is the JWT's `exp` claim. No path is stored.
 
@@ -226,7 +229,7 @@ Sealed: `oauth_client_secret.enc` (`client_secret_basic`) or `oauth_client_key.e
 
 | Field | Required | Meaning |
 |---|---|---|
-| `env_var` | no | Variable the secret is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_`. |
+| `env_var` | no | Variable the secret is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_`, and a leading `_` when it would start with a digit. |
 | `expires_at` | no | RFC 3339 expiry. Omitted: never expires. |
 | `secret_source` | no | Where the secret came from. Recorded for diagnostics; never read at runtime. |
 

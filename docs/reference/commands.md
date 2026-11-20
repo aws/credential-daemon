@@ -18,7 +18,8 @@ definitions disagree.
 Every `creds` command except `config path` needs a running daemon.
 On Windows there is no daemon transport yet, so those commands fail with an error.
 
-`--credential <NAME>` and `--name <NAME>` select the same credential. An
+`--credential <NAME>` and `--name <NAME>` select the same credential, except on
+`creds logout`, which takes only `--credential`. An
 `--environment` or `--env` flag is a usage error on every command.
 
 ## creds
@@ -30,7 +31,7 @@ Client CLI. Global flags, accepted before or after the subcommand:
 | Flag | Value | Meaning |
 |---|---|---|
 | `--config-dir <PATH>` | path | Sets `CREDSD_CONFIG_DIR` for this invocation. See [configuration](configuration.md#environment-variables). |
-| `--quiet`, `-q` | | Log level `error`. Conflicts with `--verbose`. |
+| `--quiet`, `-q` | | Log level `error`. With `--verbose`, an error (exit 1). |
 | `--verbose`, `-v` | | Log level `debug`. |
 | `--log-file <PATH>` | path | Append logs to this file. |
 | `--log-format <FORMAT>` | `text`, `json` | Log format. |
@@ -52,7 +53,7 @@ creds bootstrap (--credential <NAME> | --name-prefix <PREFIX>) [<PROVIDER> <PROV
 
 With no provider, re-authenticates an existing credential from its saved configuration, as
 `creds login` does. Names are 1–64 characters of
-letters, digits, `.`, `_`, `-`, and do not start with `.`.
+letters, digits, `.`, `_`, `-`, do not start with `.`, and are not `default`.
 
 `--identity-type` on a provider sets the credential's [identity type](configuration.md#identity-types):
 `human`, `automation`, or `agent`.
@@ -348,8 +349,8 @@ your caller root at once.
 
 ### creds config
 
-The only subcommand is `path`. Environment settings remain in `config.toml` but are not
-managed by this CLI.
+The only subcommand is `path`. A `config.toml` that still holds an `[environment]` or
+`[environments]` table is refused.
 
 ### creds config path
 
@@ -364,7 +365,8 @@ Import credentials from an external store. The source is only read.
 
 Import static-key profiles from the AWS shared-credentials file. Each profile with
 `aws_access_key_id` and `aws_secret_access_key` becomes an `aws-iam-user` credential of the same
-name. No environment is created. SSO and `credential_process` profiles are skipped.
+name. SSO and `credential_process` profiles are skipped, as is a profile with an invalid
+name, no region, or the name of an existing credential; each skip prints its reason.
 
 | Flag | Value | Meaning |
 |---|---|---|
@@ -434,7 +436,7 @@ Daemon and service installer. Global flags, accepted before or after the subcomm
 |---|---|---|
 | `--storage-backend <NAME>` | backend | Where the master key is held: `data-protection-keychain`, `secure-enclave`, `tpm`, `kkrs`, `file`, `dpapi`, `credential-manager`, as compiled into this build (`credsd --version`). Required by `serve` and `init`; optional for `install`. See [key security](../key-security.md). |
 | `--config-dir <PATH>` | path | Sets `CREDSD_CONFIG_DIR` for this invocation. |
-| `--quiet`, `-q` | | Log level `error`. Conflicts with `--verbose`. |
+| `--quiet`, `-q` | | Log level `error`. With `--verbose`, an error (exit 1). |
 | `--verbose`, `-v` | | Log level `debug`. |
 | `--log-file <PATH>` | path | Append logs to this file. |
 | `--log-format <FORMAT>` | `text`, `json` | Log format. |
