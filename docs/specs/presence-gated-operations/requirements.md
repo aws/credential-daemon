@@ -5,6 +5,17 @@ created: 2026-10-04
 
 # Requirements: Presence-Gated Operations
 
+## Applicability to environment operations
+
+[credential-only-addressing](../credential-only-addressing/requirements.md)
+requirements make `config/set`, `config/get`, `config/unset`, and `environment/remove`
+unavailable. The gating and error behavior specified below for those methods applies to
+retained internal implementations only. They return method-not-found before a presence
+challenge can be created. Presence gating for active operations still applies. A caller denied by
+absence on a dispatched, credential-addressed operation receives `CREDENTIAL_NOT_FOUND`
+(credential-only-addressing Requirement 4.5); 8.5's `ENVIRONMENT_NOT_FOUND` applies to the
+retained environment handlers only.
+
 ## Summary
 
 Some daemon operations should not complete on the strength of the caller's uid alone. A process
@@ -136,21 +147,50 @@ relax which operations need presence.
      that nothing above the gate can relax it.
 
 1.7. The built-in gate SHALL require verified presence for every operation that changes a
-     caller's existing configuration or sealed material, and for enrollment:
+     caller's existing credential or security configuration or sealed material, and for
+     enrollment. Credential or security configuration is anything that affects which credentials
+     are issued, to whom, or how they are obtained, and the sealing that attests the configuration
+     has not been changed outside the daemon. An operation that changes only metadata, which no
+     authorization, presence, issuance, or selection decision reads, SHALL NOT be required to be
+     gated; a credential's tags are such metadata (`credential-tags` Requirement 5.1). An
+     operation is in the metadata class only if it changes nothing else: it SHALL leave every
+     other field of the file it writes as it was, and SHALL pass the same drift check before it
+     reseals that file (`drift-detection` Requirement 5.8), so its reseal cannot ratify a change
+     made outside the daemon. An operation that only deletes sealed material that is sign-in
+     output (`credential/logout`) is its own case, below:
 
-     | Operation | Gated when |
-     |---|---|
-     | `config/set` | always |
-     | `config/unset` | the key is set, and the key is not one Requirement 1.8 refuses to unset |
-     | `environment/bootstrap` | the credential exists, or the environment exists without it |
-     | `environment/import` | any profile would bind into an existing environment, or replace sealed material its credential left behind |
-     | `credential/remove` | always |
-     | `environment/remove` | always |
-     | `presence/enroll` | always |
+     | Operation | Class | Gated when |
+     |---|---|---|
+     | `config/set` | credential or security | always |
+     | `config/unset` | credential or security | the key is set, and the key is not one Requirement 1.8 refuses to unset |
+     | `credential/bootstrap` | credential or security | the credential exists, except a sign-in that re-authenticates it: an `aws-login` sign-in under the same provider source that signs in as the Principal already recorded for it (`aws-login-identity` Requirement 2.3), or an `aws-idc-sso` sign-in that changes none of the credential's stored settings (`credential-retrieval-api` Requirement 17 AC 11); tags are metadata, not stored settings, for this row |
+     | `credential/import` | credential or security | any profile's credential exists, or would replace sealed material a removed credential left behind |
+     | `credential/remove` | credential or security | always |
+     | `credential/logout` | sign-in output | never |
+     | `credential/tag` | metadata | never |
+     | `environment/remove` | credential or security | always |
+     | `presence/enroll` | credential or security | always |
 
      The built-in gate SHALL be fixed in the daemon and SHALL NOT be configurable. An operation that
      would change nothing — a first bootstrap, an unset of a key that is not set — SHALL NOT be
      gated by it, because there is nothing for an approver to agree to.
+
+     `credential/logout` is that exception. It applies only to
+     a credential whose sealed material is sign-in output (credential-retrieval-api Requirement 15
+     AC 13), and of the credential's `.replaced-*` archives it deletes only those holding nothing
+     but sign-in output (AC 12). An archive holding anything else, such as a prior source's IAM
+     key, stays until `credential/remove`, which is always gated. Ungated `credential/login` already replaces that material with whatever the next
+     sign-in returns. A logout only ends the session, which the next sign-in restores, so an approver
+     would be agreeing to less than a same-uid caller can already do.
+
+     The exemption SHALL hold only while no `credential/login` parameter selects or changes the
+     principal beyond what the sign-in itself decides. A login can change the principal: for
+     `aws-login` and `aws-web-identity` whoever signs in becomes it, and for `aws-idc-sso` another
+     SSO user may sign in to the same account and role, as the AWS CLI's login allows. So a logout
+     then a login gives a caller nothing a login alone does not. A login parameter that selects a
+     principal SHALL be gated, as the `aws-idc-sso` `provider` is (credential-retrieval-api
+     Requirement 17 AC 11), and adding one SHALL trigger a re-examination of this exemption. The
+     exemption SHALL NOT depend on `identity.enc`.
 
 1.8. A configuration key whose absence is read as a more privileged value than some value it can
      hold SHALL NOT be unsettable: the daemon SHALL refuse `config/unset` of such a key outright,
@@ -211,7 +251,11 @@ approve something else.
      over the daemon's own serialization of the arguments as it parsed them, SHALL cover every
      argument except a per-attempt request identifier, and SHALL be prefixed with the operation's
      name, so that an authorization for one operation cannot be spent on another.
-     `environment/bootstrap` and `environment/import` are performed by re-send.
+     `credential/bootstrap` and `credential/import` are performed by re-send. An operation MAY
+     bind its authorization to facts the daemon establishes during the operation, in addition to
+     the arguments, when that only narrows what the authorization can be spent on: an `aws-login`
+     identity change binds the params digest together with the recorded and signed-in Principals,
+     under its own prefix (`aws-login-identity` Requirement 3.3, design Decision 3b).
 
 ### Requirement 3: A challenge is satisfied by a presence signature or a privileged approval
 

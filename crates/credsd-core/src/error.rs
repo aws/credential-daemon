@@ -3,20 +3,33 @@
 /// Alias for Results returned throughout the daemon.
 pub type Result<T> = std::result::Result<T, DaemonError>;
 
+/// Category names, each written once (Requirement 1.3). A category variant renders
+/// `<name>: <message>`; nothing else adds or removes a category.
+pub const CONFIG: &str = "configuration error";
+pub const STORAGE: &str = "storage error";
+pub const ENCRYPTION: &str = "encryption error";
+pub const PROVIDER: &str = "provider error";
+pub const REAUTH: &str = "re-authentication required";
+pub const IO: &str = "I/O error";
+pub const JSON: &str = "serialization error";
+
+/// Every category name, counted by [`prefixes`].
+const CATEGORIES: [&str; 7] = [CONFIG, STORAGE, ENCRYPTION, PROVIDER, REAUTH, IO, JSON];
+
 /// Unified error type for all daemon subsystems.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DaemonError {
-    #[error("configuration error: {0}")]
+    #[error("{CONFIG}: {0}")]
     Config(String),
 
-    #[error("storage error: {0}")]
+    #[error("{STORAGE}: {0}")]
     Storage(String),
 
-    #[error("encryption error: {0}")]
+    #[error("{ENCRYPTION}: {0}")]
     Encryption(String),
 
-    #[error("provider error: {0}")]
+    #[error("{PROVIDER}: {0}")]
     Provider(String),
 
     #[error("credentials expired")]
@@ -29,7 +42,7 @@ pub enum DaemonError {
 
     /// The credential source has no unattended renewal left; the user must re-authenticate.
     /// Distinct from a transport failure so callers do not mask it as "cannot reach daemon".
-    #[error("re-authentication required: {0}")]
+    #[error("{REAUTH}: {0}")]
     ReauthRequired(String),
 
     /// The daemon could not be dialled, or the exchange broke at the transport. Never a reachable
@@ -63,10 +76,10 @@ pub enum DaemonError {
     #[error("no such pending request")]
     RequestNotFound,
 
-    #[error("I/O error: {0}")]
+    #[error("{IO}: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("serialization error: {0}")]
+    #[error("{JSON}: {0}")]
     Json(#[from] serde_json::Error),
 }
 
@@ -91,36 +104,34 @@ impl DaemonError {
         }
     }
 
-    /// The message without the category prefix `Display` adds. Use this, not `to_string()`, when
-    /// one error's text becomes part of another's: the outer error adds its own prefix, and
-    /// embedding the full `Display` repeats it (`provider error: ... provider error: ...`).
+    /// The message without the category prefix `Display` adds. An error built from another error
+    /// takes this, never the inner error's `Display`, so rendering adds exactly one prefix
+    /// (Requirement 4.2). Rendering never rewrites a message, so this is the only safe way to
+    /// embed one error in another.
     pub fn detail(&self) -> String {
         match self {
-            Self::Config(m) | Self::Storage(m) | Self::Encryption(m) | Self::Provider(m) => {
-                m.clone()
-            }
+            Self::Config(m)
+            | Self::Storage(m)
+            | Self::Encryption(m)
+            | Self::Provider(m)
+            | Self::ReauthRequired(m) => m.clone(),
+            Self::Io(e) => e.to_string(),
+            Self::Json(e) => e.to_string(),
             other => other.to_string(),
         }
     }
 
     pub fn config(msg: impl Into<String>) -> Self {
-        let msg = msg.into();
-        debug_assert_categories(&msg, 0);
-        Self::Config(msg)
+        Self::Config(msg.into())
     }
 
     pub fn provider(msg: impl Into<String>) -> Self {
-        let msg = msg.into();
-        debug_assert_categories(&msg, 0);
-        Self::Provider(msg)
+        Self::Provider(msg.into())
     }
 
-    /// A daemon reply's message, which is often one rendered error and so may carry one category
-    /// prefix, never two.
+    /// A daemon reply's message, shown exactly as the daemon worded it.
     pub fn remote(msg: impl Into<String>) -> Self {
-        let msg = msg.into();
-        debug_assert_categories(&msg, 1);
-        Self::Remote(msg)
+        Self::Remote(msg.into())
     }
 }
 
@@ -200,33 +211,13 @@ mod not_found_tests {
     }
 }
 
-/// The variants whose `Display` adds a category prefix to a message.
-const PREFIXED: [fn(String) -> DaemonError; 4] = [
-    DaemonError::Config,
-    DaemonError::Storage,
-    DaemonError::Encryption,
-    DaemonError::Provider,
-];
-
-fn category_count(msg: &str) -> usize {
-    PREFIXED
+/// Category prefixes in `text`: one per category name at a `<name>: ` boundary. The one count
+/// every test uses to assert a rendered error holds exactly one.
+pub fn prefixes(text: &str) -> usize {
+    CATEGORIES
         .iter()
-        .map(|variant| {
-            msg.matches(variant(String::new()).to_string().as_str())
-                .count()
-        })
+        .map(|c| text.matches(&format!("{c}: ")).count())
         .sum()
-}
-
-/// Debug builds reject a message carrying more category prefixes than `allowed`, so a nested
-/// error (`format!("...: {e}")` on a `DaemonError`) fails the first test that reaches it instead
-/// of shipping as `provider error: ... provider error: ...`. The fix at the call site is
-/// `e.detail()`.
-fn debug_assert_categories(msg: &str, allowed: usize) {
-    debug_assert!(
-        category_count(msg) <= allowed,
-        "error message repeats a category prefix; embed `.detail()`, not the error: {msg}"
-    );
 }
 
 #[cfg(test)]
@@ -234,47 +225,104 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// A message that names no category, so it is one a constructor accepts.
+    /// The constructors call sites use to build a category error from a message.
+    fn categories() -> [fn(String) -> DaemonError; 5] {
+        [
+            DaemonError::Config,
+            DaemonError::Storage,
+            DaemonError::Encryption,
+            DaemonError::Provider,
+            DaemonError::ReauthRequired,
+        ]
+    }
+
+    /// A message that holds no category name, so any prefix in the rendered text was added by
+    /// rendering.
     fn plain_message() -> impl Strategy<Value = String> {
-        "[a-z0-9 ':.()-]{0,48}".prop_filter("names a category", |m| category_count(m) == 0)
+        "[a-z0-9 ':.()-]{0,48}".prop_filter("holds a category name", |m| prefixes(m) == 0)
     }
 
     proptest! {
-        /// `detail` is the message alone, so embedding it adds no prefix.
+        /// Building errors from errors the way call sites do (outer context plus the inner
+        /// error's `detail()`), at any depth and across every category, renders one prefix.
+        #[test]
+        fn nesting_through_detail_renders_one_prefix(
+            root in plain_message(),
+            chain in prop::collection::vec((0usize..5, plain_message()), 0..5),
+        ) {
+            let make = categories();
+            let mut err = DaemonError::Encryption(root);
+            for (variant, context) in chain {
+                err = make[variant](format!("{context}: {}", err.detail()));
+            }
+            let shown = err.to_string();
+            prop_assert_eq!(prefixes(&shown), 1, "{}", shown);
+            prop_assert_eq!(prefixes(&err.detail()), 0);
+            let relayed = DaemonError::remote(shown.clone()).to_string();
+            prop_assert_eq!(relayed, shown);
+        }
+
+        /// `detail` is the message alone.
         #[test]
         fn detail_is_the_message_without_its_prefix(
-            variant in 0usize..PREFIXED.len(),
+            variant in 0usize..5,
             message in plain_message(),
         ) {
-            let detail = PREFIXED.get(variant).map(|v| v(message.clone()).detail());
-            prop_assert_eq!(detail, Some(message));
-        }
-
-        /// One rendered error relayed by the daemon is accepted and shown exactly as sent.
-        #[test]
-        fn a_relayed_rendered_error_shows_one_prefix(
-            variant in 0usize..PREFIXED.len(),
-            message in plain_message(),
-        ) {
-            let Some(rendered) = PREFIXED.get(variant).map(|v| v(message).to_string()) else {
-                return Ok(());
-            };
-            let shown = DaemonError::remote(rendered.clone()).to_string();
-            prop_assert_eq!(category_count(&shown), 1);
-            prop_assert_eq!(shown, rendered);
+            prop_assert_eq!(categories()[variant](message.clone()).detail(), message);
         }
     }
 
     #[test]
-    #[should_panic(expected = "repeats a category prefix")]
-    fn embedding_a_rendered_error_trips_in_debug_builds() {
+    fn a_wrapped_error_reads_as_one_sentence() {
         let inner = DaemonError::Encryption("decryption failed".to_owned());
-        let _ = DaemonError::provider(format!("no usable key: {inner}"));
+        let outer = DaemonError::provider(format!("no usable key: {}", inner.detail()));
+        assert_eq!(
+            outer.to_string(),
+            "provider error: no usable key: decryption failed"
+        );
+    }
+
+    /// Rendering never rewrites a message: text that holds a category name of its own is shown
+    /// as written (Requirement 4.3).
+    #[test]
+    fn message_text_naming_a_category_is_shown_unchanged() {
+        let message = "server said 'provider error: quota exceeded' for /tmp/provider error: x";
+        let err = DaemonError::provider(message);
+        assert_eq!(err.to_string(), format!("provider error: {message}"));
+        assert_eq!(err.detail(), message);
+    }
+
+    /// An error relayed through an RPC error message keeps one prefix: the daemon sends the
+    /// error's `detail()`, and the client adds its own category once (Requirement 2.3).
+    #[test]
+    fn an_error_relayed_through_an_rpc_message_renders_one_prefix() {
+        let on_daemon = DaemonError::provider("SSO authentication timed out after 5 minutes");
+        let wire_message = on_daemon.detail();
+        let on_client = DaemonError::config(format!("auth timed out: {wire_message}"));
+        assert_eq!(
+            on_client.to_string(),
+            "configuration error: auth timed out: SSO authentication timed out after 5 minutes"
+        );
+        assert_eq!(prefixes(&on_client.to_string()), 1);
+    }
+
+    /// `detail` drops the category for every category variant, including the ones that wrap a
+    /// typed source (Requirement 3.1).
+    #[test]
+    fn detail_drops_the_category_of_io_and_json() {
+        let io = DaemonError::from(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file or directory",
+        ));
+        assert_eq!(io.detail(), "no such file or directory");
+        let json = DaemonError::from(serde_json::from_str::<u8>("x").unwrap_err());
+        assert_eq!(prefixes(&json.detail()), 0);
+        assert_eq!(prefixes(&json.to_string()), 1);
     }
 
     #[test]
-    #[should_panic(expected = "repeats a category prefix")]
-    fn a_relayed_nested_error_trips_in_debug_builds() {
-        let _ = DaemonError::remote("provider error: credential unavailable: provider error: x");
+    fn a_remote_error_is_shown_as_the_daemon_worded_it() {
+        let text = "provider error: credential unavailable";
+        assert_eq!(DaemonError::remote(text).to_string(), text);
     }
 }

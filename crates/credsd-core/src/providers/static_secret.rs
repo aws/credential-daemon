@@ -62,9 +62,7 @@ pub fn persist_secret(
 /// `secret_source` is caller-supplied text, and interpolating it here would put it into daemon
 /// log lines and error strings — the same reason `jwt::reseal_command` takes no path.
 pub fn reseal_command(credential: &str) -> String {
-    format!(
-        "creds bootstrap --env <env> --credential {credential} static-secret --secret-file <path>"
-    )
+    format!("creds bootstrap --credential {credential} static-secret --secret-file <path>")
 }
 
 pub struct StaticSecretProvider {
@@ -118,7 +116,7 @@ impl Renewer for StaticSecretProvider {
                 DaemonError::provider(format!(
                     "no usable secret for credential '{}': {}. Seal one with '{}'.",
                     self.credential_name,
-                    e,
+                    e.detail(),
                     reseal_command(&self.credential_name)
                 ))
             })?;
@@ -379,6 +377,8 @@ mod tests {
         assert!(text.contains("no usable secret"), "{text}");
         assert!(text.contains("creds bootstrap"), "{text}");
         assert!(text.contains("static-secret"), "{text}");
+        // The open failure is embedded by its detail, so only the outer category shows.
+        assert_eq!(crate::error::prefixes(&text), 1, "{text}");
     }
 
     /// Renewal reloads and never mints, which is what lets a cache miss be served while leaving

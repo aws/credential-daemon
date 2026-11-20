@@ -448,11 +448,12 @@ pub(crate) fn canonical_of(
 ) -> credsd_core::error::Result<Vec<u8>> {
     let rel = Path::new("callers").join(uid.to_string()).join(name);
     if name == CONFIG {
+        credsd_core::config::reject_environment_tables(text)?;
         let config = DaemonConfig::from_text(text)
             .map_err(|e| credsd_core::error::DaemonError::config(e.to_string()))?;
         snapshot::canonical_config(uid, &rel, &config)
     } else {
-        snapshot::canonical_credentials(uid, &rel, &credentials::from_text(text)?)
+        snapshot::canonical_credentials(uid, &rel, &credentials::entries_from_text(text)?)
     }
 }
 
@@ -649,6 +650,16 @@ fn write_refusal(name: &str, status: &DriftStatus) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revalidation_cannot_seal_environment_tables() {
+        for table in ["[environment]", "[environments]", "[environments.work]"] {
+            let text = format!("{table}\nsecret = \"do-not-repeat\"\n");
+            let error = canonical_of(501, CONFIG, &text).unwrap_err().to_string();
+            assert!(error.contains("not supported"), "{error}");
+            assert!(!error.contains("do-not-repeat"), "{error}");
+        }
+    }
 
     #[derive(Clone, Default)]
     struct Slots(Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>);

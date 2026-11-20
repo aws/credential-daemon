@@ -5,6 +5,18 @@ created: 2026-08-14
 
 # Requirements Document: Credential Retrieval API
 
+## Applicability of environment requirements
+
+[credential-only-addressing](../credential-only-addressing/requirements.md)
+requirements govern the active interface. Criteria below that specify environment addressing,
+projection, or composition apply to retained internal code only. The
+`environment/credentials`, `environment/describe`, `environment/remove`, `config/set`,
+`config/get`, and `config/unset` methods return method-not-found on every carrier. A
+`credential/get` or `credential/list` request containing `environment` is invalid even when
+the value is `null`. Credential-addressed retrieval and enumeration remain available.
+`config.toml` files containing environment tables are invalid. No dispatched method emits
+`ENVIRONMENT_NOT_FOUND` (credential-only-addressing Requirement 4.5).
+
 ## Introduction
 
 An earlier change decoupled profiles from credential sources in the data model: a credential source is
@@ -223,6 +235,14 @@ different boundaries.
    field; AC 1 here makes the credential the decision subject. **This is a spec conflict
    requiring approval — see Spec Conflicts. It MUST NOT be resolved by unilaterally editing
    either spec.**
+
+### Amended, 2026-11-09 — restrictions belong to the credential
+
+AC 2 and AC 5 placed restriction on the profile. They are amended: a credential's `identity_type`,
+`region`, and approval gates are the credential's own, set when it is created and changed only by
+a gated re-bootstrap. An environment composes credentials and MAY add restriction, which narrows
+only (Requirement 10 AC 8). AC 3 still holds, because a Credential-addressed request is served
+under the credential's restrictions, and an environment-addressed request can only add to them.
 
 ## Requirement 3: Aggregate Retrieval Is All-or-None
 
@@ -467,6 +487,22 @@ without parsing prose.
    conventions exist in an MCP envelope, for a defensible reason on the MCP side:
    a `tools/call` failure rides inside a success envelope with `isError: true` because the
    error must reach the model. A shim-facing API has no such requirement.
+7. A Credential-addressed request (Requirement 10 AC 6) that misses MUST fail as
+   `CREDENTIAL_NOT_FOUND`, for every cause: an unknown credential, a credential the caller does
+   not hold, and an unauthorized caller. Every such failure MUST carry identical text, so the code
+   discloses nothing an unauthorized caller could not already infer from the form of its own
+   request. An environment-addressed request keeps `ENVIRONMENT_NOT_FOUND` for every miss,
+   including a credential the named environment does not compose. A client that never names an
+   environment therefore never has to recognize an environment-specific code.
+8. EVERY method whose params name a `credential` and no `environment` (`credential/get`,
+   `credential/login`, `credential/logout`, `credential/remove`, and any added later) MUST pass
+   one access check, the same for every such method and made at one point in dispatch, before the
+   method reads anything about the credential. A caller that fails it MUST get the
+   `CREDENTIAL_NOT_FOUND` of AC 7, whatever the operation, so the reply does not reveal whether the
+   credential exists. A method MUST NOT add an authorization check of its own. A new
+   credential-addressed method is under this rule by default. A request's `claim` and the
+   credential's `identity_type` restrict what a method returns, not access, so they are not part
+   of this check (Requirement 15 AC 19).
 
 ### Implementation status, 2026-08-21 — AC 2 partially met
 
@@ -474,12 +510,35 @@ Five of AC 2's seven conditions have codes: `ENVIRONMENT_NOT_FOUND` (unknown sub
 also not-authorized), `REAUTH_REQUIRED` (no valid session), `WRONG_CREDENTIAL_TYPE` (material not
 of a consumable kind), `PROVIDER_UNAVAILABLE` (transient upstream), and `INTERNAL`.
 
+Requirement 17 adds two, both domain refusals of a role pair: `ROLE_NOT_ALLOWED` (a pair the
+credential does not allow) and `ROLE_SELECTION_UNSUPPORTED` (a pair on a source other than
+`aws-idc-sso`).
+
+Requirement 10 AC 13 adds one more domain refusal: `LOGOUT_UNSUPPORTED_SOURCE` (a
+`credential/logout` of a source that does not sign in).
+
+credential-tags Requirement 1.5 adds `CONFIG_INVALID`: the caller's `config.toml` or
+`credentials.toml` parses but does not validate, for example a tag key that breaks the rules.
+`credential/get`, `credential/list` and `credential/tag` return it, and nothing is served or
+listed. The message names the credential and key, never a value. It differs from
+`CONFIG_DRIFTED`, whose remedy is `creds revalidate`: an invalid file must be edited first,
+because revalidating a file that does not validate cannot clear it.
+
 The two scope conditions — scope malformed or oversized, and scope rejected by policy — are
 **deliberately unnamed** until the Requested_Scope grammar exists. AC 5 makes codes additive-only,
 so a name coined before its domain is permanent, and both conditions are unreachable today
 because nothing can populate a scope. The first three names are carried over byte-identically
 from the HTTP surface (`src/server/routes.rs:166`, `:214`, `:249`) rather than coined here, so the
 transport port does not rename a code a caller may already branch on.
+
+### Implementation status, 2026-11-18 — AC 8 met in outcome, not in placement
+
+The shipped credential-addressed methods `credential/get`, `credential/remove`, and
+`credential/logout` answer an unauthorized caller with `CREDENTIAL_NOT_FOUND`. `credential/remove` earlier answered with `ENVIRONMENT_NOT_FOUND`. That change
+is breaking under AC 5, but it lands before the first general-availability release, so the
+pre-launch waiver of Requirement 11 AC 3 accepts it without a version increment. The check is not yet made at one point in
+dispatch: each handler calls `authorized_uid` itself. The outcome is the same for every method, so
+no caller can tell the difference; moving the check into dispatch is what remains of AC 8.
 
 # Part II — Transport Binding
 
@@ -548,6 +607,62 @@ retires four questions the HTTP draft carried:
 5. THE credsd method namespace MUST NOT collide with MCP's reserved methods (`initialize`,
    `tools/list`, `tools/call`), so that one dispatcher can serve both carriers if
    Requirement 13 permits it.
+6. `credential/get` MUST accept `credential` with no `environment`. That request is
+   Credential-addressed: its subject is the credential, and it is served from the credential
+   alone. The restrictions that apply are the credential's own (its `identity_type`, its approval
+   and presence gates) together with the request's `claim` and `scope`. No environment is derived
+   or consulted.
+7. A Credential-addressed request MUST succeed for any credential the caller holds, whether no
+   environment, one, or several compose it. Environment membership MUST NOT affect whether the
+   credential is reachable by name.
+8. WHEN a request names an `environment`, the environment MUST only narrow. The request MUST NOT
+   yield material that the Credential-addressed request for the same credential would refuse. An
+   environment that does not compose the named credential MUST fail as `ENVIRONMENT_NOT_FOUND`.
+   With `environment` and no `credential`, the credential served is the first entry of that
+   environment's `credentials` list; an environment with an empty list serves nothing and fails as
+   `ENVIRONMENT_NOT_FOUND`.
+9. A request that names neither `environment` nor `credential` MUST fail as invalid params
+   (`-32602`). That outcome is decidable from the request alone, so it discloses nothing about
+   existence.
+10. Both forms MUST pass the drift and custody checks before any miss is reported, so a drifted
+    caller cannot use a miss as an existence oracle.
+11. Every Credential-addressed miss MUST fail as `CREDENTIAL_NOT_FOUND` (Requirement 8 AC 7), and
+    every environment-addressed miss MUST fail as `ENVIRONMENT_NOT_FOUND`.
+12. A `REAUTH_REQUIRED` failure on a Credential-addressed request MUST name the credential, and its
+    remediation MUST be `credential/login` for that credential.
+13. Aggregate retrieval is `environment/credentials { environment }`. It MUST be defined as one
+    environment-addressed `credential/get` per entry of the environment's `credentials` list, in
+    list order, all-or-none (Requirement 3).
+
+### Settled, 2026-11-09 — the credential is the retrieval subject
+
+A client that holds only a credential name, such as an AWS CLI profile or a gateway reference of
+the form `credsd://<name>`, must be able to retrieve it without knowing that environments exist.
+AC 6-7 make the credential the subject of retrieval. AC 8 keeps environments as groupings that a
+caller may opt into for extra restriction: naming one can narrow what is served, never widen it.
+
+This replaces an interim rule, recorded in the first draft of this amendment, that derived an
+Authorization_Context from the one environment that composes the credential. That rule failed
+for a credential composed by several environments, or by none, and it relied on every
+credential-creating path also writing a one-to-one environment, which Requirement 16 removes.
+
+It also supersedes the part of the creds interface simplification proposal that has `--credential
+X` send `environment = X` and treats restrictions as attached to the environment. Under this
+amendment, `region` and `identity_type` belong to the credential, and no current method takes an
+environment.
+
+Open questions, not settled by this amendment:
+
+- **Environment-level `identity_type` and `region`.** They remain in `config.toml` and narrow a
+  request that names the environment. Whether they are kept once every restriction is
+  credential-owned, or deprecated and removed in a future revision, is open.
+- **Boundary application.** Open Decision 1 still blocks boundary application. When it lands, a
+  boundary attached to an environment narrows only, by AC 8.
+- **Field name.** The params keep `credential`. Whether to also accept the SDK protocol's `name`
+  is open.
+- **Environment-addressed configuration.** `config/set|get|unset` and `environment/describe` stay
+  environment-addressed. For a credential that no environment composes, they fail as
+  `ENVIRONMENT_NOT_FOUND`; whether they gain a credential-addressed form is open.
 
 ### Settled, 2026-08-21
 
@@ -562,12 +677,16 @@ Requirement 6's "Settled, 2026-08-24" records the collision that forced the spli
 | Method | Operation | AC satisfied |
 |---|---|---|
 | `credential/get` | Atomic_Retrieval — one credential | 10 AC 1-2, 1 AC 4 |
-| `credential/get_batch` | Aggregate_Retrieval — N credentials, all-or-none | 10 AC 1-2, 3 |
+| `environment/credentials` | Aggregate_Retrieval — N credentials, all-or-none | 10 AC 1-2, 3 |
 | `credential/list` | Enumeration — no material, capped | 13 AC 4, 10 AC 2 |
 | `environment/describe` | Manifest — credential entries plus projection inputs, no material | 6, 10 AC 2 |
 | `system/health` | Liveness and protocol version | 11 AC 5 |
 
-**`credential/get_batch` names a profile, credsd determines the membership, and the all-or-none
+**Amended, 2026-11-09.** Aggregate retrieval was `credential/get_batch`. It is renamed
+`environment/credentials`, with no alias, because its subject is an environment and the
+`credential/` namespace is for operations whose subject is a credential.
+
+**`environment/credentials` names a profile, credsd determines the membership, and the all-or-none
 property is an invariant credsd enforces rather than a contract the caller is trusted to
 honor.** This is the decision worth not re-deriving. Four things follow from it:
 
@@ -585,7 +704,7 @@ honor.** This is the decision worth not re-deriving. Four things follow from it:
    element, because there is no element-level result to read. Result entries are
    self-describing (each names its credential) precisely because the caller did not supply the
    list and so has no index to match against.
-4. It keeps Requirement 1 AC 6 satisfiable at 1:1. `credential/get_batch { profile }` and
+4. It keeps Requirement 1 AC 6 satisfiable at 1:1. `environment/credentials { profile }` and
    `credential/get { profile, credential }` stay type-distinct even when the profile reaches a
    single credential — which is every profile today — so the Aggregate subject never collapses
    into the Atomic one.
@@ -669,9 +788,11 @@ other half.
 2. Additive changes — a new Credential_Kind, a new error code, a new Manifest field — MUST
    NOT require a version increment.
 3. Removing a field, repurposing an error code, or changing a default MUST require one.
-   **Pre-launch waiver:** the `profile` → `environment` wire rename (method names, field names,
-   `ENVIRONMENT_NOT_FOUND` → `ENVIRONMENT_NOT_FOUND`) is a breaking change accepted without a
-   version increment. No deployed consumers exist; this waiver expires at first external release.
+   **Pre-launch waiver:** every wire change made before the first general-availability release,
+   breaking or not, is accepted without a version increment. This covers the `profile` →
+   `environment` rename and any other method, field, or error-code change made before that
+   release. No deployed consumers exist, so the OpenRPC `info.version` stays `1.0.0` until then.
+   This AC's increment rule applies from that release on.
 4. THE version MUST NOT be inferred from the credsd binary version. A shim cannot assume the
    daemon it reached is the binary it shipped with.
 5. THE version MUST be reported by an explicit method — MCP's `initialize` handshake is the
@@ -740,10 +861,15 @@ exactly what it does not, so the two land on opposite sides of one line.
 
 3. *Not a core requirement.*
 4. `credential/list` MUST return enough for a model to name a credential or secret in a
-   projection request — the name, its Credential_Kind (Requirement 7 AC 2), and its session
-   status — and nothing more. It MUST NOT return Material, and MUST NOT return a value that
-   becomes Material by accumulation. The cap binds the method's result type, so run-time
-   tooling that exposes enumeration to a model can rely on it.
+   projection request — the name, its Credential_Kind (Requirement 7 AC 2), its source type,
+   and its session status — and nothing more. (Amended 2026-11-09: source type is added because
+   no environment carries it once credentials exist without environments, Requirement 16, and a
+   client needs it to name the sign-in command. A source type is a provider name, not Material.)
+   It MUST NOT return Material, and MUST NOT return a value that becomes Material by
+   accumulation. The cap binds the method's result type, so run-time tooling that exposes
+   enumeration to a model can rely on it.
+   (Amended by `credential-tags` Requirement 4: each row also carries the credential's `tags`,
+   user-chosen labels that hold no Material.)
 5. WHEN a method is not exposed on a carrier, THE response MUST be method-not-found
    (`-32601`), never a permission error. A permission error confirms the method exists, which
    is the disclosure Requirement 8 AC 3-4 works to prevent.
@@ -857,32 +983,333 @@ separate `credsd` OS user.
 
 ### Acceptance Criteria
 
-1. THE system MUST expose five mutation methods over UDS: `config/set`, `config/get`,
-   `config/unset`, `credential/remove`, and `environment/remove`.
-2. ALL five methods MUST be UDS-only. They MUST NOT be reachable on any other carrier. The exposure table
+1. THE system MUST expose seven mutation methods over UDS: `config/set`, `config/get`,
+   `config/unset`, `credential/remove`, `credential/logout`, `credential/tag` (`credential-tags`
+   Requirement 3), and `environment/remove`.
+2. ALL seven methods MUST be UDS-only. They MUST NOT be reachable on any other carrier. The exposure table
    MUST enforce this at dispatch, not in individual handlers (consistent with Req 13 AC 1–2).
 3. THE daemon MUST derive the caller's storage root from the kernel-verified peer uid (via
    `SO_PEERCRED`), never from a method parameter. A method parameter that names a profile or
    credential is an index into the caller's own tree, not an absolute path.
 4. AN unauthorized caller (Denied or Unresolved per the caller-auth model) MUST receive
-   `ENVIRONMENT_NOT_FOUND`, consistent with Req 8 AC 3–4's indistinguishability rule.
+   `ENVIRONMENT_NOT_FOUND` on an environment-addressed method, consistent with Req 8 AC 3–4's
+   indistinguishability rule. `credential/remove`, `credential/logout`, and `credential/tag` are
+   credential-addressed, so they follow the single access check of Req 8 AC 8 and answer an
+   unauthorized caller, like any other miss, with `CREDENTIAL_NOT_FOUND` (Req 8 AC 7).
 5. `environment` and `credential` parameters MUST be validated at deserialize time by
    `config::credentials::validate_name`. An invalid name MUST produce `-32602` with `NAME_RULE`
    in the message and MUST NOT echo the offending value.
 6. `config/set`, `config/get`, `config/unset`, and `environment/remove` operate on `environment`
-   (an env name). `credential/remove` operates on `credential` (a credential name). An
+   (an env name). `credential/remove`, `credential/logout`, and `credential/tag` operate on
+   `credential` (a credential name). An
    `environment` that does not exist in the caller's config MUST yield `ENVIRONMENT_NOT_FOUND`.
-7. ALL mutation methods MUST return `OkResult {ok: true}` on success. `config/get` MUST return
+7. ALL mutation methods except `credential/logout` MUST return `OkResult {ok: true}` on success.
+   `credential/logout` returns `LogoutResult` (AC 17). `config/get` MUST return
    `ConfigGetResult {value: Option<String>}` where `None` means the key is not set.
 8. THE daemon MUST be the sole writer of `callers/<uid>/config.toml` and
    `callers/<uid>/credentials.toml`. Client processes MUST NOT write these files directly; they
    MUST go through the mutation methods.
-9. EVERY bootstrap, import, or login that writes sealed material MUST emit one audit record per
-   credential written, when the write commits, naming the operation, the environment and credential,
-   and the caller: its uid, login uid, pid, executable, and ancestry. A write that fails MUST NOT
-   emit one. The record for a challenge raised under `presence-gated-operations` MUST name the same
+9. EVERY bootstrap, import, login, or logout that writes or deletes sealed material MUST emit one audit record per
+   credential written or deleted, when that change commits, naming the operation, the credential,
+   and the caller: its uid, login uid, pid, executable, and ancestry. A change that commits
+   nothing MUST NOT emit one. The record for a challenge raised under `presence-gated-operations` MUST name the same
    caller ancestry. Ancestry is process names and pids, never a command line, and no record carries
    credential material.
+
+10. Credential-creating and re-authentication methods are credential-addressed:
+    `credential/bootstrap`, `credential/bootstrap/respond`, `credential/login`, and
+    `credential/import`. Their params name a `credential` and MUST NOT accept an `environment`.
+    Each replaces an `environment/`-prefixed method of the same suffix, with no alias.
+11. `credential/import` MUST take exactly one credential per call: its name and source fields,
+    flat in params. It MUST NOT accept an array of profiles. A client importing several runs one
+    call per credential.
+12. `credential/logout` MUST sign a credential out: it MUST delete everything in the credential's
+    data directory except `identity.enc`. It MUST also delete each `.replaced-*` archive of that
+    credential, including the archive's own `identity.enc`, whose other files are all ones a
+    sign-in writes for an `aws-login`, `aws-idc-sso`, or `aws-web-identity` source (AC 13). It
+    MUST NOT delete any other archive:
+    one holding any other file may hold material only a bootstrap restores, such as an IAM key
+    from before the credential was re-bootstrapped to a sign-in source, and stays until the gated
+    `credential/remove`. Nothing records an archive's source once its entry is replaced, so the
+    files decide. An archive normally does not survive: a successful replace deletes it at once,
+    and only a failed cleanup or restore, which is logged, leaves one behind. It MUST keep the
+    credential's `credentials.toml` entry and the live `identity.enc`, its
+    record of who signed in. After a logout, `credential/get` for that credential MUST return `REAUTH_REQUIRED`, and
+    `credential/login` MUST restore it.
+13. `credential/logout` MUST apply only to a credential whose source signs in: `aws-login`,
+    `aws-idc-sso`, and `aws-web-identity`. For any other source it MUST fail as
+    `LOGOUT_UNSUPPORTED_SOURCE`, a domain refusal, with a message naming the source and
+    `credential/remove`, and MUST delete nothing: that material is not something a sign-in
+    restores. It is a domain code, not invalid params, because resolved config decides it rather
+    than the request (Requirement 8 AC 1), and it MUST be checked after the credential resolves,
+    so a credential the caller cannot reach fails with `CREDENTIAL_NOT_FOUND` (Requirement 8 AC 8).
+14. `credential/logout` MUST pass the shared drift and custody check (drift-detection Requirement 5.8)
+    before it reads the credential's entry, so a hand-edited source type cannot widen what it
+    deletes, and a drifted caller cannot use a logout as an existence oracle. It MUST NOT change
+    `config.toml`, `credentials.toml`, or the integrity record, so a logout is never drift.
+15. A `credential/logout` that names no credential the caller has MUST fail as
+    `CREDENTIAL_NOT_FOUND`. A logout of a credential with no sealed session MUST succeed and delete
+    nothing, so repeating a logout is harmless.
+16. A `credential/logout` that deletes material MUST emit the audit record of AC 9 with operation
+    `credential/logout`. It MUST NOT be gated by presence (presence-gated-operations Requirement
+    1.7).
+17. `credential/logout` MUST return
+    `LogoutResult {signed_out, provider, start_url?, access_token_expires_at?}` on success.
+    `provider` reports what happened at the identity provider and MUST be one of:
+    - `ended`: an `aws-idc-sso` session, and SSO accepted `Logout` (AC 18).
+    - `token_rejected`: an `aws-idc-sso` session, and SSO refused `Logout` or the refresh before
+      it because the token is no longer valid (AC 18). No sealed token can act at SSO, but the
+      access-portal session may still be live.
+    - `local_only`: an `aws-login` or `aws-web-identity` session. Neither source's configuration
+      names an endpoint that ends or revokes a session, so there is nothing to call, and what the
+      provider issued stays valid there until it expires. Also an `aws-idc-sso` logout that
+      deleted local material but found no sealed token, so there was nothing to send.
+    - `failed`: an `aws-idc-sso` session that AC 18 could not end at SSO.
+    - `none`: there was no sealed session, so nothing was deleted and nothing was sent (AC 15).
+
+    `signed_out` MUST be `false` when `provider` is `none` and `true` otherwise. `start_url` and
+    `access_token_expires_at` MUST be present only when `provider` is `failed`:
+    - `start_url` is the credential's SSO start URL, the access portal's sign-in page. It is where
+      the user can sign out of the SSO session; it is not itself a sign-out action.
+    - `access_token_expires_at` (RFC 3339) is the expiry of the newest SSO access token SSO
+      issued, the sealed one or the one refreshed in memory for the logout (AC 18), which the
+      daemon set from the OIDC token endpoint's `expires_in` when SSO issued it. It is not the expiry of the SSO sign-in session,
+      which the daemon does not know and which can be later. It is absent when the sealed token
+      could not be read.
+
+    The CLI equivalent is `creds logout --credential <name>`, which prints one line naming the
+    outcome and passes the daemon's errors through. On `ended` that line MUST say the
+    access-portal session ended. On `token_rejected` it MUST say only that the sealed token no
+    longer works at SSO and that the access-portal session may still be live. On `failed` it MUST print a warning on stderr
+    and MUST exit 1, the command reference's "Error; the message is on stderr" code, because the
+    session may still be live at SSO. The warning MUST say to sign out at `start_url` to end the
+    SSO session, and, when `access_token_expires_at` is present, that the access token stays valid
+    until then and the SSO session may last longer. It MUST NOT present that time as the session's
+    end.
+18. For an `aws-idc-sso` credential with a sealed sign-in, `credential/logout` MUST also try to
+    end the session at SSO: it MUST call the SSO service's `Logout` once with the sealed access
+    token or one refreshed from it, before it deletes that token, at the SSO endpoint the credential's other SSO calls use.
+    WHEN the sealed access token has expired and a refresh token is sealed with it, the daemon
+    MUST first refresh the access token there and send `Logout` with the new one, since the
+    refresh token can keep the access-portal session live. The refreshed tokens are used in
+    memory only, for that one `Logout` call; a logout MUST NOT seal them. The refresh and `Logout` MUST share
+    one 30-second bound, covering connect, send, and response, with any retries counted inside
+    it; neither may inherit the timeouts or retry policy of the client those other calls use.
+    The bound comes from the logout's 60-second lock hold (drift-detection Requirement 5.9): both
+    calls always end inside the hold, so the hold never cancels the logout before it deletes.
+    `provider` MUST be `ended` WHEN SSO accepts `Logout`. It MUST be `token_rejected` WHEN SSO
+    refuses the refresh token as invalid or expired (then `Logout` is not sent), and WHEN SSO
+    refuses `Logout` because the access token is invalid or expired, an authorization refusal of
+    the token rather than a service fault. That refusal is what a retry draws after SSO accepted
+    `Logout` and a local deletion then failed: the first call already invalidated the token and
+    its refresh token, so the retry reports `token_rejected`, since no record of the first call is
+    kept on disk. An expired access token with no refresh token draws the same refusal while the
+    access-portal session may still be live. `provider` MUST be `failed` WHEN
+    SSO refuses `Logout` or the refresh for any other reason, WHEN the refresh or `Logout` fails
+    to complete or reaches the 30-second bound, or WHEN the sealed token cannot be read (it is
+    corrupt, or sealed under a key that has since rotated), so nothing could be sent. In each of
+    these cases the local deletion, the cache eviction, and the audit record of AC 16 MUST
+    still happen, so an unreachable SSO endpoint never keeps a user signed in here. A repeat
+    logout finds no sealed session, returns `provider: none`, and MUST NOT send `Logout`.
+
+    An error MAY leave the logout partly done: for example, SSO accepted `Logout` but a local
+    deletion then failed. Retrying the same logout MUST be safe and MUST finish it, because the
+    daemon cannot make the SSO sign-out and the local deletion one atomic step. An SSO outcome alone is never an error: once the local deletion has happened, the logout MUST
+    succeed and report the provider outcome in `LogoutResult`. Its only errors are
+    `CREDENTIAL_NOT_FOUND` (AC 4, AC 15); the drift-detection refusals (AC 14);
+    `LOGOUT_UNSUPPORTED_SOURCE` for a source with no sign-in (AC 13); invalid params for a
+    malformed name (AC 5); and `INTERNAL`. `INTERNAL` covers a local step that fails, which may
+    leave the logout partly done, and the expiry of either lock bound (drift-detection
+    Requirement 5.9): the caller's write lock not acquired within the 10-second wait, or the
+    logout not finished within the 60-second hold. A wait expiry lands before the logout starts.
+    The local deletion MUST NOT yield until it finishes, so a hold expiry can land only during the
+    refresh or `Logout` call, before any deletion. Both expiries delete nothing.
+    `credential/logout` MUST NOT return `PROVIDER_UNAVAILABLE`.
+19. `credential/logout` MUST NOT take a `claim` and MUST NOT check the credential's
+    `identity_type` against one, as `credential/login` does not. A caller whose claim bars it from
+    retrieving a credential MAY sign that credential out. A claim is self-reported and only adds
+    restriction, so a check on it binds only a caller that chose to state one. A logout yields no
+    material, and the session it ends is one an ungated login of the same credential could
+    already replace, so the claim has nothing to protect here.
+
+## Requirement 16: Credentials Exist Without Environments
+
+**User Story:** As a client that stores one credential name per profile, I want creating a
+credential to create only the credential, so that nothing I did not ask for decides which
+restrictions apply to it.
+
+### Rationale
+
+Writing a same-named environment for every credential made environments look mandatory, gave
+every credential a second place for its restrictions, and made name-only retrieval depend on that
+second place existing. With the credential as the retrieval subject (Requirement 10 AC 6), an
+environment is something a caller composes on purpose.
+
+### Acceptance Criteria
+
+1. `credential/bootstrap`, `credential/import`, and every other credential-creating path MUST
+   write only the credential. They MUST NOT create or modify an environment.
+2. An environment MUST exist only when one is created explicitly. No method creates one
+   implicitly as a side effect of another operation.
+3. An environment's `credentials` list MUST be explicit. An absent or empty list composes no
+   credentials. A credential named after the environment MUST NOT be composed implicitly.
+4. A credential that no environment composes MUST be listed by `credential/list`, retrievable by
+   Credential-addressed `credential/get`, and re-authenticated by `credential/login`.
+5. Re-bootstrapping a credential MUST NOT change any environment that composes it.
+6. `credential/list` filtered to a name that is not an environment MUST fail
+   `ENVIRONMENT_NOT_FOUND`, the code `credential/get` returns for the same name. This holds for a
+   caller with nothing provisioned too: it has no environments, so any filter fails, while its
+   unfiltered list is empty. A filter naming an environment that composes no credentials MUST list
+   empty.
+
+### Open questions
+
+- **Signing out.** Specified by Requirement 15 AC 12-19. The record of who signed in is
+  specified in aws-login-identity; a logout keeps it (AC 12).
+- **Creating an environment.** No method creates an environment today; one comes from an
+  edit to `config.toml`, sealed with `file/revalidate`. A future revision may add a gated
+  creation method.
+- **Removing a credential that environments compose.** Whether `credential/remove` refuses, or
+  drops the credential from each environment's list, is open.
+
+## Requirement 17: One Identity Center Sign-in Serves Any of Its Roles
+
+**User Story:** As a client that names one credential per sign-in, I want to ask for any account
+and role the signed-in user holds on each `credential/get`, so that every profile sharing one
+sign-in is served by one credential and one browser login.
+
+### Rationale
+
+An IAM Identity Center sign-in yields an access token, and that token can be exchanged for role
+credentials in any account and role the user is assigned. Fixing the credential to one pair at
+sign-in forces one credential, and one sign-in, per pair. The AWS CLI names a credential after its
+`sso-session`, so several of its profiles share one credential name and differ only in account
+and role. Selecting the pair per request lets one sign-in serve them all.
+
+The pair is a parameter of the request, not a new subject. The credential is still the subject
+(Requirement 10 AC 6), and every restriction on it still applies. What the pair changes is which
+of the sign-in's roles the material is minted for.
+
+### Acceptance Criteria
+
+1. `credential/get` MUST accept optional `account_id` and `role_name` params. A request MUST name
+   both or neither. A request naming one without the other MUST fail as invalid params
+   (`-32602`) before any config or keystore is read, since that is decidable from the request
+   alone.
+2. `account_id` MUST be twelve ASCII digits, and `role_name` MUST be 1 to 64 characters from
+   `A-Z a-z 0-9 + = , . @ _ -`. Both MUST be validated at deserialize time, and a malformed value
+   MUST fail as `-32602` with a message that names the field and the rule, never the value
+   (Requirement 10, "Names are validated at deserialize time").
+3. The pair MUST be accepted only when the served credential's source is `aws-idc-sso`. For any
+   other source the request MUST fail as `ROLE_SELECTION_UNSUPPORTED`, a domain refusal, since it
+   is decided from resolved config rather than the request (Requirement 8 AC 1). It is its own
+   code, not `WRONG_CREDENTIAL_TYPE`, which means unusable material (Requirement 8 AC 5). This
+   check MUST run after the credential resolves, so a request for a credential the caller cannot reach fails with its miss code
+   (Requirement 8 AC 7, Requirement 10 AC 11) and never discloses that credential's source.
+4. With the pair, the material MUST be role credentials for that account and role, obtained with
+   the credential's one sign-in. With neither, the material MUST be for the credential's stored
+   account and role, which bootstrap chooses. A pair equal to the stored one MUST be served as
+   the request with neither.
+5. Sign-in state, meaning the access token and its refresh, MUST be per credential and shared by
+   every pair. Selecting a pair MUST NOT start a sign-in. A `REAUTH_REQUIRED` for any pair MUST
+   name the credential, and its remediation MUST be `credential/login` for that credential
+   (Requirement 10 AC 12).
+6. The cache identity of a result MUST include the pair (extending Requirement 5 AC 1). Material
+   for one pair MUST NOT be served to a request for another, or to a request naming neither.
+   Renewals of one credential's pairs MUST NOT run concurrently, so they never race on the
+   rotating refresh token.
+7. Every restriction that applies to the credential MUST apply to every pair: drift and custody,
+   the credential's `identity_type` and approval gates, the request's `claim` and `scope`, and any
+   environment the request names. A request with a pair MUST NOT be served when the same request
+   without it would be refused.
+8. Serving a pair other than the stored one MUST be audited with the credential name, the
+   account, and the role. So MUST refusing one under AC 10, with its outcome, so a caller probing
+   the allowed list leaves a record.
+9. `environment/credentials` MUST NOT accept a pair. It serves each member's stored account and
+   role.
+10. A pair MUST be served only if it equals the credential's stored pair or is in the
+    credential's allowed list (`allowed_roles`), matched on both account and role. Any other pair
+    MUST fail as `ROLE_NOT_ALLOWED`, a domain refusal naming the credential (Requirement 8 AC 1),
+    after the AC 3 check. An absent or empty list allows only the stored pair. The list is part of
+    the credential's bootstrap params, so changing it is a `credential/bootstrap` over an existing
+    credential, gated on verified presence by `presence-gated-operations` Req 1.7, and the approval
+    MUST name every listed pair.
+11. A `credential/bootstrap` naming an existing `aws-idc-sso` credential, with a provider that
+    changes none of the credential's stored settings, is a re-authentication: the system MUST
+    replace its sign-in without a presence challenge. The stored settings are `start_url`,
+    `sso_region`, `identity_type`, `account_id`, `role_name`, and `allowed_roles`, compared
+    exactly as bootstrap stores them. A request MUST name both `account_id` and `role_name` or
+    neither, as AC 1 requires of `credential/get`; naming one without the other MUST fail as
+    invalid params (`-32602`) with a message that names the fields and not their values, before
+    any config or keystore is read and before any provider flow runs, since a half pair would
+    otherwise be approved as one pair and have its missing half resolved at sign-in. A request
+    that omits `account_id`, `role_name`, or `allowed_roles` keeps the stored value of each, and
+    MUST NOT prompt for an account or a role, so a re-authentication completes with no client
+    selection. An omitted `allowed_roles` MUST be
+    distinguishable from an empty one: absent keeps the credential's allowed list, and an empty
+    list clears it, which is a change and so gated. A request naming any stored setting with
+    another value, or a provider whose type is not the credential's source, is a replace: it
+    MUST be gated on verified presence by `presence-gated-operations` Req 1.7, and the approval
+    MUST name each changed setting by its stored key, one clause per setting, with its old and new
+    value. WHEN `start_url` or `sso_region` changes, the approval MUST also name the stored
+    `account_id` and `role_name` and every `allowed_roles` pair, since they carry over to the new
+    values, and MUST mark them as kept, apart from the change clauses, so a reader can tell a
+    value that changes from one that carries over. A pair the allowed list already names is not
+    exempt, because the stored pair is what a request naming no pair is served (AC 4), so moving
+    it changes what every such request receives. Whether the credential holds a live sign-in
+    MUST NOT take part: an expired session, a session never stored, and one `credential/logout`
+    ended all leave the same credential, which a re-authentication signs in again. A credential
+    with sealed material but no `credentials.toml` entry, and a `credentials.toml` that does not
+    parse, MUST NOT read as a re-authentication. The settings the sign-in ran on MUST be compared
+    against the `credentials.toml` bytes the write check verified, under the per-caller write lock
+    that performs the write, so neither the settings nor the decision can change between them. A
+    sign-in that fails, times out, or is cancelled MUST change nothing. The checks every write
+    runs — drift, custody, and integrity — apply to a re-authentication unchanged; it is not a
+    path around them.
+
+### What the sign-in grants
+
+A caller allowed to get the credential can get its stored pair and the pairs its allowed list
+names, and no other, even when the sign-in holds more (AC 10). The user approves that set when
+bootstrapping the credential. A listed pair the user does not hold fails as Identity Center's
+refusal, reported as `PROVIDER_UNAVAILABLE`.
+
+### Who signed in
+
+An `aws-idc-sso` credential stores the Identity Center instance it signs in to and the pairs it
+may serve, and nothing about the person who signed in. Who that is reaches the audit log instead.
+The sign-in asks only for `sso:account:access`, so no identity token comes back with the access
+token; after each fresh sign-in the system brokers role credentials for the pair the sign-in is
+stored with and reads the session name `sts:GetCallerIdentity` returns, which for Identity Center
+is the user name. That user is audited with the credential and the pair the lookup used, and it is
+neither persisted nor compared.
+
+The lookup is best effort. Every failure — a pair the signed-in user is not assigned, an
+unreachable STS, an ARN that does not parse — MUST leave the sign-in successful and MUST be
+audited with its reason in place of the user. A credential may serve pairs beyond its stored one
+(AC 10), so a stored pair the instance no longer assigns is an ordinary state and not a reason to
+fail a sign-in that is otherwise complete.
+
+Comparing the user, as `aws-login-identity` does for an `aws-login` credential, is deliberately
+not done. It could not prevent a privilege escalation: a substituting user already holds the pair,
+or the lookup is the thing that fails. And it would make a stale stored pair fatal to a
+re-authentication that is otherwise valid, since the comparison has nothing to compare when the
+pair cannot be brokered. A re-authentication (AC 11) therefore cannot tell the user already signed
+in from another user of the same instance, and AC 10 is what bounds the reach: either of them is
+served only the stored pair and the listed pairs, and only where Identity Center holds the
+assignment. The record is for local traceability — it tells a reader of the log who last signed a
+credential in.
+
+### Open questions
+
+- **A code for a role the user does not hold.** `PROVIDER_UNAVAILABLE` reads as transient, but
+  Identity Center's refusal is not. Whether it gets its own code, under Requirement 8 AC 5's
+  additive-only rule, is open.
+- **Background refresh of selected pairs.** The background loop warms each credential's stored
+  pair. A selected pair renews when a request finds its cached entry within a minute of expiry.
+- **An identity record for `aws-idc-sso`.** **Resolved:** a fresh sign-in resolves the signed-in
+  user best effort and audits it; nothing stores or compares it, for the reasons in "Who signed
+  in". `aws-login-identity` leaves every source but `aws-login` out of scope, and that stands.
 
 ---
 
@@ -960,6 +1387,11 @@ profile's configured credential", which is the behavior that exists today; an in
 reject a `credential` value that names anything other than that until this is resolved, rather
 than honoring it unrestricted.
 
+**Amended, 2026-11-09.** A request MAY name only a credential. It is served under the
+credential's own restrictions (Requirement 2, amended), and an environment, when named, narrows
+only (Requirement 10 AC 6-8). This settles which restriction applies to the identity and approval
+axes. Boundary application stays open and blocked as described above.
+
 ### 2. Scope on Aggregate_Retrieval (Requirement 4 AC 4)
 
 Apply one document to every credential, or reject scoped aggregates outright. Applying one
@@ -970,7 +1402,7 @@ loses little if the granular path exists. Leaning reject; decide with Requiremen
 ### 3. ~~Whether JSON-RPC batch requests are accepted~~ — **RESOLVED, 2026-08-21**
 
 Transport-level batches are prohibited; a top-level JSON array is rejected with
-`ERR_INVALID_PARAMS`. Domain-level batching exists instead, as `credential/get_batch` — see
+`ERR_INVALID_PARAMS`. Domain-level batching exists instead, as `environment/credentials` — see
 Requirement 10 "Settled".
 
 Recorded because the resolution turns on a distinction that reads as a contradiction otherwise:
@@ -1076,6 +1508,17 @@ Per `AGENTS.md` spec coherence, these are surfaced rather than resolved.
    instance lifecycle, no TCP listener, no stale-socket path), all of which this refinement
    leaves intact. Its status was already `proposal` and unimplemented, so no status revert was
    needed and no migration was incurred.
+
+5. **`presence-gated-operations` Req 1.7 and Requirement 17.** Today the account and role an
+   `aws-idc-sso` credential vends is fixed in its sealed `credentials.toml` entry, and changing
+   it means `credential/bootstrap` over an existing credential, which Req 1.7 gates on verified
+   presence. Requirement 17 lets any process the credential's restrictions admit select another
+   pair per request, with no gate, so such a process reaches every role the sign-in holds
+   rather than the one pair the user approved. The sign-in does grant that whole set, and
+   Requirement 17 says so, but the gate it moves around is real. **Resolved:** Requirement 17
+   AC 10 ships a per-credential allowed list with the parameter. A pair outside the stored pair
+   and the list is refused, and the list changes only through the Req 1.7 presence-gated
+   re-bootstrap, so Req 1.7 still bounds every pair a credential can vend.
 
 ## Dependencies
 

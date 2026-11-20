@@ -131,7 +131,8 @@ impl<S: TpmSeam> SecureStorage for TpmStorage<S> {
 
         self.seam.unseal(&blob).map_err(|e| {
             DaemonError::Storage(format!(
-                "could not unseal key '{key_id}' (TPM cleared or replaced): {e}"
+                "could not unseal key '{key_id}' (TPM cleared or replaced): {}",
+                e.detail()
             ))
         })
     }
@@ -425,20 +426,21 @@ mod esapi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use crate::error::prefixes;
+    use proptest::prelude::*;
+    use std::sync::{Arc, Mutex};
 
     /// Reversible non-identity transform so a "sealed" blob differs from the
     /// plaintext (lets us assert no-cleartext-on-disk) and can be flipped to
-    /// simulate a policy/TPM change that makes unseal fail.
+    /// simulate a policy/TPM change that makes unseal fail with the given message.
     #[derive(Clone, Default)]
     struct FakeSeam {
-        broken: Arc<AtomicBool>,
+        broken: Arc<Mutex<Option<String>>>,
     }
 
     impl FakeSeam {
-        fn break_unseal(&self) {
-            self.broken.store(true, Ordering::SeqCst);
+        fn break_unseal(&self, message: &str) {
+            *self.broken.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.to_owned());
         }
     }
 
@@ -447,8 +449,13 @@ mod tests {
             Ok(plaintext.iter().map(|b| b ^ 0x5A).collect())
         }
         fn unseal(&self, blob: &[u8]) -> Result<Vec<u8>> {
-            if self.broken.load(Ordering::SeqCst) {
-                return Err(DaemonError::Storage("simulated policy mismatch".into()));
+            let broken = self
+                .broken
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(message) = broken {
+                return Err(DaemonError::Storage(message));
             }
             Ok(blob.iter().map(|b| b ^ 0x5A).collect())
         }
@@ -481,7 +488,7 @@ mod tests {
 
         // Unsealable: blob present (exists() true) but the seam refuses to unseal.
         s.store("k", b"0123456789abcdef0123456789abcdef").unwrap();
-        seam.break_unseal();
+        seam.break_unseal("simulated policy mismatch");
         assert!(s.exists("k").unwrap());
         let unsealable = s.retrieve("k").unwrap_err().to_string();
         assert!(
@@ -492,6 +499,25 @@ mod tests {
             unsealable.contains("could not unseal"),
             "unexpected: {unsealable}"
         );
+    }
+
+    proptest! {
+        /// The seam's failure is embedded through its `detail()`, so a key that will not unseal
+        /// names one category however the seam worded the failure.
+        #[test]
+        fn an_unsealable_key_names_one_category(
+            message in "[a-z0-9 ':.()-]{0,48}".prop_filter("holds a category name", |m| prefixes(m) == 0),
+        ) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let seam = FakeSeam::default();
+            let s = TpmStorage::new_in(dir.path().to_path_buf(), seam.clone());
+            s.store("k", b"0123456789abcdef0123456789abcdef").expect("store");
+            seam.break_unseal(&message);
+            let Err(err) = s.retrieve("k") else {
+                panic!("a refused unseal must not retrieve");
+            };
+            prop_assert_eq!(prefixes(&err.to_string()), 1, "{}", err);
+        }
     }
 
     #[test]

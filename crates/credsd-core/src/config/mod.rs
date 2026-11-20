@@ -62,7 +62,10 @@ impl IdentityType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PartialEq` is the gate's definition of a repeat `aws-idc-sso` bootstrap
+/// (`credential-retrieval-api` Req 17 AC 11): every stored setting equal, so a field added here
+/// joins the comparison rather than being silently exempt from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SsoConfig {
     pub start_url: String,
     pub sso_region: String,
@@ -71,6 +74,60 @@ pub struct SsoConfig {
     /// Who this credential is *for*. Controls the privilege lattice check at bootstrap.
     #[serde(default, skip_serializing_if = "is_default_identity")]
     pub identity_type: IdentityType,
+    /// Other pairs of the sign-in a request may select (`credential-retrieval-api`
+    /// Requirement 17). Empty means only the stored pair. Changed only by re-bootstrapping, which
+    /// is presence-gated over an existing credential (`presence-gated-operations` Req 1.7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_roles: Vec<RolePair>,
+}
+
+/// One Identity Center account and permission-set role of a sign-in. Validated on deserialize, so
+/// a pair that could never match a request is never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolePair {
+    #[serde(deserialize_with = "account_id")]
+    pub account_id: String,
+    #[serde(deserialize_with = "role_name")]
+    pub role_name: String,
+}
+
+/// Identity Center's account shape: twelve ASCII digits. The message states the rule, never the
+/// value.
+pub fn check_account_id(value: &str) -> std::result::Result<(), &'static str> {
+    if value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err("account_id: must be twelve digits")
+    }
+}
+
+/// Identity Center's role shape: 1 to 64 of `A-Z a-z 0-9 + = , . @ _ -`.
+pub fn check_role_name(value: &str) -> std::result::Result<(), &'static str> {
+    if (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
+    {
+        Ok(())
+    } else {
+        Err("role_name: use 1 to 64 letters, digits, or '+=,.@_-'")
+    }
+}
+
+fn account_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    check_account_id(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
+fn role_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    check_role_name(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
 }
 
 /// A long-term IAM key brokered into short-lived credentials via `sts:GetSessionToken`.
@@ -188,7 +245,9 @@ pub struct AwsWebIdentityConfig {
 /// `credentials.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AwsLoginConfig {
-    /// Sign-In region; selects `https://{region}.signin.aws.amazon.com`. Required, with no default.
+    /// Sign-In region; selects `https://{region}.{domain}`, where `{domain}` is the Sign-In domain
+    /// of the region's partition (`signin.aws.amazon.com` in the commercial partition). Required,
+    /// with no default.
     pub region: String,
     /// Fixed loopback port for the callback server. Omit for ephemeral. Meaningless when
     /// `remote` is set, which has no listener to bind.
@@ -380,8 +439,8 @@ pub struct CliSettings {
 /// login, different region" is expressed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EnvConfig {
-    /// The credentials this env composes, in order. The first is the default. Empty means
-    /// "a single credential named after the env" (the 1:1 shape `credsd bootstrap` writes).
+    /// The credentials this env composes, in order. The first is the default. Empty composes
+    /// nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<String>,
     /// Legacy singular form (`credential = "x"`). Deserialize-only, folded into
@@ -412,27 +471,21 @@ pub struct EnvConfig {
 }
 
 impl EnvConfig {
-    /// The ordered credential list this env resolves. Precedence: explicit `credentials`
-    /// list, else the legacy singular `credential`, else a one-element list of the env's own
-    /// name (the bootstrap 1:1 default).
-    pub fn credential_list(&self, env_name: &str) -> Vec<String> {
+    /// The ordered credential list this env composes: the explicit `credentials` list, else the
+    /// legacy singular `credential`. Empty composes nothing; an env never implicitly composes a
+    /// credential named after itself (credential-retrieval-api Requirement 16 AC 3).
+    pub fn credential_list(&self) -> Vec<String> {
         if !self.credentials.is_empty() {
             self.credentials.clone()
-        } else if let Some(ref c) = self.credential {
-            vec![c.clone()]
         } else {
-            vec![env_name.to_string()]
+            self.credential.iter().cloned().collect()
         }
     }
 
-    /// The env's default credential — the first in [`EnvConfig::credential_list`]. This is the
-    /// ambient identity served on the container endpoint and written as `[default]`.
-    pub fn default_credential(&self, env_name: &str) -> String {
-        // credential_list is never empty by construction.
-        self.credential_list(env_name)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| env_name.to_string())
+    /// The env's default credential, the first in [`EnvConfig::credential_list`], or `None` for
+    /// an env that composes nothing.
+    pub fn default_credential(&self) -> Option<String> {
+        self.credential_list().into_iter().next()
     }
 }
 
@@ -614,8 +667,16 @@ impl DaemonConfig {
     /// check canonicalizes this, so a file that parses but does not validate is checked against
     /// its snapshot rather than read as drift.
     pub fn parse_from(dir: &std::path::Path) -> Result<(Self, CredentialSources)> {
+        let (config, entries) = Self::parse_entries_from(dir)?;
+        Ok((config, credentials::sources(entries)))
+    }
+
+    /// [`parse_from`](Self::parse_from) keeping each credential's tags.
+    pub fn parse_entries_from(
+        dir: &std::path::Path,
+    ) -> Result<(Self, credentials::CredentialEntries)> {
         let creds_path = dir.join("credentials.toml");
-        let credentials = credentials::load_from(&creds_path)?;
+        let credentials = credentials::load_entries_from(&creds_path)?;
 
         let config_path = dir.join("config.toml");
         let Some(content) = read_if_present(&config_path)? else {
@@ -623,6 +684,7 @@ impl DaemonConfig {
         };
         warn_if_permissive(&config_path);
         warn_obsolete_keys(&content);
+        reject_environment_tables(&content)?;
         let config = Self::from_text(&content).map_err(|e| {
             DaemonError::config(format!(
                 "{}: parse error at {}",
@@ -677,10 +739,10 @@ impl DaemonConfig {
 
         for (name, env) in &self.envs {
             if let Err(e) = credentials::validate_name(name) {
-                errors.push(format!("invalid env name: {}", e));
+                errors.push(format!("invalid env name: {}", e.detail()));
             }
 
-            for credential in env.credential_list(name) {
+            for credential in env.credential_list() {
                 if !credentials.contains_key(&credential) {
                     errors.push(format!(
                         "env '{}' references credential '{}', which is not defined in {}",
@@ -785,7 +847,7 @@ impl DaemonConfig {
         let mut names: Vec<&str> = self
             .envs
             .iter()
-            .filter(|(name, env)| env.credential_list(name).iter().any(|c| c == credential))
+            .filter(|(_, env)| env.credential_list().iter().any(|c| c == credential))
             .map(|(name, _)| name.as_str())
             .collect();
         names.sort_unstable();
@@ -803,6 +865,22 @@ impl DaemonConfig {
             .or_else(|| self.socket_path.clone())
             .unwrap_or_else(platform::default_socket_path)
     }
+}
+
+/// Refuse environment tables at a persisted-file boundary while keeping the model parser
+/// available for a later environment design.
+pub fn reject_environment_tables(content: &str) -> Result<()> {
+    let doc = content
+        .parse::<DocumentMut>()
+        .map_err(|e| DaemonError::config(e.to_string()))?;
+    for table in ["environment", "environments"] {
+        if doc.contains_key(table) {
+            return Err(DaemonError::config(format!(
+                "'[{table}]' is not supported in config.toml"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Write a config file atomically, at mode `0600`, so a reader or a crash mid-write never
@@ -1243,6 +1321,38 @@ mod tests {
     use super::*;
     use toml_edit::value;
 
+    proptest::proptest! {
+        /// A stored pair round-trips through `credentials.toml` only when it has Identity Center's
+        /// shapes; a pair that could never match a request is refused on load, naming the rule.
+        #[test]
+        fn role_pair_deserializes_only_identity_center_shapes(
+            account_id in proptest::prop_oneof![
+                "[0-9]{12}", "[0-9]{0,11}", "[0-9]{13,16}", "[0-9]{6}[A-Za-z:]{1,6}",
+            ],
+            role_name in proptest::prop_oneof![
+                "[A-Za-z0-9+=,.@_-]{1,64}", "[A-Za-z0-9+=,.@_-]{65,80}", "",
+                "[A-Za-z]{1,8}[:/ *]{1,3}[A-Za-z]{0,8}",
+            ],
+        ) {
+            let valid = account_id.len() == 12
+                && account_id.bytes().all(|b| b.is_ascii_digit())
+                && (1..=64).contains(&role_name.len())
+                && role_name.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b));
+            let text = toml::to_string(&RolePair { account_id, role_name }).expect("serializes");
+            match toml::from_str::<RolePair>(&text) {
+                Ok(pair) => {
+                    proptest::prop_assert!(valid, "accepted a pair that can never match: {pair:?}");
+                    proptest::prop_assert_eq!(toml::to_string(&pair).expect("serializes"), text);
+                }
+                Err(e) => {
+                    proptest::prop_assert!(!valid, "refused a valid pair: {e}");
+                    let e = e.to_string();
+                    proptest::prop_assert!(e.contains("account_id:") || e.contains("role_name:"), "{e}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn aws_web_identity_rejects_the_removed_mode_key() {
         // `mode = "token"` was removed with the token path. Without deny_unknown_fields serde
@@ -1347,6 +1457,7 @@ region = "us-west-2"
                                 account_id: "111111111111".to_string(),
                                 role_name: "AdminRole".to_string(),
                                 identity_type: IdentityType::Human,
+                                allowed_roles: Vec::new(),
                             }),
                         )
                     }),
@@ -1363,6 +1474,7 @@ region = "us-west-2"
                 account_id: "111111111111".to_string(),
                 role_name: "AdminRole".to_string(),
                 identity_type,
+                allowed_roles: Vec::new(),
             }),
         )]
         .into_iter()
@@ -1518,10 +1630,7 @@ region = "us-west-2"
         let output = doc.to_string();
 
         let config: DaemonConfig = toml::from_str(&output).unwrap();
-        assert_eq!(
-            config.envs["prod"].credential_list("prod"),
-            vec!["shared-login"]
-        );
+        assert_eq!(config.envs["prod"].credential_list(), vec!["shared-login"]);
         assert_eq!(config.envs["prod"].identity_type, IdentityType::Automation);
         assert_eq!(
             config.envs["prod"].region.as_deref(),
@@ -2150,7 +2259,13 @@ sdk = { retry_mode = "adaptive", max_attempts = 5 }
 
     #[test]
     fn validate_rejects_env_naming_undefined_credential() {
-        let config = config_with_envs(&[("broken", EnvConfig::default())]);
+        let config = config_with_envs(&[(
+            "broken",
+            EnvConfig {
+                credentials: vec!["broken".into()],
+                ..Default::default()
+            },
+        )]);
         let errors = config.validate(&CredentialSources::new()).unwrap_err();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("env 'broken'"));
@@ -2173,9 +2288,9 @@ sdk = { retry_mode = "adaptive", max_attempts = 5 }
     }
 
     #[test]
-    fn credential_name_defaults_to_the_env_name() {
-        assert_eq!(EnvConfig::default().default_credential("dev"), "dev");
-        assert_eq!(EnvConfig::default().credential_list("dev"), vec!["dev"]);
+    fn an_env_with_no_credentials_composes_nothing() {
+        assert_eq!(EnvConfig::default().default_credential(), None);
+        assert!(EnvConfig::default().credential_list().is_empty());
     }
 
     #[test]
@@ -2183,15 +2298,15 @@ sdk = { retry_mode = "adaptive", max_attempts = 5 }
         // Canonical ordered-list form; first is the default.
         let list: DaemonConfig =
             toml::from_str("[environments.prod]\ncredentials = [\"a\", \"b\"]\n").unwrap();
-        assert_eq!(list.envs["prod"].credential_list("prod"), vec!["a", "b"]);
-        assert_eq!(list.envs["prod"].default_credential("prod"), "a");
+        assert_eq!(list.envs["prod"].credential_list(), vec!["a", "b"]);
+        assert_eq!(list.envs["prod"].default_credential().as_deref(), Some("a"));
 
         let singular: DaemonConfig =
             toml::from_str("[environments.dev]\ncredential = \"shared\"\n").unwrap();
-        assert_eq!(singular.envs["dev"].credential_list("dev"), vec!["shared"]);
+        assert_eq!(singular.envs["dev"].credential_list(), vec!["shared"]);
 
         let bare: DaemonConfig = toml::from_str("[environments.solo]\n").unwrap();
-        assert_eq!(bare.envs["solo"].credential_list("solo"), vec!["solo"]);
+        assert!(bare.envs["solo"].credential_list().is_empty());
     }
 
     #[test]
@@ -2207,7 +2322,8 @@ sdk = { retry_mode = "adaptive", max_attempts = 5 }
         ]);
 
         assert_eq!(config.envs_using("shared-login"), vec!["dev", "dev-tokyo"]);
-        assert_eq!(config.envs_using("prod"), vec!["prod"]);
+        // An env composes nothing implicitly, so `prod` does not compose a credential `prod`.
+        assert!(config.envs_using("prod").is_empty());
         assert!(config.envs_using("nobody").is_empty());
     }
 
@@ -2230,12 +2346,24 @@ sdk = { retry_mode = "adaptive", max_attempts = 5 }
             "{:?}",
             errors
         );
+        // The list is wrapped in one configuration error later, so it carries no prefix itself.
+        assert!(
+            errors.iter().all(|e| crate::error::prefixes(e) == 0),
+            "{:?}",
+            errors
+        );
     }
 
     #[test]
     fn validate_collects_multiple_errors() {
         let mut envs = HashMap::new();
-        envs.insert("bad".to_string(), EnvConfig::default());
+        envs.insert(
+            "bad".to_string(),
+            EnvConfig {
+                credentials: vec!["bad".into()],
+                ..Default::default()
+            },
+        );
         let config = DaemonConfig {
             auth: AuthConfig::default(),
             socket_path: Some(PathBuf::from("not/absolute")),
@@ -2476,6 +2604,20 @@ region = "us-east-1"
         let (config, credentials) = DaemonConfig::load_from(dir.path()).unwrap();
         assert!(config.envs.is_empty());
         assert!(credentials.is_empty());
+    }
+
+    #[test]
+    fn persisted_environment_tables_are_invalid_and_unchanged() {
+        for table in ["[environment]", "[environments]", "[environments.work]"] {
+            let dir = tempfile::tempdir().unwrap();
+            let content = format!("{table}\nsecret = \"do-not-repeat\"\n");
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &content).unwrap();
+            let error = DaemonConfig::load_from(dir.path()).unwrap_err().to_string();
+            assert!(error.contains("not supported"), "{error}");
+            assert!(!error.contains("do-not-repeat"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
     }
 
     /// `resolve_env_vars` reads the env's settings, not a file. Its `env_var` mappings are the

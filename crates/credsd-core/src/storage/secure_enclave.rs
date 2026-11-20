@@ -260,7 +260,8 @@ impl<S: SeSeam> SecureStorage for SecureEnclaveStorage<S> {
         // key_blob() opens with O_NOFOLLOW and validates uid/mode — do not bypass with a direct read.
         let key_blob = self.key_blob(key_id).map_err(|e| {
             DaemonError::Storage(format!(
-                "sealed key '{key_id}' exists but its enclave key cannot be read: {e}"
+                "sealed key '{key_id}' exists but its enclave key cannot be read: {}",
+                e.detail()
             ))
         })?;
 
@@ -270,7 +271,8 @@ impl<S: SeSeam> SecureStorage for SecureEnclaveStorage<S> {
             .map_err(|e| {
                 DaemonError::Storage(format!(
                     "could not unwrap key '{key_id}' (enclave key from another machine, or a \
-                     protection class this process cannot satisfy): {e}"
+                     protection class this process cannot satisfy): {}",
+                    e.detail()
                 ))
             })
     }

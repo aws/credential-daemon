@@ -257,8 +257,9 @@ fn init_keystore(backend: &str) -> Result<()> {
     }
     credsd_core::encryption::ensure_system_service_key(backend).map_err(|e| {
         crate::error::DaemonError::config(format!(
-            "failed to initialize keystore for backend '{backend}': {e}. \
-                 Re-run 'sudo credsd install' to retry."
+            "failed to initialize keystore for backend '{backend}': {}. \
+                 Re-run 'sudo credsd install' to retry.",
+            e.detail()
         ))
     })
 }
@@ -1029,7 +1030,7 @@ becomes permanently undecryptable.
 
 The sealed blobs are moved to quarantine under the data directory first, but
 nothing can open them afterwards: the key they need will not exist. Every
-environment has to be re-imported with 'credsd bootstrap --env <env>'.
+credential has to be re-bootstrapped with 'creds bootstrap --credential <name>'.
 
 Type 'yes' to continue: ";
 
@@ -1092,8 +1093,8 @@ fn purge_key_if_asked(
                 "encryption key deleted from the '{backend}' keystore. Sealed credentials were \
                  moved to {}/quarantine and cannot be decrypted. Each user's integrity record \
                  will not open under a new key, so each user runs 'creds revalidate' (its \
-                 approval replaces the record), then re-imports each environment with \
-                 'credsd bootstrap --env <env>'.",
+                 approval replaces the record), then re-bootstraps each credential with \
+                 'creds bootstrap --credential <name>'.",
                 data_dir.display()
             );
         }
@@ -1208,9 +1209,10 @@ mod macos {
 
         minted.map_err(|e| {
             DaemonError::config(format!(
-                "could not mint the Secure Enclave key as '{user}' under launchd: {e}\n{output}\
+                "could not mint the Secure Enclave key as '{user}' under launchd: {}\n{output}\
                  The key has to be minted from inside launchd — the enclave binds it to that \
                  context — so this cannot fall back to minting here.",
+                e.detail(),
                 user = CREDSD_USER,
                 output = if job_output.trim().is_empty() {
                     String::new()
@@ -1457,8 +1459,9 @@ mod macos {
                 "storage backend not resolved — re-run credsd install",
             )
         })?;
-        credsd_core::encryption::init_encryption_with_backend(Some(backend))
-            .map_err(|e| DaemonError::config(format!("failed to initialize keystore: {e}")))?;
+        credsd_core::encryption::init_encryption_with_backend(Some(backend)).map_err(|e| {
+            DaemonError::config(format!("failed to initialize keystore: {}", e.detail()))
+        })?;
 
         let log_file = super::resolve_log_file(opts);
         let args = super::program_arguments(opts, log_file.as_deref());
@@ -2287,8 +2290,6 @@ mod linux {
         let args = super::program_arguments(opts, log_file.as_deref());
         let updating = service_unit_path().exists();
 
-        let logs_directory =
-            log_dir_path.parent() == Some(Path::new(crate::config::platform::SYSTEM_LOG_DIR));
         write_unit(
             &service_unit_path(),
             // install created and minted into this home, so the service reads the same one.
@@ -2296,7 +2297,6 @@ mod linux {
                 binary,
                 &args,
                 tpm_device_group(opts),
-                logs_directory,
                 crate::config::platform::data_dir_override()
                     .map(|p| p.display().to_string())
                     .as_deref(),
@@ -2450,8 +2450,8 @@ mod linux {
         Ok(())
     }
 
-    /// `StateDirectoryMode=` only applies to a directory systemd creates, and an earlier install
-    /// left `/var/lib/credsd` at the umask, listing every provisioned uid under `callers/`.
+    /// `own_tree` chowns but leaves the mode at the umask, which would list every provisioned
+    /// uid under `callers/`. The unit cannot do this: `StateDirectoryMode=` needs systemd 235.
     fn restrict_data_root() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let root = crate::config::platform::data_dir();
@@ -2488,20 +2488,21 @@ mod linux {
         group_exists.then_some(TPM_GROUP)
     }
 
-    /// No `[Install]` — the `.socket` owns activation. `RuntimeDirectory=credsd` is what makes
-    /// `/run/credsd`, the parent of [`system_socket_path`], exist and be credsd-owned.
-    /// `RuntimeDirectoryPreserve=yes` keeps it when the service stops: systemd otherwise deletes
-    /// it, and with it the socket the still-listening `.socket` unit bound inside it.
+    /// No `[Install]` — the `.socket` owns activation.
+    ///
+    /// Every key rendered here must exist in systemd 219, the oldest version credsd supports
+    /// (Amazon Linux 2); see `every_rendered_key_exists_in_the_oldest_supported_systemd`. That
+    /// rules out `StateDirectory=`/`LogsDirectory=` (235), which `install` does itself anyway,
+    /// and `RuntimeDirectory=`/`RuntimeDirectoryPreserve=`: the `.socket` unit already creates
+    /// `/run/credsd` as the parent of its `ListenStream=`, and a service that claims the same
+    /// directory fails to start on 219 and takes the socket file down with the directory.
     ///
     /// No `StandardOutput=`/`StandardError=` file target: credsd writes its own log via
-    /// `--log-file`, which keeps its size-based rotation the single writer. `LogsDirectory=` is
-    /// named only when that log is in `/var/log/credsd`, so a custom `--log-file` does not get
-    /// an empty directory created beside it.
+    /// `--log-file`, which keeps its size-based rotation the single writer.
     pub(super) fn render_service(
         binary: &Path,
         args: &[String],
         supplementary_group: Option<&str>,
-        logs_directory: bool,
         data_dir: Option<&str>,
     ) -> String {
         let mut exec = systemd_quote(&binary.display().to_string());
@@ -2527,14 +2528,6 @@ mod linux {
             ));
         }
         s.push_str(&format!("ExecStart={}\n", exec));
-        s.push_str("RuntimeDirectory=credsd\n");
-        s.push_str("RuntimeDirectoryPreserve=yes\n");
-        s.push_str("StateDirectory=credsd\n");
-        s.push_str("StateDirectoryMode=0700\n");
-        if logs_directory {
-            s.push_str("LogsDirectory=credsd\n");
-            s.push_str("LogsDirectoryMode=0700\n");
-        }
         s.push_str("Restart=on-failure\n");
         s.push_str("RestartSec=5\n");
         s
@@ -2637,7 +2630,6 @@ mod linux {
                     "serve".to_string(),
                 ],
                 None,
-                false,
                 None,
             );
             assert!(unit.contains("ExecStart="));
@@ -2645,12 +2637,9 @@ mod linux {
             assert!(unit.contains("\"serve\""));
             assert!(unit.contains(&format!("User={CREDSD_USER}")));
             assert!(unit.contains(&format!("Group={CREDSD_GROUP}")));
-            assert!(unit.contains("RuntimeDirectory=credsd\n"));
-            // Without it, a stopped or crashed service takes the socket file with it while the
-            // .socket unit still reports active.
-            assert!(unit.contains("RuntimeDirectoryPreserve=yes\n"));
-            assert!(unit.contains("StateDirectory=credsd\n"));
-            assert!(unit.contains("StateDirectoryMode=0700\n"));
+            // The `.socket` unit is the only owner of `/run/credsd`: a second claim here fails
+            // the start on systemd 219 and deletes the socket file with the directory.
+            assert!(!unit.contains("RuntimeDirectory"));
             assert!(unit.contains("Restart=on-failure"));
             assert!(unit.contains("RestartSec=5"));
             // Activation is the socket's job: the service carries no [Install]/WantedBy, and the
@@ -2663,20 +2652,13 @@ mod linux {
         #[test]
         fn service_names_no_supplementary_group_unless_given() {
             let serve = ["serve".to_string()];
-            let unit = render_service(
-                Path::new("/usr/local/bin/credsd"),
-                &serve,
-                None,
-                false,
-                None,
-            );
+            let unit = render_service(Path::new("/usr/local/bin/credsd"), &serve, None, None);
             assert!(!unit.contains("SupplementaryGroups="));
 
             let unit = render_service(
                 Path::new("/usr/local/bin/credsd"),
                 &serve,
                 Some("tss"),
-                false,
                 None,
             );
             assert!(unit.contains("SupplementaryGroups=tss\n"));
@@ -2685,14 +2667,58 @@ mod linux {
             assert!(unit.contains(&format!("Group={CREDSD_GROUP}")));
         }
 
+        /// Every key credsd renders, in either unit. systemd ignores a key it does not know
+        /// (`Unknown lvalue` in the journal) rather than refusing the unit, so a key above the
+        /// floor silently does nothing on an old host — which is how the service came to delete
+        /// its own socket on Amazon Linux 2.
+        ///
+        /// Every rendered key belongs here, hardening keys included. Adding one that needs a
+        /// newer systemd is a deliberate choice, and not the same choice for every key: an
+        /// ignored hardening key costs protection on an old host, while an ignored key the unit
+        /// depends on to start breaks it.
+        const SYSTEMD_219_KEYS: &[&str] = &[
+            "Description",
+            "Type",
+            "User",
+            "Group",
+            "SupplementaryGroups",
+            "Environment",
+            "ExecStart",
+            "Restart",
+            "RestartSec",
+            "ListenStream",
+            "SocketMode",
+            "SocketUser",
+            "SocketGroup",
+            "RemoveOnStop",
+            "WantedBy",
+        ];
+
         #[test]
-        fn logs_directory_is_named_only_when_asked() {
+        fn every_rendered_key_exists_in_the_oldest_supported_systemd() {
             let serve = ["serve".to_string()];
-            let path = Path::new("/usr/local/bin/credsd");
-            assert!(!render_service(path, &serve, None, false, None).contains("LogsDirectory="));
-            let unit = render_service(path, &serve, None, true, None);
-            assert!(unit.contains("LogsDirectory=credsd\n"));
-            assert!(unit.contains("LogsDirectoryMode=0700\n"));
+            let units = [
+                render_service(
+                    Path::new("/usr/local/bin/credsd"),
+                    &serve,
+                    Some("tss"),
+                    Some("/var/lib/credsd"),
+                ),
+                render_socket(&system_socket_path()),
+            ];
+            for unit in &units {
+                for key in unit
+                    .lines()
+                    .filter_map(|l| l.split_once('='))
+                    .map(|(k, _)| k)
+                {
+                    assert!(
+                        SYSTEMD_219_KEYS.contains(&key),
+                        "`{key}=` is not in the systemd 219 key list; adding it raises the \
+                         oldest systemd credsd can be installed on",
+                    );
+                }
+            }
         }
 
         #[test]
@@ -2712,8 +2738,6 @@ mod linux {
             assert!(unit.contains(&format!("SocketUser={CREDSD_USER}")));
             assert!(unit.contains(&format!("SocketGroup={CREDSD_GROUP}")));
             assert!(unit.contains("WantedBy=sockets.target"));
-            // `RuntimeDirectoryPreserve=yes` keeps `/run/credsd`, so nothing else unlinks the
-            // socket after an uninstall.
             assert!(unit.contains("RemoveOnStop=yes\n"));
         }
 
@@ -2727,7 +2751,6 @@ mod linux {
                     "serve".to_string(),
                 ],
                 None,
-                false,
                 None,
             );
             let parsed = parse_exec_start(&unit);
@@ -2753,7 +2776,6 @@ mod linux {
                     "serve".to_string(),
                 ],
                 None,
-                true,
                 None,
             );
             for target in [
@@ -2774,24 +2796,12 @@ mod linux {
         fn the_unit_carries_a_data_dir_override() {
             let serve = ["serve".to_string()];
             let dir = "/srv/cred sd/%h$x";
-            let unit = render_service(
-                Path::new("/usr/local/bin/credsd"),
-                &serve,
-                None,
-                false,
-                Some(dir),
-            );
+            let unit = render_service(Path::new("/usr/local/bin/credsd"), &serve, None, Some(dir));
             assert!(
                 unit.contains("Environment=\"CREDSD_DATA_DIR=/srv/cred sd/%%h$x\"\n"),
                 "{unit}"
             );
-            let none = render_service(
-                Path::new("/usr/local/bin/credsd"),
-                &serve,
-                None,
-                false,
-                None,
-            );
+            let none = render_service(Path::new("/usr/local/bin/credsd"), &serve, None, None);
             assert!(!none.contains("Environment="));
         }
 
@@ -2837,7 +2847,6 @@ mod linux {
                     Path::new("/usr/local/bin/credsd"),
                     &["serve".to_string()],
                     None,
-                    false,
                     Some(dir.as_str()),
                 );
                 proptest::prop_assert_eq!(
@@ -2850,7 +2859,7 @@ mod linux {
         #[test]
         fn quote_round_trips_metacharacters() {
             let weird = "/home/a b/%$\\\"\n\rx/credsd";
-            let unit = render_service(Path::new(weird), &["serve".to_string()], None, false, None);
+            let unit = render_service(Path::new(weird), &["serve".to_string()], None, None);
             let parsed = parse_exec_start(&unit);
             assert_eq!(parsed, vec![weird, "serve"]);
         }
@@ -2863,7 +2872,7 @@ mod linux {
                 binary in "[^\u{0}]{1,32}",
                 args in proptest::collection::vec("[^\u{0}]{0,16}", 0..4),
             ) {
-                let unit = render_service(Path::new(&binary), &args, None, false, None);
+                let unit = render_service(Path::new(&binary), &args, None, None);
                 let parsed = parse_exec_start(&unit);
                 let mut expected = vec![binary];
                 expected.extend(args);

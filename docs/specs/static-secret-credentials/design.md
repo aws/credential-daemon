@@ -150,7 +150,8 @@ pub struct StaticSecretConfig {
   serialize path and does not report as `Unsupported`.
 - `supported_forms()` → `&[MaterializationForm::EnvVar]` (joins the `Jwt | Oauth |
   JwtBearer` arm).
-- Human-facing name for the `creds list` MODE column.
+- Reported as `source` on `environment/describe` entries; `credential/list` rows carry
+  only name, kind and status.
 
 ### 4. `StaticSecretProvider` (`src/providers/static_secret.rs`, new)
 
@@ -269,7 +270,7 @@ With no declared expiry, `expires_at` is `null` (the field stays present):
 ```
 
 `provenance` is always `cached_shared`: the secret is served from the shared
-sealed file, never minted per request. `credential/get_batch` uses the same
+sealed file, never minted per request. `environment/credentials` uses the same
 `CredentialResult` as its element type, so a batch that names a `static-secret`
 carries exactly this element.
 

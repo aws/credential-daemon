@@ -480,7 +480,8 @@ pub const CREDSD_GROUP: &str = "credsd";
 ///
 /// This is the one constant the install renderer (systemd `ListenStream=` / launchd
 /// `SockPathName`), the client dial, and the daemon's bind fallback all read, so the three
-/// locations cannot drift. Linux uses `/run/credsd` to match systemd `RuntimeDirectory=credsd`;
+/// locations cannot drift. Linux uses `/run/credsd`, the parent systemd creates for the
+/// `.socket` unit's `ListenStream=`;
 /// macOS uses `/var/run/credsd` (launchd creates the parent when it binds the socket).
 #[cfg(unix)]
 pub fn system_socket_path() -> PathBuf {

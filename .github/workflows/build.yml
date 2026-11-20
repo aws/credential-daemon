@@ -18,7 +18,6 @@ jobs:
   build:
     name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,81 +29,62 @@ jobs:
           - os: macos-latest        # Apple Silicon (M-series)
             platform: macos-aarch64
 
-          - os: ubuntu-24.04
-            platform: ubuntu-x64
-
-          - os: ubuntu-24.04-arm
-            platform: ubuntu-aarch64
-
-          - os: ubuntu-24.04
-            platform: al2023-x64
-            container: amazonlinux:2023
-            bootstrap: dnf install -y --quiet tar git gcc
-
-          - os: ubuntu-24.04-arm
-            platform: al2023-aarch64
-            container: amazonlinux:2023
-            bootstrap: dnf install -y --quiet tar git gcc
-
-          # The `-tpm` rows ship a second artifact per distro and arch, with `credsd` linked
-          # against the system tpm2-tss libraries. They cannot replace the default rows: a
-          # binary that links tpm2-tss does not start on a host without it. See
-          # docs/design/tpm-linux-artifact.md. Container rows run as root; runner rows need
-          # sudo for the same install.
-          - os: ubuntu-24.04
-            platform: ubuntu-x64-tpm
-            bootstrap: sudo apt-get update -qq && sudo apt-get install -y -qq libtss2-dev
-            tpm: true
-
-          - os: ubuntu-24.04-arm
-            platform: ubuntu-aarch64-tpm
-            bootstrap: sudo apt-get update -qq && sudo apt-get install -y -qq libtss2-dev
-            tpm: true
-
-          - os: ubuntu-24.04
-            platform: al2023-x64-tpm
-            container: amazonlinux:2023
-            bootstrap: dnf install -y --quiet tar git gcc tpm2-tss-devel
-            tpm: true
-
-          - os: ubuntu-24.04-arm
-            platform: al2023-aarch64-tpm
-            container: amazonlinux:2023
-            bootstrap: dnf install -y --quiet tar git gcc tpm2-tss-devel
-            tpm: true
-
-          # AL2 remains in use on legacy hosts and sets the oldest glibc (2.26)
-          # credsd must run against. AL2 ships cmake 2.8, which aws-lc-sys/ring
-          # reject; cmake3 (3.17) is in amzn2-core but installs as `cmake3`,
-          # hence the symlink. gcc 7.3.1 is sufficient.
+          # The whole shipped Linux set: one portable pair per architecture plus a
+          # `-tpm` sibling, built on manylinux2014 so the glibc floor is 2.17.
+          # That floor is what let these four replace the eight per-distro rows
+          # and the two AL2 rows they grew out of — it is below AL2's 2.26, so one
+          # binary covers every host those artifacts reached and then some. See
+          # docs/design/tpm-linux-artifact.md.
           #
-          # `image` rather than `container`: these rows run the job on the host
-          # and invoke docker themselves. See the "build and test (image)" step.
+          # `image` rather than `container`: the row runs the job on the host and
+          # invokes docker itself, because the runner's JS actions need glibc 2.28
+          # and manylinux2014 has 2.17. See the "build and test" step.
+          #
+          # `glibc_floor` is what makes the claim checkable. Without that
+          # assertion a row proves only that the tree compiles somewhere old,
+          # and a newer symbol picked up from the toolchain would ship.
           - os: ubuntu-24.04
-            platform: al2-x64
-            image: amazonlinux:2
-            bootstrap: yum install -y -q tar gzip git gcc cmake3 && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+            platform: linux-x64
+            image: quay.io/pypa/manylinux2014_x86_64@sha256:e6a785657009c612fe2a85fa933051d03a50ba62b1c5e47d62abcab546a2e423 # 2026-11-17
+            glibc_floor: '2.17'
 
           - os: ubuntu-24.04-arm
-            platform: al2-aarch64
-            image: amazonlinux:2
-            bootstrap: yum install -y -q tar gzip git gcc cmake3 && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+            platform: linux-aarch64
+            image: quay.io/pypa/manylinux2014_aarch64@sha256:c2995cae5e2d433fbe757d1466486727b3edd68ba644cd60df253365f35fda9e # 2026-11-17
+            glibc_floor: '2.17'
+
+          # `bootstrap` runs inside the container and builds tpm2-tss, because the
+          # image has no package manager that still works. `host_bootstrap` runs
+          # on the runner, because the assertion steps below read the binary from
+          # the host and a tpm-linked daemon will not start without libtss2 there.
+          - os: ubuntu-24.04
+            platform: linux-x64-tpm
+            image: quay.io/pypa/manylinux2014_x86_64@sha256:e6a785657009c612fe2a85fa933051d03a50ba62b1c5e47d62abcab546a2e423 # 2026-11-17
+            bootstrap: ./scripts/manylinux-toolchain.sh
+            host_bootstrap: sudo apt-get update -qq && sudo apt-get install -y -qq libtss2-dev
+            tpm: true
+            glibc_floor: '2.17'
+
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64-tpm
+            image: quay.io/pypa/manylinux2014_aarch64@sha256:c2995cae5e2d433fbe757d1466486727b3edd68ba644cd60df253365f35fda9e # 2026-11-17
+            bootstrap: ./scripts/manylinux-toolchain.sh
+            host_bootstrap: sudo apt-get update -qq && sudo apt-get install -y -qq libtss2-dev
+            tpm: true
+            glibc_floor: '2.17'
 
     steps:
-      - name: install prerequisites
-        if: matrix.bootstrap && !matrix.image
-        run: ${{ matrix.bootstrap }}
+      # Runner-side, for `image` rows whose container bootstrap cannot reach the
+      # host the later assertion steps run the binary on. Every Linux row is an
+      # `image` row now, so there is no in-job bootstrap: a row's own bootstrap
+      # runs inside the docker invocation.
+      - name: install host prerequisites
+        if: matrix.host_bootstrap
+        run: ${{ matrix.host_bootstrap }}
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Container images have no preinstalled Rust. `--default-toolchain none`
-      # avoids downloading `stable` only to have rust-toolchain.toml's pin
-      # override it on the first in-repo cargo call.
-      - name: install rust toolchain
-        if: matrix.container
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-toolchain none
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        with:
+          persist-credentials: false
 
       # Skipped for `image` rows: the cargo home being populated lives inside the
       # container, not in the host paths this would save.
@@ -117,12 +97,6 @@ jobs:
             target/
           key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-cargo-
-
-      - name: build
-        if: ${{ !matrix.image && !matrix.tpm && !startsWith(matrix.os, 'macos') }}
-        env:
-          FEATURES: ${{ matrix.features }}
-        run: cargo build --release --locked ${FEATURES:+--features "$FEATURES"}
 
       # Two invocations for the same reason the tpm row needs them, with the opt-out on the
       # other side. The published daemon drops `secure-enclave`: this artifact's supported
@@ -143,18 +117,6 @@ jobs:
           FEATURES: ${{ matrix.features }}
         run: cargo test --locked ${FEATURES:+--features "$FEATURES"}
 
-      # Two invocations, not one. `creds` depends on `credsd-core` directly, so a single
-      # workspace build with the feature on resolves one `credsd-core` for every member and
-      # hands the client the tpm-linked rlib. Separate invocations give the two binaries two
-      # feature resolutions; the second rebuilds `credsd-core` without the feature and leaves
-      # the first invocation's `credsd` in place, so both binaries survive in target/release.
-      - name: build and test (tpm)
-        if: matrix.tpm
-        run: |
-          cargo build --release --locked -p credsd-daemon --features tpm
-          cargo build --release --locked -p creds
-          cargo test --locked -p credsd-core --features tpm
-
       # The macOS `test` step already covers `secure-enclave`, which is in the default set: the
       # shim links, the build script runs, and the feature-gated code passes against the fake
       # seam. Nothing there asserts anything about the enclave itself — `hardware_round_trip`
@@ -170,33 +132,39 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: cargo test --locked --features secure-enclave,file
 
-      # `kkrs` is off in every shipped build; this keeps the retained backend compiled and
-      # tested. Test only, never `build --release`, for the same reason as the step above.
-      # Runner rows only: container rows run under a seccomp profile that can refuse the
-      # keyring syscalls the backend's tests make.
-      - name: test (kkrs)
-        if: ${{ !matrix.image && !matrix.tpm && !matrix.container && startsWith(matrix.os, 'ubuntu') }}
-        run: cargo test --locked -p credsd-core --features kkrs
-
-      # AL2 cannot host the workflow's JS actions: the runner forces them onto
-      # Node 24, which needs glibc 2.28, and AL2 has 2.26 — the very floor this
-      # row exists to verify. So the host runs the actions and docker runs only
-      # cargo, still against a real AL2 userland.
+      # manylinux2014 cannot host the workflow's JS actions: the runner forces
+      # them onto Node 24, which needs glibc 2.28, and the image has 2.17 — the
+      # very floor these rows exist to hold. So the host runs the actions and
+      # docker runs only cargo, against a real glibc 2.17 userland.
       #
-      # The container runs as root because `yum` needs to write the RPM db, so
-      # target/ comes back root-owned; chown it so later host steps (artifact
-      # upload, cleanup) can read and remove it.
-      - name: build and test (${{ matrix.image }})
+      # The container runs as root, so target/ comes back root-owned; chown it so
+      # later host steps (the assertions, artifact upload, cleanup) can read and
+      # remove it.
+      #
+      # The tpm branch splits the build for the reason decision 3 of
+      # docs/design/tpm-linux-artifact.md gives, and points pkg-config at the
+      # prefix matrix.bootstrap installed.
+      - name: build and test (${{ matrix.platform }})
         if: matrix.image
+        env:
+          TPM: ${{ matrix.tpm }}
         run: |
-          docker run --rm -v "$PWD":/w -w /w -e CARGO_TERM_COLOR=always \
+          docker run --rm -v "$PWD":/w -w /w -e CARGO_TERM_COLOR=always -e TPM \
             ${{ matrix.image }} sh -euc '
               ${{ matrix.bootstrap }}
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --no-modify-path --default-toolchain none
               . "$HOME/.cargo/env"
-              cargo build --release --locked
-              cargo test --locked
+              if [ "${TPM:-}" = true ]; then
+                export PKG_CONFIG_PATH=/opt/tss/lib/pkgconfig
+                export LD_LIBRARY_PATH=/opt/tss/lib
+                cargo build --release --locked -p credsd-daemon --features tpm
+                cargo build --release --locked -p creds
+                cargo test --locked -p credsd-core --features tpm
+              else
+                cargo build --release --locked
+                cargo test --locked
+              fi
             '
           sudo chown -R "$(id -u):$(id -g)" target
 
@@ -220,6 +188,41 @@ jobs:
               grep -qw file <<<"$line" || fail "Linux build must ship the file backend"
               ;;
           esac
+
+      # The claim a portable row exists to make, read off the binary rather than
+      # inferred from the image it was built in. Both halves fail a build that
+      # looks green: a newer symbol picked up from the toolchain only fails on the
+      # oldest host a customer has, and a RUNPATH left by the tpm2-tss prefix
+      # sends the loader to a build-machine path — which on a host where that
+      # path is creatable is somewhere to plant a library.
+      #
+      # Non-weak symbols only. Rust std references statx, getrandom, gettid and
+      # others weakly and falls back to a syscall when the host lacks them, so a
+      # weak reference above the floor is not a floor.
+      - name: assert build-host independence
+        if: matrix.glibc_floor
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          FLOOR: ${{ matrix.glibc_floor }}
+        run: |
+          set -euo pipefail
+          for binary in creds credsd; do
+            path="target/release/$binary"
+            highest=$(readelf -W --dyn-syms "$path" \
+              | awk '$7=="UND" && $8 ~ /@GLIBC_/ && $5!="WEAK" {split($8,a,"@"); print a[2]}' \
+              | sed 's/^GLIBC_//' | sort -uV | tail -1)
+            if [ -n "$highest" ] \
+               && [ "$(printf '%s\n%s\n' "$highest" "$FLOOR" | sort -V | tail -1)" != "$FLOOR" ]; then
+              echo "::error::$PLATFORM: $binary needs glibc $highest, above the $FLOOR floor"
+              exit 1
+            fi
+            paths=$(objdump -p "$path" | awk '$1=="RUNPATH" || $1=="RPATH" {print $2}')
+            if [ -n "$paths" ]; then
+              echo "::error::$PLATFORM: $binary carries RUNPATH/RPATH $paths"
+              exit 1
+            fi
+            echo "$binary: glibc floor ${highest:-none}, no RUNPATH"
+          done
 
       # `if-no-files-found: error` cannot catch a *partial* set: it fires only when nothing
       # matches, so an artifact holding the daemon and no client still uploads green. That is
@@ -261,7 +264,7 @@ jobs:
           fi
 
       # Recorded here, on the machine that produced the binary, and in hex.
-      # macOS runners ship no `sha256sum` and the AL2/AL2023 containers ship no
+      # macOS runners ship no `sha256sum` and the AL2 container ships no
       # `shasum`, so take whichever the row has.
       - name: record binary digests
         if: inputs.upload-artifacts

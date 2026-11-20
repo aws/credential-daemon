@@ -19,7 +19,7 @@ Every client operation that needs sealed material obtains it over the UDS RPC:
 
 - `credsd import` parses the AWS shared-credentials and config files client-side — they live
   under the caller's `$HOME`, which the scoped daemon user cannot read — and sends
-  the discovered profiles to the daemon over `environment/import`. The daemon seals
+  the discovered profiles to the daemon over `credential/import`. The daemon seals
   each key pair and writes the per-uid tree, so imported credentials land where
   the daemon serves them.
 - A consumer that enumerates credentials with their freshness — run-time
@@ -28,14 +28,14 @@ Every client operation that needs sealed material obtains it over the UDS RPC:
   synchronous loop. It reads no per-uid config and opens no storage.
 
 These build on primitives the daemon already provides: `rpc::uds::call` (the
-client transport), the per-uid seal-and-write behind `environment/bootstrap`, and the
-per-uid freshness `status_of` surfaces through `list`/`describe`. `environment/import`
+client transport), the per-uid seal-and-write behind `credential/bootstrap`, and the
+per-uid freshness `status_of` surfaces through `list`/`describe`. `credential/import`
 is one new non-streaming method over those primitives, and enumeration reuses the
 existing `credential/list`.
 
 ## Key design decisions
 
-### 1. Batched `environment/import`, not a loop of `environment/bootstrap`
+### 1. Batched `credential/import`, not a loop of `credential/bootstrap`
 
 Import today is "parse the whole file once, then loop the writes." The batched
 method preserves that shape while moving the write loop server-side:
@@ -91,7 +91,7 @@ is not a core decision.
 credsd import
   └─ client: import::discover_aws_profiles(path, region)   [reads $HOME/.aws/credentials and $HOME/.aws/config]
   └─ client: build ImportParams { profiles: [ {name, akid, secret, region, itype}, … ], dry_run }
-  └─ client: rpc::uds::call(socket, "environment/import", &params, "import")
+  └─ client: rpc::uds::call(socket, "credential/import", &params, "import")
         └─ daemon dispatch → import handler:
              authorize_for_bootstrap(peer)         [auto-provisions on NoRoot]
              lock = bootstrap_lock(uid).lock().await
@@ -112,7 +112,7 @@ storage.
 
 ## Components and interfaces
 
-### 1. New method `environment/import` (`credsd-core/src/rpc/methods.rs`)
+### 1. New method `credential/import` (`credsd-core/src/rpc/methods.rs`)
 
 New `Method::ProfileImport` variant and wire types:
 
@@ -166,9 +166,9 @@ import loop call it (avoid duplicating the persist/upsert/env-append sequence).
 
 - Keep the discovery call (`import::discover_aws_profiles`) client-side.
 - Map `Discovered` → `ImportProfile`, build `ImportParams`, call
-  `rpc::uds::call(socket, "environment/import", …)`.
+  `rpc::uds::call(socket, "credential/import", …)`.
 - No client-side provisioning: the daemon auto-provisions `callers/<uid>/owner`
-  on the first authorized request, exactly as `environment/bootstrap` does.
+  on the first authorized request, exactly as `credential/bootstrap` does.
 - Print outcomes from `ImportResult` to stderr; summary line as today.
 - Drop the `EncryptionService` and `--storage-backend` usage here.
 
@@ -224,7 +224,7 @@ Wire additions live in `credsd-core/src/rpc/methods.rs` alongside the existing
 
 ## Error handling
 
-- `environment/import`: `validate_name` failure and already-exists are *per-profile
+- `credential/import`: `validate_name` failure and already-exists are *per-profile
   skips*, not batch errors. A seal or file-write failure for one profile is an
   `Internal` domain error that aborts the batch (the caller retries); the per-uid
   lock guarantees no interleaving with a concurrent write.
@@ -260,7 +260,7 @@ Wire additions live in `credsd-core/src/rpc/methods.rs` alongside the existing
 ## Security considerations
 
 - The socket now carries bulk IAM secret material on import. This is the same
-  material `environment/bootstrap` already carries for a single iam-user credential;
+  material `credential/bootstrap` already carries for a single iam-user credential;
   the wire type reuses its zeroizing/redaction. The socket is the existing
   peer-authenticated UDS — no new exposure surface.
 - Removing client storage access shrinks the key-exfiltration surface to the

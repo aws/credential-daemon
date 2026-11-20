@@ -20,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 2
 
       # HEAD is the PR merged into its base, so HEAD^1 is the base and the diff is the PR.
@@ -38,6 +39,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -71,6 +74,8 @@ jobs:
             platform: macos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -130,6 +135,13 @@ jobs:
         if: matrix.platform == 'linux'
         run: cargo clippy --all-targets --features credsd-core/kkrs -- -D warnings
 
+      # Here rather than in build.yml because the backend's tests make keyring syscalls that a
+      # container's seccomp profile can refuse, and every Linux build row now runs in one. This
+      # is the only bare Linux runner left in CI, so it is the only place the tests can run.
+      - name: test (kkrs)
+        if: matrix.platform == 'linux'
+        run: cargo test --locked -p credsd-core --features kkrs
+
   # THIRD-PARTY-LICENSES.md must track Cargo.lock. Pinned so a cargo-about release cannot
   # reformat the file and fail every PR. Reads `cargo metadata` only, so the tpm feature
   # needs no tpm2-tss headers here.
@@ -138,8 +150,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-about@0.9.3
 
@@ -174,6 +188,8 @@ jobs:
       # no install step here — the pin is what makes the command work identically
       # for developers and for CI.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -184,7 +200,7 @@ jobs:
           key: ${{ runner.os }}-coverage-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-coverage-cargo-
 
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-llvm-cov
 
@@ -210,3 +226,20 @@ jobs:
           name: coverage-lcov
           path: target/lcov.info
           if-no-files-found: error
+
+  zizmor:
+    name: Workflow audit
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read # upload-sarif reads the workflow run; required on a private repo
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          version: 1.32.0
+          min-severity: medium

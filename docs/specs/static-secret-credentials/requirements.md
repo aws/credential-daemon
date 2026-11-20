@@ -9,6 +9,14 @@ Non-Goals).
 user supplies — a bearer token, an API key, any pre-issued secret string — and
 serves it verbatim. No issuer, no exchange, no unattended renewal.
 
+## Applicability of environment criteria
+
+[credential-only-addressing](../credential-only-addressing/requirements.md)
+requirements govern the active interface. 3.3's environment-level override applies only to
+retained internal code. `creds get` exports a token under the name derived from the
+credential. `--env-var` is recorded in `credentials.toml`, but no command reads it, so it does
+not change the exported name. `environment/credentials` in 3.5 is not dispatched.
+
 ## Introduction
 
 Every credential source credsd has today either federates to AWS (SSO, IAM-user,
@@ -64,25 +72,25 @@ command-line argument. The desired flow:
 Paste interactively (secret read from a hidden prompt):
 
 ```
-$ creds bootstrap --env prod --credential openai static-secret --env-var OPENAI_API_KEY
+$ creds bootstrap --credential openai-api-key static-secret
 Paste the secret, then press Ctrl-D:
 ••••••••••••••••          (input is not echoed)
-✓ Sealed 'openai' (static-secret) in env 'prod'. Projected as env-var OPENAI_API_KEY.
+✓ Sealed 'openai-api-key' (static-secret).
 ```
 
 From a file, with a known rotation date:
 
 ```
-$ creds bootstrap --env prod --credential gh static-secret \
+$ creds bootstrap --credential gh static-secret \
     --secret-file ./gh-token.txt --expires-at 2026-12-31T00:00:00Z
-✓ Sealed 'gh' (static-secret) in env 'prod'. Projected as env-var GH; expires 2026-12-31.
+✓ Sealed 'gh' (static-secret); expires 2026-12-31.
 ```
 
 Re-running bootstrap for the same credential replaces the secret (the rotation
 path). Thereafter the value is served like any other credential:
 
 ```
-$ eval "$(creds get --env prod --credential openai --format shell)"
+$ eval "$(creds get --credential openai-api-key --format shell)"
 $ printenv OPENAI_API_KEY
 sk-...
 ```
@@ -170,7 +178,7 @@ involved.
      naming the bootstrap command that seals a secret — never a decrypt error and
      never a silently empty credential.
 
-3.5. The `credential/get` (and `credential/get_batch`) response for a
+3.5. The `credential/get` (and `environment/credentials`) response for a
      `static-secret` SHALL be the existing `CredentialResult` shape, with no new
      result or material type:
      - `credential`: the credential's name, echoed.

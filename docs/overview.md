@@ -64,7 +64,7 @@ credsd moves those secrets behind a boundary your user account does not cross:
 
 **Safely empower local AI coding agents.** Run autonomous coding assistants and local scripts
 alongside your normal developer environment without leaving readable credentials on disk or
-handing an agent unrestricted access. Give the agent's environment its own IAM role, or pair
+handing an agent unrestricted access. Give the agent its own credential and IAM role, or pair
 credsd with a sandbox such as [Strands Box](https://github.com/strands-agents/box) when the agent
 should not hold a credential at all.
 
@@ -89,8 +89,7 @@ receives and how it receives it.
 |---|---|---|
 | Vaulting | Seals long-lived secrets at rest under a master key in a hardware or OS keystore. | Chosen at install: [key security](key-security.md) |
 | Credential exchange | Trades a held secret for a short-lived credential from its issuer, and refreshes it before it expires. | `credentials.toml`, through `creds bootstrap` |
-| Environment definitions | Names a set of credentials and the settings that go with them, so a task asks for `work` rather than for each piece. | `config.toml`, through `creds config` |
-| Credential projection | Delivers each credential in the form its consumer reads: an AWS profile, an environment variable, or a credential endpoint. | The credential type's default, or a declaration in `config.toml` or `credentials.toml` |
+| Credential projection | Delivers each credential in the form its consumer reads: an AWS profile or an environment variable. | The credential type's default |
 | Lightweight authorization | Decides who may ask: kernel-verified caller identity, per-user isolation, identity-type rules, and approval for changes. | Fixed in the daemon; not configurable |
 
 ### Vaulting
@@ -125,12 +124,11 @@ a build from source with `--features jwt-bearer`. See
 [`creds bootstrap jwt-bearer`](reference/commands.md#creds-bootstrap-jwt-bearer) in the command
 reference.
 
-### Environment definitions
+### Credential addressing
 
-An environment is an ordered list of credentials plus settings: region, endpoint overrides, CA
-bundle, retry behavior, CLI output. The first credential is the default identity; the rest stay
-addressable by name. A consumer asks for `work` and receives all of it: `creds get --environment
-work` returns the default identity, and `--credential` names any other.
+A credential is addressed by its own name: `creds get --credential work` returns it under
+its own restrictions. Bootstrap creates only the credential. Environment definitions are
+currently unavailable; a `config.toml` containing one is invalid.
 
 ### Credential projection
 
@@ -143,13 +141,7 @@ delivered through one:
   config holds no secrets.
 - **`env-var`.** A token or secret under the variable its consumer reads. `creds get --format
   shell` prints it for `eval`.
-- **`credential-endpoint`.** A loopback endpoint behind a bearer token, for consumers that only
-  discover credentials that way.
-
-Each credential type has a default projection, and configuration can declare another. credsd
-defines the projections and serves `creds get`; delivering a whole environment into one child
-process — a generated config, exported variables, a resident endpoint — is left to run-time
-tooling built on the [API](reference/api.md).
+Each credential type has a fixed default projection. `creds get` serves the named credential.
 
 ### Lightweight authorization
 
@@ -157,11 +149,10 @@ The daemon decides who may ask without a policy language:
 
 - **Caller identity comes from the kernel.** The daemon reads the connecting process's uid from
   the socket. The socket takes no bearer token, so there is none to steal.
-- **Users are isolated.** Each uid has its own environments and credentials, and a request sees
+- **Users are isolated.** Each uid has its own credentials, and a request sees
   only its own. A request about something you do not own is indistinguishable from one about
   something that does not exist.
-- **Identity types bound composition.** An environment or credential is `human`, `automation`,
-  or `agent`. An environment may compose only credentials no more privileged than itself.
+- **Identity types classify credentials.** A credential is `human`, `automation`, or `agent`.
 - **Agents are recorded.** On macOS and Linux the daemon inspects the caller's process ancestry
   and records in its audit log when an agent harness is among its ancestors. `--agentic` declares
   this explicitly.
@@ -184,9 +175,9 @@ IAM role or policy behind it. credsd chooses which credential a process receives
 narrow what that credential permits. `agent` credentials are not yet scoped down and carry their
 role's full permissions.
 
-> **Planned: a scope-down ceiling.** An environment will be able to carry a ceiling that credsd
-> applies as an inline policy at issuance, through `sts:GetScopedCredentials`, so the session
-> AWS returns is already narrower than the role behind it. Because AWS applies the limit when
+> **Planned: a scope-down ceiling.** credsd will be able to apply a ceiling as an inline policy
+> at issuance, through `sts:GetScopedCredentials`, so the session AWS returns is already
+> narrower than the role behind it. Because AWS applies the limit when
 > the credential is minted rather than the daemon enforcing it locally, the limit travels with
 > the credential and nothing holding that session can widen it. This is in development and no
 > release carries it yet; the paragraph above describes current behavior.

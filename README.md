@@ -40,15 +40,15 @@ master key in a hardware-backed keystore and vends short-lived credentials from 
 
 credsd is not a general-purpose secret store: it has no API for applications to store and read
 arbitrary values, and everything it holds belongs to one user on one machine. What it does beyond
-holding secrets — exchanging credentials, composing environments, projecting each credential into
-the form its consumer reads, gating changes on approval, and the planned permission ceiling — is
-described in the [overview](docs/overview.md).
+holding secrets — exchanging credentials, projecting each credential into the form its consumer
+reads, gating changes on approval, and the planned permission ceiling — is described in the
+[overview](docs/overview.md).
 
 ## The two binaries
 
 | Binary | Role | Subcommands |
 |---|---|---|
-| `creds` | Client | `bootstrap`, `login`, `get`, `list`, `remove`, `revalidate`, `config`, `import`, `request`, `presence` |
+| `creds` | Client | `bootstrap`, `login`, `logout`, `get`, `list`, `tag`, `remove`, `revalidate`, `config`, `import`, `request`, `presence` |
 | `credsd` | Daemon | `serve`, `init`, `install`, `uninstall`, `status` |
 
 ## Choose your path

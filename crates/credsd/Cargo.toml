@@ -37,6 +37,7 @@ secure-enclave = ["credsd-core/secure-enclave"]
 jwt-bearer = ["credsd-core/jwt-bearer"]
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 
 [lints]

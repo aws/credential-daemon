@@ -125,13 +125,13 @@ credsd status
 ## Bootstrap a credential
 
 `creds bootstrap` authenticates once, has the daemon seal the long-lived secret, and verifies
-it. `--environment <name>` creates a credential and a same-named env wrapping it. The first
-bootstrap from your uid also registers you with the daemon.
+it. `--credential <name>` names the credential; bootstrap creates only the credential, no
+environment. The first bootstrap from your uid also registers you with the daemon.
 
 **IAM Identity Center (SSO):**
 
 ```bash
-creds bootstrap --environment work aws-idc-sso \
+creds bootstrap --credential work aws-idc-sso \
   --start-url https://myorg.awsapps.com/start \
   --sso-region us-east-1
 ```
@@ -141,7 +141,7 @@ Omit `--account-id` and `--role-name` to choose from the accounts and roles you 
 **IAM user key**, brokered into sessions with `sts:GetSessionToken`:
 
 ```bash
-creds bootstrap --environment legacy aws-iam-user \
+creds bootstrap --credential legacy aws-iam-user \
   --access-key-id AKIAIOSFODNN7EXAMPLE \
   --region us-east-1
 ```
@@ -150,16 +150,16 @@ The secret access key is read with echo disabled, never from an argument; piping
 secret manager works. Add `--mfa-serial <arn>` if the account requires MFA.
 
 Confirm with `creds list`. When a session can no longer renew unattended, run
-`creds login --environment work`.
+`creds login --credential work`.
 
 ## Get credentials into a process
 
-The env is always named on the command line; credsd never infers it from `$AWS_PROFILE`.
+The credential is always named on the command line; credsd never infers it from `$AWS_PROFILE`.
 `creds get` serves both a tool that reads a `credential_process` line and your own shell:
 
 ```bash
-# In ~/.aws/config:  credential_process = creds get --environment work --format credential-process
-eval "$(creds get --environment work --format shell)"
+# In ~/.aws/config:  credential_process = creds get --credential work --format credential-process
+eval "$(creds get --credential work --format shell)"
 ```
 
 Running a command with credentials delivered for it alone — a generated AWS config, a named

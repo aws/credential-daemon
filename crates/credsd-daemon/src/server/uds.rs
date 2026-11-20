@@ -271,7 +271,7 @@ async fn serve_connection(
     use crate::server::dispatch::{dispatch, Carrier};
     use credsd_core::rpc::{
         codec, BootstrapRespondParams, DomainCode, Id, Response, RpcError,
-        METHOD_PROFILE_BOOTSTRAP, METHOD_PROFILE_BOOTSTRAP_RESPOND, METHOD_PROFILE_LOGIN,
+        METHOD_CREDENTIAL_BOOTSTRAP, METHOD_CREDENTIAL_BOOTSTRAP_RESPOND, METHOD_CREDENTIAL_LOGIN,
     };
     use serde_json::Value;
     use tokio::io::AsyncWriteExt;
@@ -315,7 +315,8 @@ async fn serve_connection(
         // notification (no `id`) that routes into the respond_slot rather than dispatch.
         // We peek at the raw JSON to check method and id presence without a full decode.
         if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&line) {
-            if raw.get("method").and_then(|m| m.as_str()) == Some(METHOD_PROFILE_BOOTSTRAP_RESPOND)
+            if raw.get("method").and_then(|m| m.as_str())
+                == Some(METHOD_CREDENTIAL_BOOTSTRAP_RESPOND)
                 && raw.get("id").is_none()
             {
                 let params_val = raw
@@ -329,7 +330,7 @@ async fn serve_connection(
                             let _ = tx.send(params.selection);
                         } else {
                             tracing::warn!(
-                                "environment/bootstrap/respond received with no in-flight bootstrap"
+                                "credential/bootstrap/respond received with no in-flight bootstrap"
                             );
                         }
                     }
@@ -353,7 +354,9 @@ async fn serve_connection(
         };
 
         // Bootstrap and login are streamed via spawned tasks.
-        if request.method == METHOD_PROFILE_BOOTSTRAP || request.method == METHOD_PROFILE_LOGIN {
+        if request.method == METHOD_CREDENTIAL_BOOTSTRAP
+            || request.method == METHOD_CREDENTIAL_LOGIN
+        {
             if bootstrap_in_flight.swap(true, Ordering::SeqCst) {
                 let response: Response<Value> = Response::failure(
                     request.id,
@@ -371,19 +374,27 @@ async fn serve_connection(
             // Per-uid cap: only one login in flight per uid across all connections.
             // A device flow can block for up to 5 minutes; without this cap a single uid
             // opening many connections could flood the daemon with long-lived tasks.
-            let Some(claim) = peer.uid.and_then(|uid| daemon.claim_login(uid)) else {
-                bootstrap_in_flight.store(false, Ordering::SeqCst);
-                let response: Response<Value> = Response::failure(
-                    request.id,
+            // A peer with no uid fails the access check the handler would make, so it misses
+            // the same way here rather than as a busy slot it never had.
+            let claim = match peer.uid {
+                None => Err(crate::server::dispatch::credential_not_found()),
+                Some(uid) => daemon.claim_login(uid).ok_or_else(|| {
                     RpcError::domain(
                         DomainCode::ProviderUnavailable,
                         "a login is already in progress for this identity",
-                    ),
-                );
-                if let Ok(bytes) = codec::encode_response(&response) {
-                    let _ = write_tx.send(bytes).await;
+                    )
+                }),
+            };
+            let claim = match claim {
+                Ok(claim) => claim,
+                Err(error) => {
+                    bootstrap_in_flight.store(false, Ordering::SeqCst);
+                    let response: Response<Value> = Response::failure(request.id, error);
+                    if let Ok(bytes) = codec::encode_response(&response) {
+                        let _ = write_tx.send(bytes).await;
+                    }
+                    continue;
                 }
-                continue;
             };
 
             let req = request.clone();
@@ -397,7 +408,7 @@ async fn serve_connection(
             let final_tx = write_tx.clone();
 
             bootstrap_task = Some(tokio::spawn(async move {
-                let result = if method == METHOD_PROFILE_BOOTSTRAP {
+                let result = if method == METHOD_CREDENTIAL_BOOTSTRAP {
                     handle_profile_bootstrap(&req, &peer_c, &daemon_c, notif_tx, slot).await
                 } else {
                     handle_profile_login(&req, &peer_c, &daemon_c, notif_tx, slot).await
@@ -553,7 +564,7 @@ mod tests {
     async fn client_and_daemon_round_trip_over_a_real_socket() {
         use crate::server::dispatch::Daemon;
         use credsd_core::config::credentials::{CredentialSource, CredentialSources};
-        use credsd_core::config::{DaemonConfig, EnvConfig, SsoConfig};
+        use credsd_core::config::{DaemonConfig, SsoConfig};
         use credsd_core::credentials::{CredentialData, Credentials};
         use credsd_core::wire::ClaimedIdentity;
         use std::sync::Arc;
@@ -581,26 +592,16 @@ mod tests {
                 account_id: "111111111111".into(),
                 role_name: role.into(),
                 identity_type: Default::default(),
+                allowed_roles: Vec::new(),
             })
         };
 
-        let mut config = DaemonConfig::default();
-        config.envs.insert("dev".into(), EnvConfig::default());
-        // The atom/group scheme: an env whose name is NOT the name of the credential it
-        // composes. Resolving `ra-main` requires naming `work` as the authorization context.
-        config.envs.insert(
-            "work".into(),
-            EnvConfig {
-                credentials: vec!["ra-main".into()],
-                ..Default::default()
-            },
-        );
+        let config = DaemonConfig::default();
         let mut sources = CredentialSources::default();
         sources.insert("dev".into(), sso("Developer"));
         sources.insert("ra-main".into(), sso("Main"));
         let store = Arc::new(crate::credential_store::CredentialStore::new(
             uid,
-            &config,
             &sources,
             encryption.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
@@ -632,7 +633,7 @@ mod tests {
         let listener = prepare_socket(&socket).unwrap();
         tokio::spawn(async move { serve(listener, daemon).await.ok() });
 
-        let creds = credsd_core::credential_resolve::fetch_from_daemon_uds(
+        let creds = credsd_core::credential_resolve::fetch_credential(
             &socket,
             "dev",
             ClaimedIdentity::Unstated,
@@ -647,47 +648,31 @@ mod tests {
             other => panic!("expected session credentials, got {other:?}"),
         }
 
-        // The atom/group path `credsd exec` relies on: a generated `credential_process` line
-        // (`credsd get --env work --credential ra-main`) names the credential and its env
-        // together, so the daemon resolves a credential whose name is not itself an env. This
-        // is what the transport swap regressed when the client dropped the env context.
-        let composed = credsd_core::credential_resolve::fetch_credential_in_env(
+        // The second credential is independently reachable by name.
+        let by_name = credsd_core::credential_resolve::fetch_credential(
             &socket,
-            "work",
             "ra-main",
             ClaimedIdentity::Unstated,
         )
         .await
-        .expect("a credential must resolve under its env's authority");
-        match &composed.data {
+        .expect("a credential must resolve by name with no environment");
+        match &by_name.data {
             CredentialData::SessionCredentials { access_key, .. } => {
                 assert_eq!(access_key, "AKIAI44QH8DHBEXAMPLE")
             }
             other => panic!("expected session credentials, got {other:?}"),
         }
 
-        // The bare credential name is not itself an env, so a request that omits the env
-        // context cannot reach it — indistinguishable from an absent subject.
-        let no_context = credsd_core::credential_resolve::fetch_from_daemon_uds(
-            &socket,
-            "ra-main",
-            ClaimedIdentity::Unstated,
-        )
-        .await;
-        assert!(matches!(
-            no_context,
-            Err(credsd_core::error::DaemonError::EnvNotFound(_))
-        ));
-
-        // An unknown profile maps back through the wire to the env-not-found the CLI branches on.
-        let miss = credsd_core::credential_resolve::fetch_from_daemon_uds(
+        // A credential-addressed miss is `CREDENTIAL_NOT_FOUND` on the wire, which the client
+        // maps to the same not-found error the CLI already branches on.
+        let unknown = credsd_core::credential_resolve::fetch_credential(
             &socket,
             "nope",
             ClaimedIdentity::Unstated,
         )
         .await;
         assert!(matches!(
-            miss,
+            unknown,
             Err(credsd_core::error::DaemonError::EnvNotFound(_))
         ));
     }
@@ -701,5 +686,68 @@ mod tests {
     #[test]
     fn socket_modes_non_system_path_is_user_only() {
         assert_eq!(socket_modes(Path::new("/tmp/test.sock")), (0o700, 0o600));
+    }
+
+    /// On the wire, a login or bootstrap from a peer whose credentials could not be read misses
+    /// as an unknown credential, the one answer every failed access check gets (Requirement 8
+    /// AC 7-8), not as a busy login slot.
+    #[tokio::test]
+    async fn a_peerless_login_or_bootstrap_misses_as_an_unknown_credential() {
+        use crate::server::routes::{CallerAuth, DenyReason, PeerInfo};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        for method in [
+            credsd_core::rpc::METHOD_CREDENTIAL_LOGIN,
+            credsd_core::rpc::METHOD_CREDENTIAL_BOOTSTRAP,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let callers_root = tmp.path().join("callers");
+            let encryption = std::sync::Arc::new(
+                credsd_core::encryption::EncryptionService::new(
+                    credsd_core::encryption::generate_key().unwrap(),
+                )
+                .unwrap(),
+            );
+            let daemon = crate::server::dispatch::Daemon::new(
+                encryption,
+                callers_root.clone(),
+                crate::server::presence::RegistryCustody::beside(&callers_root),
+                crate::server::integrity::IntegrityCustody::beside(&callers_root),
+            );
+            let peer = PeerInfo {
+                uid: None,
+                pid: None,
+                auth: CallerAuth::Denied(DenyReason::NoPeerCred),
+                executable: None,
+                login_uid: None,
+            };
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let serving = tokio::spawn(serve_connection(server, peer, daemon));
+            let (read, mut write) = client.into_split();
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method,
+                "params": {"credential": "work"},
+            });
+            write
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut line = String::new();
+            tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                response["error"]["data"]["code"], "CREDENTIAL_NOT_FOUND",
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"], "credential not found",
+                "{method}"
+            );
+            drop(write);
+            serving.abort();
+        }
     }
 }

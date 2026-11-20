@@ -228,7 +228,7 @@ impl<'de> Deserialize<'de> for ProjectionDecl {
         Self::split(&raw, |t| {
             Ok(t.parse().unwrap_or(ProjectionType::Unsupported))
         })
-        .map_err(serde::de::Error::custom)
+        .map_err(|e| serde::de::Error::custom(e.detail()))
     }
 }
 

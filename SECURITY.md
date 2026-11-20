@@ -29,10 +29,10 @@ This project handles AWS credentials and cryptographic key material. The
 following are in scope for security reports:
 
 - Credential exposure (plaintext leaks, insufficient zeroization)
-- Authentication bypass (HMAC, bearer token, IMDSv2 session)
+- Authentication bypass (kernel-verified caller identity, presence approval)
 - Encryption weaknesses (key derivation, storage, envelope model)
 - Privilege escalation (daemon user boundary, sandbox escape)
-- Local network attacks (SSRF via loopback, cross-user credential access)
+- Cross-user credential access
 
 ## Process Hardening
 
@@ -139,7 +139,7 @@ which controls took effect.
 
 ## OAuth Loopback Callback — Fixed Port
 
-`--callback-port` (for `creds bootstrap aws-login`) binds a fixed loopback port so the
+`--callback-port` (for `creds bootstrap aws-web-identity`) binds a fixed loopback port so the
 redirect URI can be pre-registered with IdPs that require an exact URI match (e.g.
 Cognito). This narrows the attack surface for the callback relative to a random ephemeral
 port:

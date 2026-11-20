@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c41518991a608b54d75f79954553a2bf304d79d43b9759d67fc9cb5c6222f068 # shrinks to pairs = [], malformed = "0:A"
+cc 147a49000c2234e030492dc441113827b60c2b74940c4428aad4ab286fb82967 # shrinks to rows = [("a", Active, {"a": " "})]
+cc d103ea3e1a1d74691ffd9662f1c1b4196357fa7edd3ce84c1c33d6c29e69d7e0 # shrinks to pairs = {"0a": ""}, dup = Some(Index(0)), upper = true

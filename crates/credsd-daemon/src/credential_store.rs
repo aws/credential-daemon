@@ -10,7 +10,6 @@ use tracing::{error, info, warn};
 
 use crate::config::credentials::{CredentialSource, CredentialSources};
 use crate::config::platform::caller_root;
-use crate::config::DaemonConfig;
 use crate::credentials::Credentials;
 use crate::encryption::EncryptionService;
 use crate::providers::aws_login::AwsLoginProvider;
@@ -71,12 +70,11 @@ pub struct CredentialStore {
     /// per caller so a serve-time lookup is impossible without a kernel-verified caller
     /// dimension. In single-user runs there is exactly one uid, so this collapses to the
     /// previous one-entry-per-credential behavior.
-    cache: Arc<RwLock<HashMap<(u32, String), Credentials>>>,
-    /// One turn lock per `(uid, credential)`, so concurrent renewals of a credential queue
-    /// rather than racing on its rotating refresh token. See `renew_single_flight`.
+    cache: Arc<RwLock<HashMap<CacheKey, Credentials>>>,
+    /// One turn lock per credential, so concurrent renewals of it, whatever pair each asks for,
+    /// queue rather than racing on its rotating refresh token. See `renew_single_flight`.
     renew_turns: std::sync::Mutex<RenewTurns>,
     providers: Arc<HashMap<String, Box<dyn CredentialProvider>>>,
-    env_to_credentials: Arc<HashMap<String, Vec<String>>>,
     /// Credentials any configured env references — the set warmed by the background loop.
     /// Ad-hoc-only credentials (built as providers but referenced by no env) are refreshed
     /// only once fetched on demand, so an unused credential costs no refresh traffic.
@@ -104,7 +102,13 @@ pub(crate) fn records_verified() -> RecordsCheck {
     Arc::new(|_, _| Ok(()))
 }
 
+/// Keyed by `(uid, credential)`, not by pair: one credential's pairs share its rotating refresh
+/// token, and a key per pair would let a caller grow this map with every pair it names.
 type RenewTurns = HashMap<(u32, String), Arc<tokio::sync::Mutex<()>>>;
+
+/// `(uid, credential, pair)`, where `pair` is a selected `(account_id, role_name)` and `None` is
+/// the credential's stored one (credential-retrieval-api Requirement 17 AC 6).
+type CacheKey = (u32, String, Option<(String, String)>);
 
 /// A renewal's claim on the caller's write lock.
 ///
@@ -140,27 +144,18 @@ fn servable(creds: &Credentials) -> bool {
 impl CredentialStore {
     pub fn new(
         uid: u32,
-        config: &DaemonConfig,
         credentials: &CredentialSources,
         encryption: Arc<EncryptionService>,
         bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
         records_check: RecordsCheck,
     ) -> Self {
         let mut providers: HashMap<String, Box<dyn CredentialProvider>> = HashMap::new();
-        let mut env_to_credentials: HashMap<String, Vec<String>> = HashMap::new();
-        let mut warm_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every defined credential is warmed: a credential is served by name whether or not an
+        // env composes it (credential-retrieval-api Requirement 16 AC 4).
+        let warm_set: std::collections::HashSet<String> = credentials.keys().cloned().collect();
 
-        for (env_name, env) in &config.envs {
-            let creds = env.credential_list(env_name);
-            for c in &creds {
-                warm_set.insert(c.clone());
-            }
-            env_to_credentials.insert(env_name.clone(), creds);
-        }
-
-        // Build a provider for every DEFINED credential (not just env-referenced ones), so
-        // ad-hoc composition can address any credential. Unused ones cost a struct, not
-        // traffic — the background loop only warms `warm_set`.
+        // Build a provider for every defined credential, so any credential is addressable by
+        // name.
         for (credential_name, source) in credentials {
             let credential_name = credential_name.clone();
             match source {
@@ -290,27 +285,29 @@ impl CredentialStore {
             cache: Arc::new(RwLock::new(HashMap::new())),
             renew_turns: std::sync::Mutex::new(HashMap::new()),
             providers: Arc::new(providers),
-            env_to_credentials: Arc::new(env_to_credentials),
             warm_set: Arc::new(warm_set),
             bootstrap_lock,
             records_check,
         }
     }
 
-    /// Resolve an env to its **default** (first) credential — the ambient identity the
-    /// container endpoint serves. Named credentials within the env are fetched individually
-    /// via [`CredentialStore::get_credential`].
-    pub async fn get(&self, uid: u32, env: &str) -> Lookup {
-        match self.env_to_credentials.get(env).and_then(|c| c.first()) {
-            Some(credential) => self.get_by_credential(uid, credential).await,
-            None => Lookup::Unknown,
-        }
-    }
-
     /// Resolve a single credential by name, independent of any env. This is what
     /// `credential_process` (`credsd get --credential X`) and ad-hoc composition carry.
     pub async fn get_credential(&self, uid: u32, credential: &str) -> Lookup {
-        self.get_by_credential(uid, credential).await
+        self.get_by_credential(uid, credential, None).await
+    }
+
+    /// Resolve another account and role of a credential's sign-in. A source with no role choice
+    /// is a miss, never its stored material.
+    pub async fn get_role_credential(
+        &self,
+        uid: u32,
+        credential: &str,
+        account_id: &str,
+        role_name: &str,
+    ) -> Lookup {
+        self.get_by_credential(uid, credential, Some((account_id, role_name)))
+            .await
     }
 
     /// Renew `key` if `due` says the cached entry (or its absence) needs it. Callers queue on a
@@ -319,13 +316,13 @@ impl CredentialStore {
     /// `None` means the entry was already fresh enough by the time the lock was taken.
     async fn renew_single_flight(
         &self,
-        key: &(u32, String),
+        key: &CacheKey,
         renewer: &dyn Renewer,
         due: impl Fn(Option<&Credentials>) -> bool,
     ) -> crate::error::Result<Option<Renewed>> {
         let turn = {
             let mut turns = self.renew_turns.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(turns.entry(key.clone()).or_default())
+            Arc::clone(turns.entry((key.0, key.1.clone())).or_default())
         };
         let _turn = turn.lock().await;
 
@@ -358,20 +355,43 @@ impl CredentialStore {
                 "renewal deferred: {} ({}s)",
                 match expired {
                     crate::server::write_lock::Expired::Wait =>
-                        "a bootstrap, import, or login for this user is in progress",
+                        "another write for this user is in progress",
                     crate::server::write_lock::Expired::Hold => "the provider did not answer",
                 },
                 expired.limit(RENEWAL_LOCK_BUDGET).as_secs(),
             ))
         })??;
         if let Renewed::Ready(creds) = &renewed {
-            self.cache.write().await.insert(key.clone(), creds.clone());
+            // An expired entry is never served, so it goes: what stays is unexpired material for
+            // pairs the sign-in actually granted, which Identity Center bounds, not the caller.
+            let mut cache = self.cache.write().await;
+            cache.retain(|_, c| !c.is_expired());
+            cache.insert(key.clone(), creds.clone());
         }
         Ok(Some(renewed))
     }
 
-    async fn get_by_credential(&self, uid: u32, credential: &str) -> Lookup {
-        let key = (uid, credential.to_string());
+    async fn get_by_credential(
+        &self,
+        uid: u32,
+        credential: &str,
+        pair: Option<(&str, &str)>,
+    ) -> Lookup {
+        let provider = self.providers.get(credential);
+        let selected = match pair {
+            Some((account_id, role_name)) => {
+                match provider.and_then(|p| p.role_renewer(account_id, role_name)) {
+                    Some(renewer) => Some(renewer),
+                    None => return Lookup::Unknown,
+                }
+            }
+            None => None,
+        };
+        let key = (
+            uid,
+            credential.to_string(),
+            pair.map(|(a, r)| (a.to_owned(), r.to_owned())),
+        );
         {
             let cache = self.cache.read().await;
             if let Some(creds) = cache.get(&key).filter(|c| servable(c)) {
@@ -387,7 +407,11 @@ impl CredentialStore {
         // dead credentials until the next successful renewal.
         let mut reauth: Option<ReauthInput> = None;
         let mut failure: Option<String> = None;
-        if let Some(renewer) = self.providers.get(credential).and_then(|p| p.renewer()) {
+        let renewer = match &selected {
+            Some(renewer) => Some(renewer.as_ref()),
+            None => provider.and_then(|p| p.renewer()),
+        };
+        if let Some(renewer) = renewer {
             match self
                 .renew_single_flight(&key, renewer, |c| !c.is_some_and(servable))
                 .await
@@ -438,7 +462,7 @@ impl CredentialStore {
                 let Some(renewer) = provider.renewer() else {
                     continue;
                 };
-                let key = (uid, name.clone());
+                let key = (uid, name.clone(), None);
 
                 let due = |cached: Option<&Credentials>| match cached {
                     // Already warm: refresh as it nears expiry. Only a stated expiry can be near
@@ -446,8 +470,7 @@ impl CredentialStore {
                     Some(creds) => creds
                         .expires_at
                         .is_some_and(|at| at.signed_duration_since(Utc::now()).num_minutes() <= 15),
-                    // Cold: pre-warm only credentials a configured env references. An ad-hoc-only
-                    // credential is left cold until first fetched on demand.
+                    // Cold: pre-warm every defined credential.
                     None => self.warm_set.contains(name),
                 };
                 match self.renew_single_flight(&key, renewer, due).await {
@@ -476,7 +499,7 @@ impl CredentialStore {
                 .into_iter()
                 .collect();
         let cache = self.cache.read().await;
-        for (uid, _) in cache.keys() {
+        for (uid, _, _) in cache.keys() {
             uids.insert(*uid);
         }
         uids
@@ -500,7 +523,7 @@ impl CredentialStore {
         self.cache
             .write()
             .await
-            .insert((uid, credential.to_string()), creds);
+            .insert((uid, credential.to_string(), None), creds);
     }
 
     #[cfg(test)]
@@ -508,7 +531,7 @@ impl CredentialStore {
         // Use try_write for non-async test contexts; fallback to a new runtime.
         // This is only for tests — production code uses the async path.
         if let Ok(mut cache) = self.cache.try_write() {
-            cache.insert((uid, credential.to_string()), creds);
+            cache.insert((uid, credential.to_string(), None), creds);
         }
     }
 }
@@ -517,24 +540,13 @@ impl CredentialStore {
 mod tests {
     use super::*;
     use crate::config::credentials::CredentialSource;
-    use crate::config::{EnvConfig, SsoConfig};
+    use crate::config::SsoConfig;
 
     /// A fixed caller uid for the store tests. The cache is partitioned by uid, so every
     /// seed/read must agree on one; production supplies the kernel-verified peer uid.
     const TEST_UID: u32 = 501;
 
-    fn store_for(envs: &[(&str, Option<&str>)], credential_names: &[&str]) -> CredentialStore {
-        let mut config = DaemonConfig::default();
-        for (name, credential) in envs {
-            config.envs.insert(
-                name.to_string(),
-                EnvConfig {
-                    credential: credential.map(String::from),
-                    ..Default::default()
-                },
-            );
-        }
-
+    fn store_for(credential_names: &[&str]) -> CredentialStore {
         let credentials: CredentialSources = credential_names
             .iter()
             .map(|name| {
@@ -546,6 +558,7 @@ mod tests {
                         account_id: "111111111111".into(),
                         role_name: "Developer".into(),
                         identity_type: Default::default(),
+                        allowed_roles: Vec::new(),
                     }),
                 )
             })
@@ -555,7 +568,6 @@ mod tests {
         let encryption = Arc::new(crate::encryption::EncryptionService::new(key).unwrap());
         CredentialStore::new(
             TEST_UID,
-            &config,
             &credentials,
             encryption,
             Arc::new(tokio::sync::Mutex::new(())),
@@ -671,6 +683,158 @@ mod tests {
         assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// A renewer that mints material naming its pair, and records how many renewals overlap.
+    struct Minting {
+        pair: (String, String),
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        renewals: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::providers::Renewer for Minting {
+        async fn renew(&self) -> crate::error::Result<Renewed> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.running.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            self.renewals.fetch_add(1, SeqCst);
+            tokio::task::yield_now().await;
+            self.running.fetch_sub(1, SeqCst);
+            Ok(Renewed::Ready(Credentials::session(
+                format!("{}/{}", self.pair.0, self.pair.1),
+                "SK".into(),
+                "TOK".into(),
+                credsd_core::credentials::expires_in_seconds(3600),
+            )))
+        }
+    }
+    /// Stands in for an `aws-idc-sso` provider: a stored pair, and any other pair on request.
+    struct RoleProvider {
+        default: Minting,
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        renewals: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl RoleProvider {
+        fn new() -> Self {
+            let [running, peak, renewals] =
+                std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+            Self {
+                default: Minting {
+                    pair: ("111111111111".into(), "Admin".into()),
+                    running: Arc::clone(&running),
+                    peak: Arc::clone(&peak),
+                    renewals: Arc::clone(&renewals),
+                },
+                running,
+                peak,
+                renewals,
+            }
+        }
+    }
+    impl CredentialProvider for RoleProvider {
+        fn renewer(&self) -> Option<&dyn crate::providers::Renewer> {
+            Some(&self.default)
+        }
+        fn role_renewer<'a>(
+            &'a self,
+            account_id: &'a str,
+            role_name: &'a str,
+        ) -> Option<Box<dyn crate::providers::Renewer + 'a>> {
+            Some(Box::new(Minting {
+                pair: (account_id.into(), role_name.into()),
+                running: Arc::clone(&self.running),
+                peak: Arc::clone(&self.peak),
+                renewals: Arc::clone(&self.renewals),
+            }))
+        }
+        fn mode_name(&self) -> &'static str {
+            "roles"
+        }
+    }
+
+    fn access_key(lookup: Lookup) -> String {
+        match lookup {
+            Lookup::Ready(creds) => match creds.data {
+                credsd_core::credentials::CredentialData::SessionCredentials {
+                    ref access_key,
+                    ..
+                } => access_key.clone(),
+                _ => panic!("expected session credentials"),
+            },
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    /// Each pair of one sign-in is its own cache entry, so no pair is served another's material,
+    /// and the pairs renew in turn under the caller's write lock, so they never race on the shared
+    /// refresh token (credential-retrieval-api Requirement 17 AC 6).
+    #[tokio::test]
+    async fn each_selected_role_is_cached_apart_and_renews_in_turn() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let provider = RoleProvider::new();
+        let (peak, renewals) = (Arc::clone(&provider.peak), Arc::clone(&provider.renewals));
+        let store = store_with_provider("sso.acme", Box::new(provider));
+
+        let (stored, read_only, other) = tokio::join!(
+            store.get_credential(TEST_UID, "sso.acme"),
+            store.get_role_credential(TEST_UID, "sso.acme", "222222222222", "ReadOnly"),
+            store.get_role_credential(TEST_UID, "sso.acme", "333333333333", "ReadOnly"),
+        );
+        assert_eq!(access_key(stored), "111111111111/Admin");
+        assert_eq!(access_key(read_only), "222222222222/ReadOnly");
+        assert_eq!(access_key(other), "333333333333/ReadOnly");
+        assert_eq!(peak.load(SeqCst), 1, "renewals of one sign-in overlapped");
+        assert_eq!(renewals.load(SeqCst), 3);
+
+        let again = store
+            .get_role_credential(TEST_UID, "sso.acme", "222222222222", "ReadOnly")
+            .await;
+        assert_eq!(access_key(again), "222222222222/ReadOnly");
+        assert_eq!(renewals.load(SeqCst), 3, "a cached pair renewed again");
+    }
+
+    /// A caller naming ever more pairs grows neither the turn locks, which are one per
+    /// credential however many pairs it is asked for, nor the cache past what has not expired.
+    #[tokio::test]
+    async fn distinct_pairs_leave_one_turn_lock_and_no_expired_entries() {
+        let store = store_with_provider("sso.acme", Box::new(RoleProvider::new()));
+        let expired = (
+            TEST_UID,
+            "sso.acme".to_string(),
+            Some(("999999999999".to_string(), "Old".to_string())),
+        );
+        let mut dead = session_creds();
+        dead.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        store.cache.write().await.insert(expired.clone(), dead);
+
+        for account in 200_000_000_000u64..200_000_000_016 {
+            store
+                .get_role_credential(TEST_UID, "sso.acme", &account.to_string(), "ReadOnly")
+                .await;
+        }
+        assert_eq!(store.renew_turns.lock().unwrap().len(), 1);
+        assert!(!store.cache.read().await.contains_key(&expired));
+    }
+
+    /// A source with no role choice never falls back to its stored material for a selected pair:
+    /// the lookup is a miss and nothing renews.
+    #[tokio::test]
+    async fn a_selected_role_on_a_source_without_roles_serves_nothing() {
+        let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = store_with_provider(
+            "ra",
+            Box::new(CountingProvider(Counting(Arc::clone(&renewals)))),
+        );
+        store
+            .inject_for_test_async(TEST_UID, "ra", session_creds())
+            .await;
+        assert!(store
+            .get_role_credential(TEST_UID, "ra", "222222222222", "ReadOnly")
+            .await
+            .is_unknown());
+        assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// A re-auth-only source: no unattended renewal, so `refresher()` yields `None`. Stands in
     /// for a provider whose only path to a new credential is its (interactive) auth process.
     struct ReauthOnly;
@@ -692,15 +856,12 @@ mod tests {
     ) -> CredentialStore {
         let mut providers: HashMap<String, Box<dyn CredentialProvider>> = HashMap::new();
         providers.insert(credential.to_string(), provider);
-        let mut env_to_credentials = HashMap::new();
-        env_to_credentials.insert(credential.to_string(), vec![credential.to_string()]);
         let mut warm_set = std::collections::HashSet::new();
         warm_set.insert(credential.to_string());
         CredentialStore {
             cache: Arc::new(RwLock::new(HashMap::new())),
             renew_turns: std::sync::Mutex::new(HashMap::new()),
             providers: Arc::new(providers),
-            env_to_credentials: Arc::new(env_to_credentials),
             warm_set: Arc::new(warm_set),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             records_check: records_verified(),
@@ -755,11 +916,11 @@ mod tests {
     #[tokio::test]
     async fn renewal_error_without_cache_is_unavailable_with_cause() {
         let store = store_with_provider("ra", Box::new(FailingProvider));
-        match store.get(TEST_UID, "ra").await {
+        match store.get_credential(TEST_UID, "ra").await {
             Lookup::Unavailable(cause) => {
                 assert!(cause.contains("status 403"), "cause: {cause}");
                 // The client adds its own prefix; the cause must not carry one too.
-                assert!(!cause.contains("provider error"), "cause: {cause}");
+                assert_eq!(credsd_core::error::prefixes(&cause), 0, "cause: {cause}");
             }
             _ => panic!("expected Unavailable"),
         }
@@ -809,7 +970,7 @@ mod tests {
         store
             .inject_for_test_async(TEST_UID, "ra", session_creds())
             .await;
-        assert!(store.get(TEST_UID, "ra").await.is_ready());
+        assert!(store.get_credential(TEST_UID, "ra").await.is_ready());
     }
 
     /// A `ReauthRequired` renewal serves a still-valid cached credential (it is not an error)
@@ -820,7 +981,7 @@ mod tests {
         store
             .inject_for_test_async(TEST_UID, "sso", session_creds())
             .await;
-        assert!(store.get(TEST_UID, "sso").await.is_ready());
+        assert!(store.get_credential(TEST_UID, "sso").await.is_ready());
 
         let expired = Credentials::session(
             "AK".into(),
@@ -830,7 +991,7 @@ mod tests {
         );
         store.inject_for_test_async(TEST_UID, "sso", expired).await;
         // Exhausted renewer + no valid cache now surfaces as a re-auth challenge, not a bare miss.
-        assert!(store.get(TEST_UID, "sso").await.is_reauth());
+        assert!(store.get_credential(TEST_UID, "sso").await.is_reauth());
     }
 
     /// The background loop treats `ReauthRequired` as "leave it alone" — it does not clobber a
@@ -847,7 +1008,7 @@ mod tests {
                 .cache
                 .read()
                 .await
-                .get(&(TEST_UID, "sso".to_string()))
+                .get(&(TEST_UID, "sso".to_string(), None))
                 .unwrap()
                 .expires_at,
             expires_at
@@ -859,7 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn reauth_only_miss_returns_none() {
         let store = store_with_provider("manual", Box::new(ReauthOnly));
-        assert!(store.get(TEST_UID, "manual").await.is_unknown());
+        assert!(store.get_credential(TEST_UID, "manual").await.is_unknown());
     }
 
     /// While a valid credential still sits in cache (seeded by an earlier interactive setup),
@@ -870,7 +1031,7 @@ mod tests {
         store
             .inject_for_test_async(TEST_UID, "manual", session_creds())
             .await;
-        assert!(store.get(TEST_UID, "manual").await.is_ready());
+        assert!(store.get_credential(TEST_UID, "manual").await.is_ready());
     }
 
     /// The background loop skips a re-auth-only source structurally: it never renews, so an
@@ -882,51 +1043,12 @@ mod tests {
         assert!(store.cache.read().await.is_empty());
     }
 
-    /// The observable payoff of the env/credential split: one login serves every
-    /// env naming it, so seeding the credential once satisfies both envs.
-    #[tokio::test]
-    async fn envs_sharing_a_credential_share_one_cache_entry() {
-        let store = store_for(
-            &[("dev", Some("shared")), ("dev-tokyo", Some("shared"))],
-            &["shared"],
-        );
-        store
-            .inject_for_test_async(TEST_UID, "shared", session_creds())
-            .await;
-
-        assert!(store.get(TEST_UID, "dev").await.is_ready());
-        assert!(store.get(TEST_UID, "dev-tokyo").await.is_ready());
-        assert_eq!(store.cache.read().await.len(), 1);
-        assert_eq!(store.providers.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_env_without_an_explicit_credential_uses_its_own_name() {
-        let store = store_for(&[("dev", None)], &["dev"]);
-        store
-            .inject_for_test_async(TEST_UID, "dev", session_creds())
-            .await;
-        assert!(store.get(TEST_UID, "dev").await.is_ready());
-    }
-
-    /// Entering by credential name rather than env name must not work — the HTTP API
-    /// and `credential_process` both carry env names, and the mapping is the
-    /// authorization boundary.
-    #[tokio::test]
-    async fn a_credential_name_is_not_a_env_name() {
-        let store = store_for(&[("dev", Some("shared"))], &["shared"]);
-        store
-            .inject_for_test_async(TEST_UID, "shared", session_creds())
-            .await;
-        assert!(store.get(TEST_UID, "shared").await.is_unknown());
-    }
-
     /// A renewal that can't produce fresh creds must not serve an expired cache entry. The SSO
     /// provider has no token on disk here, so it returns `ReauthRequired`; without the expiry
     /// filter the daemon would serve the dead session instead of signalling re-auth.
     #[tokio::test]
     async fn expired_cached_creds_are_not_served_when_fetch_fails() {
-        let store = store_for(&[("dev", None)], &["dev"]);
+        let store = store_for(&["dev"]);
         let expired = Credentials::session(
             "AK".into(),
             "SK".into(),
@@ -934,14 +1056,14 @@ mod tests {
             Utc::now() - chrono::Duration::hours(1),
         );
         store.inject_for_test_async(TEST_UID, "dev", expired).await;
-        assert!(store.get(TEST_UID, "dev").await.is_reauth());
+        assert!(store.get_credential(TEST_UID, "dev").await.is_reauth());
     }
 
     /// The same failing-fetch path still serves a cache entry that is stale-but-valid, so a
     /// transient provider error does not needlessly drop still-good credentials.
     #[tokio::test]
     async fn valid_cached_creds_are_served_when_fetch_fails() {
-        let store = store_for(&[("dev", None)], &["dev"]);
+        let store = store_for(&["dev"]);
         let near = Credentials::session(
             "AK".into(),
             "SK".into(),
@@ -949,21 +1071,19 @@ mod tests {
             Utc::now() + chrono::Duration::seconds(30),
         );
         store.inject_for_test_async(TEST_UID, "dev", near).await;
-        assert!(store.get(TEST_UID, "dev").await.is_ready());
+        assert!(store.get_credential(TEST_UID, "dev").await.is_ready());
     }
 
-    /// Every defined credential gets a provider — so ad-hoc composition (`--credential X`) can
-    /// address any credential, not only env-referenced ones. An unreferenced credential is
-    /// built but kept OUT of the warm set, so it costs a struct, not refresh traffic, until
-    /// first fetched on demand.
+    /// Every defined credential gets a provider and is warmed, whether or not an env composes
+    /// it: a credential is served by name (credential-retrieval-api Requirement 16 AC 4).
     #[tokio::test]
-    async fn every_defined_credential_gets_a_provider_but_only_referenced_ones_are_warm() {
-        let store = store_for(&[("dev", None)], &["dev", "unused"]);
+    async fn every_defined_credential_gets_a_provider_and_is_warm() {
+        let store = store_for(&["dev", "unused"]);
         assert_eq!(store.providers.len(), 2);
         assert!(store.providers.contains_key("dev"));
         assert!(store.providers.contains_key("unused"));
         assert!(store.warm_set.contains("dev"));
-        assert!(!store.warm_set.contains("unused"));
+        assert!(store.warm_set.contains("unused"));
     }
 
     /// `get_credential` resolves any defined credential by name, env-independent — the
@@ -971,7 +1091,7 @@ mod tests {
     /// still resolves its default credential via `get`.
     #[tokio::test]
     async fn get_credential_resolves_any_defined_credential() {
-        let store = store_for(&[("dev", None)], &["dev", "adhoc"]);
+        let store = store_for(&["dev", "adhoc"]);
         store
             .inject_for_test_async(TEST_UID, "adhoc", session_creds())
             .await;
@@ -980,7 +1100,7 @@ mod tests {
         store
             .inject_for_test_async(TEST_UID, "dev", session_creds())
             .await;
-        assert!(store.get(TEST_UID, "dev").await.is_ready());
+        assert!(store.get_credential(TEST_UID, "dev").await.is_ready());
 
         // An undefined credential is Unknown, not a panic.
         assert!(store.get_credential(TEST_UID, "nope").await.is_unknown());

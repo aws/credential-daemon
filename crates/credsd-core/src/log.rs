@@ -295,6 +295,8 @@ pub fn init_logging(
         }
     });
 
+    let file_opened = file_mutex.is_some();
+
     let file_writer = file_mutex
         .as_ref()
         .zip(effective_file)
@@ -362,7 +364,7 @@ pub fn init_logging(
     }
 
     let mut destinations = vec!["stderr"];
-    if effective_file.is_some() {
+    if file_opened {
         destinations.push("file");
     }
     tracing::info!(
@@ -499,6 +501,74 @@ mod tests {
         open_log_file(&path).expect("open");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// `destinations` must name the sinks that opened, not the ones asked for. A log directory
+    /// that cannot be created leaves the file sink unbuilt, and naming "file" anyway tells an
+    /// operator their audit log is on disk when it only reached stderr.
+    ///
+    /// Re-execs this test binary because `init_logging` installs the *global* subscriber: a
+    /// process gets one call and a second panics. The child makes the call and the parent reads
+    /// the record off its stderr, which `--nocapture` leaves unredirected.
+    #[test]
+    fn reported_destinations_name_only_the_sinks_that_opened() {
+        const PROBE: &str = "CREDSD_LOG_DESTINATIONS_PROBE";
+        const THIS_FN: &str = "reported_destinations_name_only_the_sinks_that_opened";
+
+        if let Ok(path) = std::env::var(PROBE) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                init_logging(false, false, Some(Path::new(&path)), None, None);
+            });
+            return;
+        }
+
+        let filter = format!(
+            "{}::{THIS_FN}",
+            module_path!().split_once("::").expect("crate-qualified").1
+        );
+        let probe = |log_file: &Path| -> String {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([filter.as_str(), "--exact", "--nocapture"])
+                .env(PROBE, log_file)
+                .env_remove("RUST_LOG")
+                .env_remove("CREDSD_LOG_LEVEL")
+                .env_remove("CREDSD_LOG_FORMAT")
+                .env_remove("CREDSD_LOG_FILE")
+                .output()
+                .expect("re-exec the test binary");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                stderr.contains("logging initialized"),
+                "no init record from the child; did `{filter}` match a test? {stderr}"
+            );
+            stderr
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let opened = probe(&dir.path().join("credsd.log"));
+        assert!(
+            opened.contains(r#"destinations="stderr, file""#),
+            "a writable log path names the file sink: {opened}"
+        );
+
+        // A regular file where the log's parent directory would go: `create_dir_all` fails, so
+        // the file sink is never built.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").expect("blocker");
+        let refused = probe(&blocker.join("credsd.log"));
+        assert!(
+            refused.contains("could not create log directory"),
+            "the directory must be what failed: {refused}"
+        );
+        assert!(
+            refused.contains(r#"destinations="stderr""#),
+            "a file sink that never opened must not be named: {refused}"
+        );
     }
 
     #[test]

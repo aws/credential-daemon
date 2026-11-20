@@ -19,8 +19,7 @@ an editor plugin, a dependency's install script, or an agent, connects as that s
 send any request you can.
 
 For reading credentials, that is the bargain: a process you run as yourself is a process you
-chose to give your credentials to. Changing them is different. A process that could silently
-point `sdk.endpoint_url` at a server it controls, swap a CA bundle, or replace an SSO credential
+chose to give your credentials to. Changing them is different. A process that could silently replace an SSO credential
 with its own would redirect every later request you make. So the daemon requires something such
 a process cannot produce by itself: a finger on the sensor, or someone becoming root.
 
@@ -28,20 +27,23 @@ a process cannot produce by itself: a finger on the sensor, or someone becoming 
 
 The list is fixed in the daemon. No configuration adds to it or removes from it.
 
-| Command | Needs approval when |
+| Operation | Needs approval when |
 |---|---|
-| `creds config set` | always |
-| `creds config unset` | the key is set |
-| `creds bootstrap` | it would replace an existing credential, or repoint an existing environment |
-| `creds import` | a profile would bind into an existing environment, or replace sealed material left behind |
+| `creds bootstrap` | it would change an existing credential's stored settings or its source, or — for `aws-login` — sign in as a different account or role even when no setting moves. A repeat `aws-idc-sso` bootstrap that changes none of them is a re-authentication and goes through |
+| `creds import` | it would replace sealed material a removed credential left behind |
 | `creds remove --credential` | always |
-| `creds remove --environment` | always |
 | `creds revalidate` | a file has drifted, a file has been deleted, or the integrity record will not open |
 | `creds presence enroll` | always, and only `sudo` can approve it |
 
-An operation that changes nothing needs no approval, so a first bootstrap, a first import, and
-an unset of a key that is not set all go straight through. Reading credentials (`creds get`,
+An operation that changes nothing needs no approval, so a first bootstrap and a first import go straight through. Reading credentials (`creds get`,
 `creds list`) is never gated.
+
+The two browser sign-ins treat who signed in differently. An `aws-login` bootstrap compares it:
+signing in as a different account, role, or user is a replace and needs approval even when no
+other setting moves. An `aws-idc-sso` re-authentication records who signed in and compares
+nothing — the record is there so the log can say who last signed a credential in. Comparing it
+would stop nobody who does not already hold the credential's account and role, and it would turn
+a stored pair the instance no longer assigns into a failed sign-in.
 
 `creds revalidate` raises no challenge at all while a load-bearing file that is present does not
 parse, whatever the trigger was: a file with no canonical form has nothing a snapshot could
@@ -59,12 +61,12 @@ A pending request expires after 15 minutes. It can be approved once. If what it 
 changed in the meantime, by credsd or by hand, the daemon discards it unperformed, because the
 approval was given against a state that no longer exists.
 
-On a Mac with an enrolled presence key, the command asks for Touch ID and finishes in one step.
-Anywhere else it stops and tells you how to approve it:
+On a Mac with an enrolled presence key, a CLI command asks for Touch ID and finishes in one step.
+Other clients can use the same presence gate through the socket API. Anywhere else an
+operation returns a pending request that can be approved with `sudo`:
 
 ```
-$ creds config set sdk.ca_bundle /etc/ssl/corp-bundle.pem --environment work
-Approval required: set sdk.ca_bundle = /etc/ssl/corp-bundle.pem on environment 'work'
+Approval required: remove credential 'work'
 
 Pending request <id> (expires in 15m).
 Approve from a privileged session:
@@ -95,7 +97,7 @@ root:
 ```
 $ sudo creds request approve <id>
 
-Request <id> — set sdk.ca_bundle = /etc/ssl/corp-bundle.pem on environment 'work'
+Request <id> — remove credential 'work'
 Raised by uid 501 (alice), pid 48122, /usr/local/bin/creds, at 2026-09-30T18:22:04Z
   digest <digest>
 

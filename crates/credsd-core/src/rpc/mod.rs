@@ -14,7 +14,7 @@
 //!
 //! JSON-RPC batches (a top-level array) and notifications (a request without
 //! `id`) are not part of this protocol. Retrieving every credential a profile
-//! names in one all-or-none call is [`METHOD_CREDENTIAL_GET_BATCH`], a domain
+//! names in one all-or-none call is [`METHOD_ENVIRONMENT_CREDENTIALS`], a domain
 //! method — which is exactly why the transport-level batch is not needed.
 //!
 //! # Classifying a failure
@@ -36,20 +36,22 @@ pub mod methods;
 pub mod uds;
 
 pub use methods::{
-    AccountInfo, BootstrapRespondParams, Claim, ConfigGetParams, ConfigGetResult, ConfigSetParams,
-    ConfigUnsetParams, CredentialEntry, CredentialRemoveParams, CredentialResult,
-    CredentialSourceType, CredentialSummary, CredentialType, DescribeParams, EnvRemoveParams,
-    GetBatchParams, GetBatchResult, GetParams, HealthResult, ImportOutcome, ImportParams,
-    ImportProfile, ImportResult, ImportStatus, ListParams, ListResult, Material, OkResult,
-    ProfileBootstrapParams, ProfileLoginParams, ProfileManifest, ProgressParams, Projection,
-    Provenance, ProviderParams, ProviderParamsAwsLogin, ProviderParamsAwsWebIdentity,
-    ProviderParamsIamUser, ProviderParamsJwt, ProviderParamsJwtBearer, ProviderParamsOauth,
-    ProviderParamsRa, ProviderParamsSso, ProviderParamsStaticSecret, RevalidateParams, Scope,
-    SessionStatus, METHOD_CONFIG_GET, METHOD_CONFIG_SET, METHOD_CONFIG_UNSET,
-    METHOD_CREDENTIAL_GET, METHOD_CREDENTIAL_GET_BATCH, METHOD_CREDENTIAL_LIST,
-    METHOD_CREDENTIAL_REMOVE, METHOD_ENV_REMOVE, METHOD_FILE_REVALIDATE, METHOD_PROFILE_BOOTSTRAP,
-    METHOD_PROFILE_BOOTSTRAP_RESPOND, METHOD_PROFILE_DESCRIBE, METHOD_PROFILE_IMPORT,
-    METHOD_PROFILE_LOGIN, METHOD_SYSTEM_HEALTH, NOTIFICATION_PROGRESS,
+    AccountInfo, BootstrapRespondParams, BootstrapResult, Claim, ConfigGetParams, ConfigGetResult,
+    ConfigSetParams, ConfigUnsetParams, CredentialEntry, CredentialLogoutParams,
+    CredentialRemoveParams, CredentialResult, CredentialSourceType, CredentialSummary,
+    CredentialTagParams, CredentialType, DescribeParams, EnvRemoveParams, GetBatchParams,
+    GetBatchResult, GetParams, HealthResult, ImportOutcome, ImportParams, ImportProfile,
+    ImportStatus, ListParams, ListResult, LogoutResult, Material, OkResult, ProfileBootstrapParams,
+    ProfileLoginParams, ProfileManifest, ProgressParams, Projection, Provenance, ProviderLogout,
+    ProviderParams, ProviderParamsAwsLogin, ProviderParamsAwsWebIdentity, ProviderParamsIamUser,
+    ProviderParamsJwt, ProviderParamsJwtBearer, ProviderParamsOauth, ProviderParamsRa,
+    ProviderParamsSso, ProviderParamsStaticSecret, RevalidateParams, Scope, SessionStatus,
+    METHOD_CONFIG_GET, METHOD_CONFIG_SET, METHOD_CONFIG_UNSET, METHOD_CREDENTIAL_BOOTSTRAP,
+    METHOD_CREDENTIAL_BOOTSTRAP_RESPOND, METHOD_CREDENTIAL_GET, METHOD_CREDENTIAL_IMPORT,
+    METHOD_CREDENTIAL_LIST, METHOD_CREDENTIAL_LOGIN, METHOD_CREDENTIAL_LOGOUT,
+    METHOD_CREDENTIAL_REMOVE, METHOD_CREDENTIAL_TAG, METHOD_ENVIRONMENT_CREDENTIALS,
+    METHOD_ENV_REMOVE, METHOD_FILE_REVALIDATE, METHOD_PROFILE_DESCRIBE, METHOD_SYSTEM_HEALTH,
+    NOTIFICATION_PROGRESS,
 };
 
 /// Wire protocol revision, reported by `system/health`.
@@ -272,6 +274,11 @@ pub struct RpcError {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DomainCode {
     EnvironmentNotFound,
+    /// A credential-addressed request (no `environment`) missed, for any reason: unknown,
+    /// not held by the caller, or an unauthorized caller. One code and one message for all of
+    /// them, so a generic daemon client never has to recognize an environment-specific code
+    /// (`credential-retrieval-api` Requirement 8 AC 7).
+    CredentialNotFound,
     ReauthRequired,
     /// The credential exists and is usable, but its kind cannot be projected onto
     /// the requested shape — an `access_token` asked for as session credentials.
@@ -279,12 +286,23 @@ pub enum DomainCode {
     /// (`src/server/routes.rs:166`), not coined here, so the port does not silently
     /// rename a code a caller may already branch on.
     WrongCredentialType,
+    /// A request selected an account and role its `aws-idc-sso` credential does not allow: neither
+    /// the stored pair nor one in its `allowed_roles` (`credential-retrieval-api` Requirement 17).
+    RoleNotAllowed,
+    /// A request named an account and role for a credential whose source is not `aws-idc-sso`,
+    /// so the params do not apply (`credential-retrieval-api` Requirement 17 AC 3). Its own code
+    /// because codes are never repurposed (Requirement 8 AC 5).
+    RoleSelectionUnsupported,
     ProviderUnavailable,
     Internal,
     /// The caller's `config.toml` or `credentials.toml` has drifted from its sealed snapshot.
     /// Credential operations are blocked. Run `creds revalidate` after verifying the contents;
     /// a file that does not parse is corrected or restored first (`drift-detection` 2.10).
     ConfigDrifted,
+    /// The caller's `config.toml` or `credentials.toml` parses but does not validate, so nothing
+    /// is served or listed. The message names what fails, such as a credential and tag key
+    /// (`credential-tags` Requirement 1.5). Fix the file, then run `creds revalidate`.
+    ConfigInvalid,
     /// The caller's integrity record cannot be opened, so neither file can be verified
     /// (`drift-detection` Requirement 10.6). Run `creds revalidate`: its approval shows both files
     /// in full, discloses that there is no record to compare them against, and replaces the record.
@@ -300,6 +318,11 @@ pub enum DomainCode {
     /// The interactive bootstrap was cancelled before completion (e.g. the client closed
     /// the connection while waiting for account/role selection).
     AuthCancelled,
+    /// An `aws-login` `credential/login` signed in as a Principal other than the one the
+    /// credential records, or over a credential with no readable record, so nothing was saved
+    /// (`aws-login-identity` Requirement 3.6). Changing who a credential signs in as is the gated
+    /// `credential/bootstrap`. Not `AuthCancelled`: the sign-in completed, and was refused.
+    IdentityMismatch,
     /// A gated operation was not performed; `data.challenge` names what would approve it
     /// (`presence-gated-operations` Requirement 8.1). An error rather than a result, so a client
     /// that does not recognise it observes a failure instead of a completed operation.
@@ -310,6 +333,10 @@ pub enum DomainCode {
     /// No pending request by that identifier is visible to this caller. Unknown, discarded, and
     /// another uid's request are indistinguishable on the wire (Requirement 8.4).
     RequestNotFound,
+    /// `credential/logout` of a source that does not sign in (`credential-retrieval-api`
+    /// Requirement 10 AC 13). Resolved config decides it, not the request, so it is a domain
+    /// refusal rather than invalid parameters.
+    LogoutUnsupportedSource,
     /// A domain code not recognised by this version.
     #[serde(other)]
     Unknown,
@@ -389,6 +416,21 @@ impl RpcError {
         let mut error = Self::domain(DomainCode::ReauthRequired, message);
         if let Some(data) = error.data.as_mut() {
             data.insert("environment".into(), Value::String(environment.into()));
+            data.insert("remediation".into(), Value::String(remediation.into()));
+        }
+        error
+    }
+
+    /// [`RpcError::reauth_required`] for a credential-addressed request: `data.credential` names
+    /// the credential, and no environment is named.
+    pub fn reauth_required_for_credential(
+        credential: impl Into<String>,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::domain(DomainCode::ReauthRequired, message);
+        if let Some(data) = error.data.as_mut() {
+            data.insert("credential".into(), Value::String(credential.into()));
             data.insert("remediation".into(), Value::String(remediation.into()));
         }
         error
@@ -586,15 +628,22 @@ mod tests {
     fn domain_errors_carry_the_string_code_and_the_application_number() {
         for (code, wire) in [
             (DomainCode::EnvironmentNotFound, "ENVIRONMENT_NOT_FOUND"),
+            (DomainCode::CredentialNotFound, "CREDENTIAL_NOT_FOUND"),
             (DomainCode::ReauthRequired, "REAUTH_REQUIRED"),
             // Byte-identical to the HTTP surface's spelling (`server/routes.rs:166`,
             // `:214`, `:249`), so the transport port does not rename a code a caller
             // already branches on.
             (DomainCode::WrongCredentialType, "WRONG_CREDENTIAL_TYPE"),
+            (DomainCode::RoleNotAllowed, "ROLE_NOT_ALLOWED"),
+            (
+                DomainCode::RoleSelectionUnsupported,
+                "ROLE_SELECTION_UNSUPPORTED",
+            ),
             (DomainCode::ProviderUnavailable, "PROVIDER_UNAVAILABLE"),
             (DomainCode::Internal, "INTERNAL"),
             (DomainCode::AuthTimeout, "AUTH_TIMEOUT"),
             (DomainCode::AuthCancelled, "AUTH_CANCELLED"),
+            (DomainCode::IdentityMismatch, "IDENTITY_MISMATCH"),
         ] {
             let error = RpcError::domain(code, "boom");
             assert_eq!(error.code, CODE_APPLICATION);

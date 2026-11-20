@@ -8,44 +8,60 @@
   },
   "methods": [
     {
-      "name": "config/get",
-      "summary": "Read an environment setting.",
-      "description": "A missing environment is reported as INTERNAL here, and as -32602 by config/set and config/unset. ENVIRONMENT_NOT_FOUND covers only an unauthorized caller.",
+      "name": "credential/bootstrap",
+      "summary": "Create or replace a credential. Creates no environment.",
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "environment",
+          "name": "credential",
           "schema": {
             "$ref": "#/components/schemas/Name"
+          },
+          "required": false,
+          "description": "Credential to create or replace. Exactly one of credential and name_prefix."
+        },
+        {
+          "name": "name_prefix",
+          "schema": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "required": false,
+          "description": "aws_login only: name the credential from the identity that signs in, under this prefix."
+        },
+        {
+          "name": "tags",
+          "schema": {
+            "$ref": "#/components/schemas/Tags"
+          },
+          "required": false,
+          "description": "Given, the credential's tags become exactly this object; omitted, a new credential has none and a replaced one keeps its own."
+        },
+        {
+          "name": "provider",
+          "schema": {
+            "$ref": "#/components/schemas/ProviderParams"
           },
           "required": true
         },
         {
-          "name": "key",
+          "name": "request_id",
           "schema": {
-            "type": "string"
+            "$ref": "#/components/schemas/RequestId"
           },
-          "required": true
+          "required": false
         }
       ],
       "result": {
         "name": "result",
         "schema": {
-          "type": "object",
-          "properties": {
-            "value": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/OkResult"
+            },
+            {
+              "$ref": "#/components/schemas/AwsLoginBootstrapResult"
             }
-          },
-          "required": [
-            "value"
           ]
         }
       },
@@ -54,60 +70,25 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
+          "$ref": "#/components/errors/CredentialNotFound"
         },
         {
-          "$ref": "#/components/errors/Internal"
-        }
-      ],
-      "x-carriers": [
-        "uds"
-      ],
-      "x-deny-unknown-params": false
-    },
-    {
-      "name": "config/set",
-      "summary": "Set an environment setting.",
-      "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
+          "$ref": "#/components/errors/ProviderUnavailable"
         },
         {
-          "name": "key",
-          "schema": {
-            "type": "string",
-            "description": "A setting key such as `region` or `sdk.endpoint_url`."
-          },
-          "required": true
+          "$ref": "#/components/errors/AuthTimeout"
         },
         {
-          "name": "value",
-          "schema": {
-            "type": "string"
-          },
-          "required": true
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/OkResult"
-        }
-      },
-      "errors": [
-        {
-          "$ref": "#/components/errors/InvalidParams"
+          "$ref": "#/components/errors/AuthCancelled"
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
+          "$ref": "#/components/errors/ReauthRequired"
         },
         {
           "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRefused"
         },
         {
           "$ref": "#/components/errors/Internal"
@@ -126,64 +107,16 @@
         "uds"
       ],
       "x-deny-unknown-params": false,
-      "description": "Gated: returns APPROVAL_REQUIRED; `request/approve` applies it.",
-      "x-gated": "ConfigSet"
-    },
-    {
-      "name": "config/unset",
-      "summary": "Remove an environment setting.",
-      "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
-        },
-        {
-          "name": "key",
-          "schema": {
-            "type": "string"
-          },
-          "required": true
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/OkResult"
-        }
-      },
-      "errors": [
-        {
-          "$ref": "#/components/errors/InvalidParams"
-        },
-        {
-          "$ref": "#/components/errors/EnvironmentNotFound"
-        },
-        {
-          "$ref": "#/components/errors/ApprovalRequired"
-        },
-        {
-          "$ref": "#/components/errors/Internal"
-        },
-        {
-          "$ref": "#/components/errors/ConfigDrifted"
-        },
-        {
-          "$ref": "#/components/errors/IntegrityUnverifiable"
-        },
-        {
-          "$ref": "#/components/errors/CustodyBroken"
-        }
-      ],
-      "x-carriers": [
-        "uds"
-      ],
-      "x-deny-unknown-params": false,
-      "description": "Gated. Unsetting an absent key succeeds without a challenge.",
-      "x-gated": "ConfigUnset"
+      "description": "Gated only when it would replace existing state; re-sent after approval. An aws_login sign-in that replaces an aws_login credential of the same region and identity type is not gated when it signs in as the principal (partition, account, kind, and role or user name) already recorded for that credential; signing in as any other one, or over a credential with no readable recorded identity, is gated, and the approval is bound to the recorded and signed-in principals its challenge names.",
+      "x-gated": "Bootstrap",
+      "x-streaming": {
+        "emits": [
+          "notifications/progress"
+        ],
+        "accepts": [
+          "credential/bootstrap/respond"
+        ]
+      }
     },
     {
       "name": "credential/get",
@@ -191,19 +124,30 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
-        },
-        {
           "name": "credential",
           "schema": {
             "$ref": "#/components/schemas/Name"
           },
+          "required": true,
+          "description": "The credential to serve under its own restrictions."
+        },
+        {
+          "name": "account_id",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9]{12}$"
+          },
           "required": false,
-          "description": "Absent means the environment's default credential. A credential the environment does not reach fails as ENVIRONMENT_NOT_FOUND."
+          "description": "aws-idc-sso only, with role_name. The account to mint for from the credential's one sign-in, in place of its stored one. Both or neither; one alone is invalid params, and a pair on any other source is ROLE_SELECTION_UNSUPPORTED. A pair that is neither the stored one nor in the credential's allowed_roles is ROLE_NOT_ALLOWED."
+        },
+        {
+          "name": "role_name",
+          "schema": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9+=,.@_-]{1,64}$"
+          },
+          "required": false,
+          "description": "aws-idc-sso only, with account_id. The role to mint for in place of the stored one."
         },
         {
           "name": "scope",
@@ -238,10 +182,16 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
+          "$ref": "#/components/errors/CredentialNotFound"
         },
         {
           "$ref": "#/components/errors/ReauthRequired"
+        },
+        {
+          "$ref": "#/components/errors/RoleNotAllowed"
+        },
+        {
+          "$ref": "#/components/errors/RoleSelectionUnsupported"
         },
         {
           "$ref": "#/components/errors/ProviderUnavailable"
@@ -253,86 +203,7 @@
           "$ref": "#/components/errors/ConfigDrifted"
         },
         {
-          "$ref": "#/components/errors/IntegrityUnverifiable"
-        },
-        {
-          "$ref": "#/components/errors/CustodyBroken"
-        }
-      ],
-      "x-carriers": [
-        "uds"
-      ],
-      "x-deny-unknown-params": true
-    },
-    {
-      "name": "credential/get_batch",
-      "summary": "Material for every credential an environment names, all or none.",
-      "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
-        },
-        {
-          "name": "scope",
-          "schema": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "required": false
-        },
-        {
-          "name": "claim",
-          "schema": {
-            "$ref": "#/components/schemas/Claim"
-          },
-          "required": false
-        },
-        {
-          "name": "request_id",
-          "schema": {
-            "$ref": "#/components/schemas/RequestId"
-          },
-          "required": false
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "credentials": {
-              "type": "array",
-              "items": {
-                "$ref": "#/components/schemas/CredentialResult"
-              }
-            }
-          },
-          "required": [
-            "credentials"
-          ]
-        }
-      },
-      "errors": [
-        {
-          "$ref": "#/components/errors/InvalidParams"
-        },
-        {
-          "$ref": "#/components/errors/EnvironmentNotFound"
-        },
-        {
-          "$ref": "#/components/errors/ReauthRequired"
-        },
-        {
-          "$ref": "#/components/errors/ProviderUnavailable"
-        },
-        {
-          "$ref": "#/components/errors/Internal"
-        },
-        {
-          "$ref": "#/components/errors/ConfigDrifted"
+          "$ref": "#/components/errors/ConfigInvalid"
         },
         {
           "$ref": "#/components/errors/IntegrityUnverifiable"
@@ -345,7 +216,100 @@
         "uds"
       ],
       "x-deny-unknown-params": true,
-      "description": "Any member failure fails the whole request without naming the member."
+      "description": "A credential miss returns CREDENTIAL_NOT_FOUND, one message for every cause."
+    },
+    {
+      "name": "credential/import",
+      "summary": "Seal one static IAM key pair as a credential. Creates no environment.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "credential",
+          "schema": {
+            "type": "string"
+          },
+          "required": true,
+          "description": "Credential name. An invalid name is a skipped outcome, not a params error."
+        },
+        {
+          "name": "access_key_id",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        },
+        {
+          "name": "secret_access_key",
+          "schema": {
+            "type": "string",
+            "x-secret": true
+          },
+          "required": true
+        },
+        {
+          "name": "region",
+          "schema": {
+            "type": "string"
+          },
+          "required": true
+        },
+        {
+          "name": "identity_type",
+          "schema": {
+            "type": "string",
+            "enum": [
+              "human",
+              "automation",
+              "agent"
+            ],
+            "x-open-enum": true
+          },
+          "required": false
+        },
+        {
+          "name": "dry_run",
+          "schema": {
+            "type": "boolean",
+            "default": false
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ImportOutcome"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ApprovalRequired"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "description": "One call per credential. Gated when it would replace sealed material a removed credential left behind.",
+      "x-gated": "Import"
     },
     {
       "name": "credential/list",
@@ -353,12 +317,12 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "environment",
+          "name": "tags",
           "schema": {
-            "$ref": "#/components/schemas/Name"
+            "$ref": "#/components/schemas/TagFilter"
           },
           "required": false,
-          "description": "Restrict to one environment."
+          "description": "Only credentials satisfying every condition. Absent or empty applies no tag filtering; a key no credential carries matches no row."
         },
         {
           "name": "request_id",
@@ -388,6 +352,12 @@
       "errors": [
         {
           "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ConfigInvalid"
         }
       ],
       "x-carriers": [
@@ -395,6 +365,77 @@
         "stdio"
       ],
       "x-deny-unknown-params": true
+    },
+    {
+      "name": "credential/login",
+      "summary": "Re-authenticate a credential from its saved provider config.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "credential",
+          "schema": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "required": true
+        },
+        {
+          "name": "request_id",
+          "schema": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "required": false
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/OkResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
+          "$ref": "#/components/errors/ProviderUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/AuthTimeout"
+        },
+        {
+          "$ref": "#/components/errors/AuthCancelled"
+        },
+        {
+          "$ref": "#/components/errors/IdentityMismatch"
+        },
+        {
+          "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
+        },
+        {
+          "$ref": "#/components/errors/CustodyBroken"
+        }
+      ],
+      "x-carriers": [
+        "uds"
+      ],
+      "x-deny-unknown-params": false,
+      "x-streaming": {
+        "emits": [
+          "notifications/progress"
+        ],
+        "accepts": [
+          "credential/bootstrap/respond"
+        ]
+      }
     },
     {
       "name": "credential/remove",
@@ -420,7 +461,7 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
+          "$ref": "#/components/errors/CredentialNotFound"
         },
         {
           "$ref": "#/components/errors/ApprovalRequired"
@@ -446,44 +487,22 @@
       "x-gated": "RemoveCredential"
     },
     {
-      "name": "environment/bootstrap",
-      "summary": "Provision a credential and its environment.",
+      "name": "credential/logout",
+      "summary": "Sign a credential out: delete its sealed session and keep its entry.",
       "paramStructure": "by-name",
       "params": [
-        {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
-        },
         {
           "name": "credential",
           "schema": {
             "$ref": "#/components/schemas/Name"
           },
-          "required": false,
-          "description": "Absent means a credential named after the environment."
-        },
-        {
-          "name": "provider",
-          "schema": {
-            "$ref": "#/components/schemas/ProviderParams"
-          },
           "required": true
-        },
-        {
-          "name": "request_id",
-          "schema": {
-            "$ref": "#/components/schemas/RequestId"
-          },
-          "required": false
         }
       ],
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/OkResult"
+          "$ref": "#/components/schemas/LogoutResult"
         }
       },
       "errors": [
@@ -491,22 +510,7 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
-        },
-        {
-          "$ref": "#/components/errors/ProviderUnavailable"
-        },
-        {
-          "$ref": "#/components/errors/AuthTimeout"
-        },
-        {
-          "$ref": "#/components/errors/AuthCancelled"
-        },
-        {
-          "$ref": "#/components/errors/ApprovalRequired"
-        },
-        {
-          "$ref": "#/components/errors/ApprovalRefused"
+          "$ref": "#/components/errors/CredentialNotFound"
         },
         {
           "$ref": "#/components/errors/Internal"
@@ -519,158 +523,47 @@
         },
         {
           "$ref": "#/components/errors/CustodyBroken"
+        },
+        {
+          "$ref": "#/components/errors/LogoutUnsupportedSource"
         }
       ],
       "x-carriers": [
         "uds"
       ],
       "x-deny-unknown-params": false,
-      "description": "Gated only when it would replace existing state; re-sent after approval.",
-      "x-gated": "Bootstrap",
-      "x-streaming": {
-        "emits": [
-          "notifications/progress"
-        ],
-        "accepts": [
-          "environment/bootstrap/respond"
-        ]
-      }
+      "description": "Not gated. Applies to aws_login, aws_idc_sso, and aws_web_identity credentials; any other source fails with LOGOUT_UNSUPPORTED_SOURCE. An error may leave the logout partly done; retrying the same logout is safe and finishes it. On success `provider` reports what happened at the identity provider. INTERNAL means the caller's write lock was not free in time or the logout did not finish in time, and nothing was deleted; or a local deletion failed and may have deleted part of the session; retry either way. Afterwards credential/get returns REAUTH_REQUIRED until credential/login signs in again. Logging out of a credential with no session succeeds, deletes nothing, sends nothing, and reports provider `none`."
     },
     {
-      "name": "environment/describe",
-      "summary": "An environment's manifest. No material.",
+      "name": "credential/tag",
+      "summary": "Set and unset a credential's tags in one write.",
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "environment",
+          "name": "credential",
           "schema": {
             "$ref": "#/components/schemas/Name"
           },
           "required": true
         },
         {
-          "name": "request_id",
+          "name": "set",
           "schema": {
-            "$ref": "#/components/schemas/RequestId"
+            "$ref": "#/components/schemas/Tags"
           },
-          "required": false
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/ProfileManifest"
-        }
-      },
-      "errors": [
-        {
-          "$ref": "#/components/errors/InvalidParams"
+          "required": false,
+          "description": "Keys to add or overwrite. Applied before unset."
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
-        }
-      ],
-      "x-carriers": [
-        "uds"
-      ],
-      "x-deny-unknown-params": true
-    },
-    {
-      "name": "environment/import",
-      "summary": "Seal discovered static-key profiles in one batch.",
-      "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "profiles",
+          "name": "unset",
           "schema": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ImportProfile"
+              "$ref": "#/components/schemas/TagKey"
             }
           },
-          "required": true
-        },
-        {
-          "name": "dry_run",
-          "schema": {
-            "type": "boolean",
-            "default": false
-          },
-          "required": false
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "outcomes": {
-              "type": "array",
-              "items": {
-                "$ref": "#/components/schemas/ImportOutcome"
-              }
-            }
-          },
-          "required": [
-            "outcomes"
-          ]
-        }
-      },
-      "errors": [
-        {
-          "$ref": "#/components/errors/InvalidParams"
-        },
-        {
-          "$ref": "#/components/errors/ApprovalRequired"
-        },
-        {
-          "$ref": "#/components/errors/ApprovalRefused"
-        },
-        {
-          "$ref": "#/components/errors/Internal"
-        },
-        {
-          "$ref": "#/components/errors/ConfigDrifted"
-        },
-        {
-          "$ref": "#/components/errors/IntegrityUnverifiable"
-        },
-        {
-          "$ref": "#/components/errors/CustodyBroken"
-        }
-      ],
-      "x-carriers": [
-        "uds"
-      ],
-      "x-deny-unknown-params": false,
-      "description": "One outcome per submitted profile, in order. Gated when it would replace existing state.",
-      "x-gated": "Import"
-    },
-    {
-      "name": "environment/login",
-      "summary": "Re-authenticate a credential from its saved provider config.",
-      "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
-        },
-        {
-          "name": "credential",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": false
-        },
-        {
-          "name": "request_id",
-          "schema": {
-            "$ref": "#/components/schemas/RequestId"
-          },
-          "required": false
+          "required": false,
+          "description": "Keys to remove. A key the credential lacks changes nothing."
         }
       ],
       "result": {
@@ -684,22 +577,16 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/EnvironmentNotFound"
-        },
-        {
-          "$ref": "#/components/errors/ProviderUnavailable"
-        },
-        {
-          "$ref": "#/components/errors/AuthTimeout"
-        },
-        {
-          "$ref": "#/components/errors/AuthCancelled"
+          "$ref": "#/components/errors/CredentialNotFound"
         },
         {
           "$ref": "#/components/errors/Internal"
         },
         {
           "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/ConfigInvalid"
         },
         {
           "$ref": "#/components/errors/IntegrityUnverifiable"
@@ -711,64 +598,8 @@
       "x-carriers": [
         "uds"
       ],
-      "x-deny-unknown-params": false,
-      "x-streaming": {
-        "emits": [
-          "notifications/progress"
-        ],
-        "accepts": [
-          "environment/bootstrap/respond"
-        ]
-      }
-    },
-    {
-      "name": "environment/remove",
-      "summary": "Remove an environment.",
-      "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "environment",
-          "schema": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "required": true
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/OkResult"
-        }
-      },
-      "errors": [
-        {
-          "$ref": "#/components/errors/InvalidParams"
-        },
-        {
-          "$ref": "#/components/errors/EnvironmentNotFound"
-        },
-        {
-          "$ref": "#/components/errors/ApprovalRequired"
-        },
-        {
-          "$ref": "#/components/errors/Internal"
-        },
-        {
-          "$ref": "#/components/errors/ConfigDrifted"
-        },
-        {
-          "$ref": "#/components/errors/IntegrityUnverifiable"
-        },
-        {
-          "$ref": "#/components/errors/CustodyBroken"
-        }
-      ],
-      "x-carriers": [
-        "uds"
-      ],
-      "x-deny-unknown-params": false,
-      "description": "Gated: returns APPROVAL_REQUIRED; `request/approve` applies it.",
-      "x-gated": "RemoveEnv"
+      "x-deny-unknown-params": true,
+      "description": "Merges into the existing tags: keys not named keep their values, and a key in set that already exists takes the new value; credential/bootstrap with tags instead replaces the whole set. Ungated. A key in both set and unset (after folding), or a result that breaks the tag grammar or the 32-tag limit, is INVALID_PARAMS and writes nothing. An unknown or unauthorized credential is CREDENTIAL_NOT_FOUND."
     },
     {
       "name": "file/revalidate",
@@ -786,10 +617,19 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
           "$ref": "#/components/errors/ApprovalRequired"
         },
         {
           "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/ConfigDrifted"
+        },
+        {
+          "$ref": "#/components/errors/IntegrityUnverifiable"
         },
         {
           "$ref": "#/components/errors/CustodyBroken"
@@ -839,7 +679,7 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/Internal"
+          "$ref": "#/components/errors/CredentialNotFound"
         }
       ],
       "x-carriers": [
@@ -872,7 +712,10 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "$ref": "#/components/errors/Internal"
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
         },
         {
           "$ref": "#/components/errors/CustodyBroken"
@@ -952,6 +795,9 @@
       "errors": [
         {
           "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/CredentialNotFound"
         }
       ],
       "x-carriers": [
@@ -1003,6 +849,9 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
           "$ref": "#/components/errors/RequestNotFound"
         },
         {
@@ -1010,6 +859,9 @@
         },
         {
           "$ref": "#/components/errors/Internal"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
         },
         {
           "$ref": "#/components/errors/CustodyBroken"
@@ -1044,6 +896,9 @@
           "$ref": "#/components/errors/InvalidParams"
         },
         {
+          "$ref": "#/components/errors/CredentialNotFound"
+        },
+        {
           "$ref": "#/components/errors/RequestNotFound"
         }
       ],
@@ -1069,6 +924,9 @@
       "errors": [
         {
           "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/CredentialNotFound"
         }
       ],
       "x-carriers": [
@@ -1098,6 +956,9 @@
       "errors": [
         {
           "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/CredentialNotFound"
         },
         {
           "$ref": "#/components/errors/RequestNotFound"
@@ -1165,6 +1026,61 @@
           "id",
           "name",
           "email"
+        ]
+      },
+      "AwsLoginBootstrapResult": {
+        "type": "object",
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          }
+        },
+        "required": [
+          "credential",
+          "identity"
+        ]
+      },
+      "Identity": {
+        "type": "object",
+        "description": "Who an aws_login sign-in authorized, as sts:GetCallerIdentity reported it.",
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "partition": {
+            "type": "string"
+          },
+          "account": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "role",
+              "user",
+              "root"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "sub": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arn",
+          "partition",
+          "account",
+          "kind",
+          "name",
+          "session"
         ]
       },
       "ApprovalRefusedData": {
@@ -1259,60 +1175,6 @@
         "x-open-enum": true,
         "description": "Self-reported caller identity claim. Its presence is the assertion; unrecognised values are ignored."
       },
-      "CliSettings": {
-        "type": "object",
-        "properties": {
-          "output": {
-            "type": "string"
-          },
-          "pager": {
-            "type": "string"
-          },
-          "cli_timestamp_format": {
-            "type": "string"
-          },
-          "cli_binary_format": {
-            "type": "string"
-          },
-          "cli_follow_urlparam": {
-            "type": "boolean"
-          }
-        },
-        "description": "AWS CLI settings an environment projects. Absent members are omitted."
-      },
-      "CredentialEntry": {
-        "type": "object",
-        "properties": {
-          "credential": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/CredentialType"
-          },
-          "source": {
-            "$ref": "#/components/schemas/CredentialSourceType"
-          },
-          "env_var": {
-            "type": "string"
-          },
-          "projection": {
-            "$ref": "#/components/schemas/ProjectionType"
-          },
-          "status": {
-            "$ref": "#/components/schemas/SessionStatus"
-          },
-          "default": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "credential",
-          "kind",
-          "source",
-          "status",
-          "default"
-        ]
-      },
       "CredentialResult": {
         "type": "object",
         "properties": {
@@ -1355,7 +1217,8 @@
           "jwt",
           "oauth",
           "jwt_bearer",
-          "static_secret"
+          "static_secret",
+          "unsupported"
         ],
         "x-open-enum": true,
         "description": "Provider that issues a credential. Unrecognised values read as unsupported."
@@ -1363,24 +1226,28 @@
       "CredentialSummary": {
         "type": "object",
         "properties": {
-          "environment": {
-            "$ref": "#/components/schemas/Name"
-          },
           "credential": {
             "$ref": "#/components/schemas/Name"
           },
           "kind": {
             "$ref": "#/components/schemas/CredentialType"
           },
+          "source": {
+            "$ref": "#/components/schemas/CredentialSourceType"
+          },
           "status": {
             "$ref": "#/components/schemas/SessionStatus"
+          },
+          "tags": {
+            "$ref": "#/components/schemas/Tags"
           }
         },
         "required": [
-          "environment",
           "credential",
           "kind",
-          "status"
+          "source",
+          "status",
+          "tags"
         ]
       },
       "CredentialType": {
@@ -1395,19 +1262,24 @@
       "DomainCode": {
         "type": "string",
         "enum": [
-          "ENVIRONMENT_NOT_FOUND",
+          "CREDENTIAL_NOT_FOUND",
           "REAUTH_REQUIRED",
           "WRONG_CREDENTIAL_TYPE",
+          "ROLE_NOT_ALLOWED",
+          "ROLE_SELECTION_UNSUPPORTED",
           "PROVIDER_UNAVAILABLE",
           "INTERNAL",
           "CONFIG_DRIFTED",
+          "CONFIG_INVALID",
           "INTEGRITY_UNVERIFIABLE",
           "CUSTODY_BROKEN",
           "AUTH_TIMEOUT",
           "AUTH_CANCELLED",
+          "IDENTITY_MISMATCH",
           "APPROVAL_REQUIRED",
           "APPROVAL_REFUSED",
-          "REQUEST_NOT_FOUND"
+          "REQUEST_NOT_FOUND",
+          "LOGOUT_UNSUPPORTED_SOURCE"
         ],
         "x-open-enum": true,
         "description": "Domain failure classifier carried in `error.data.code`."
@@ -1420,12 +1292,12 @@
           "agent"
         ],
         "x-open-enum": true,
-        "description": "Identity tier of the credential. Absent means `human`."
+        "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
       },
       "ImportOutcome": {
         "type": "object",
         "properties": {
-          "name": {
+          "credential": {
             "type": "string"
           },
           "status": {
@@ -1442,44 +1314,8 @@
           }
         },
         "required": [
-          "name",
+          "credential",
           "status"
-        ]
-      },
-      "ImportProfile": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Credential and environment name. Validated per entry: an invalid name is a skipped outcome, not a params error."
-          },
-          "access_key_id": {
-            "type": "string"
-          },
-          "secret_access_key": {
-            "type": "string",
-            "x-secret": true,
-            "description": "Long-term secret access key."
-          },
-          "region": {
-            "type": "string"
-          },
-          "identity_type": {
-            "type": "string",
-            "enum": [
-              "human",
-              "automation",
-              "agent"
-            ],
-            "x-open-enum": true,
-            "description": "Identity tier of the credential. Absent means `human`."
-          }
-        },
-        "required": [
-          "name",
-          "access_key_id",
-          "secret_access_key",
-          "region"
         ]
       },
       "Material": {
@@ -1544,7 +1380,7 @@
         "not": {
           "const": "default"
         },
-        "description": "An environment or credential name: ASCII letters, digits, '.', '_' or '-', at most 64 characters, not starting with '.', and not `default`. Validated at deserialization; a violation is INVALID_PARAMS."
+        "description": "A credential name: ASCII letters, digits, '.', '_' or '-', at most 64 characters, not starting with '.', and not `default`. Validated at deserialization; a violation is INVALID_PARAMS."
       },
       "OkResult": {
         "type": "object",
@@ -1592,29 +1428,6 @@
           "owner_executable",
           "raised_at"
         ]
-      },
-      "ProfileManifest": {
-        "type": "object",
-        "properties": {
-          "environment": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "credentials": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CredentialEntry"
-            }
-          },
-          "projection": {
-            "$ref": "#/components/schemas/Projection"
-          }
-        },
-        "required": [
-          "environment",
-          "credentials",
-          "projection"
-        ],
-        "description": "An environment's manifest. Contains no material."
       },
       "ProgressParams": {
         "oneOf": [
@@ -1733,42 +1546,6 @@
         "description": "A step of an interactive bootstrap or login, tagged by `type`.",
         "x-open-enum": true
       },
-      "Projection": {
-        "type": "object",
-        "properties": {
-          "projections": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/ProjectionDecl"
-            },
-            "description": "Projection declarations keyed by credential name. Omitted when empty."
-          },
-          "region": {
-            "type": "string"
-          },
-          "sdk": {
-            "$ref": "#/components/schemas/SdkSettings"
-          },
-          "cli": {
-            "$ref": "#/components/schemas/CliSettings"
-          }
-        },
-        "description": "Environment-level projection inputs."
-      },
-      "ProjectionDecl": {
-        "type": "string",
-        "description": "A projection declaration, `<type>[:<address>]`, where `<type>` is a ProjectionType."
-      },
-      "ProjectionType": {
-        "type": "string",
-        "enum": [
-          "aws-profile",
-          "env-var",
-          "credential-endpoint"
-        ],
-        "x-open-enum": true,
-        "description": "How a credential is delivered to a consumer."
-      },
       "Provenance": {
         "type": "string",
         "enum": [
@@ -1794,11 +1571,32 @@
               },
               "account_id": {
                 "type": "string",
-                "description": "Chosen at sign-in when absent."
+                "description": "Chosen at sign-in when absent, or kept from the credential when it already exists."
               },
               "role_name": {
                 "type": "string",
-                "description": "Chosen at sign-in when absent."
+                "description": "Chosen at sign-in when absent, or kept from the credential when it already exists."
+              },
+              "allowed_roles": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "account_id": {
+                      "type": "string",
+                      "pattern": "^[0-9]{12}$"
+                    },
+                    "role_name": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9+=,.@_-]{1,64}$"
+                    }
+                  },
+                  "required": [
+                    "account_id",
+                    "role_name"
+                  ]
+                },
+                "description": "Other account and role pairs credential/get may select. Empty means only the stored pair; absent keeps the list a credential already has, so an empty list clears it. Part of the params a re-bootstrap approval covers."
               },
               "identity_type": {
                 "type": "string",
@@ -1808,7 +1606,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -1848,7 +1646,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -1920,7 +1718,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -1982,7 +1780,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               },
               "callback_port": {
                 "type": "integer",
@@ -2025,7 +1823,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -2067,7 +1865,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -2108,7 +1906,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -2147,7 +1945,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -2186,7 +1984,7 @@
                   "agent"
                 ],
                 "x-open-enum": true,
-                "description": "Identity tier of the credential. Absent means `human`."
+                "description": "Identity tier of the credential. Absent keeps the tier a credential already has, and means `human` for a new one."
               }
             },
             "required": [
@@ -2204,16 +2002,17 @@
           "code": {
             "const": "REAUTH_REQUIRED"
           },
-          "environment": {
-            "$ref": "#/components/schemas/Name"
+          "credential": {
+            "$ref": "#/components/schemas/Name",
+            "description": "The credential that needs sign-in."
           },
           "remediation": {
-            "type": "string"
+            "type": "string",
+            "description": "The client command, `creds login --credential <name>`."
           }
         },
         "required": [
           "code",
-          "environment",
           "remediation"
         ]
       },
@@ -2236,59 +2035,6 @@
       "Scope": {
         "description": "Caller-supplied session policy that can only narrow. The grammar is not settled; any JSON value is carried. Absence means boundary-scoped, never unscoped. A malformed scope fails the retrieval."
       },
-      "SdkSettings": {
-        "type": "object",
-        "properties": {
-          "endpoint_url": {
-            "type": "string"
-          },
-          "use_fips_endpoint": {
-            "type": "boolean"
-          },
-          "use_dualstack_endpoint": {
-            "type": "boolean"
-          },
-          "ca_bundle": {
-            "type": "string"
-          },
-          "retry_mode": {
-            "type": "string"
-          },
-          "max_attempts": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "defaults_mode": {
-            "type": "string"
-          },
-          "sts_regional_endpoints": {
-            "type": "string"
-          },
-          "s3_us_east_1_regional_endpoint": {
-            "type": "string"
-          },
-          "disable_request_compression": {
-            "type": "boolean"
-          },
-          "request_min_compression_size_bytes": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "parameter_validation": {
-            "type": "boolean"
-          },
-          "ignore_configured_endpoint_urls": {
-            "type": "boolean"
-          },
-          "sdk_ua_app_id": {
-            "type": "string"
-          },
-          "account_id_endpoint_mode": {
-            "type": "string"
-          }
-        },
-        "description": "AWS SDK settings an environment projects. Absent members are omitted."
-      },
       "SessionStatus": {
         "type": "string",
         "enum": [
@@ -2303,6 +2049,77 @@
           "unknown"
         ],
         "description": "Whether a credential would work right now."
+      },
+      "LogoutResult": {
+        "type": "object",
+        "required": [
+          "signed_out",
+          "provider"
+        ],
+        "properties": {
+          "signed_out": {
+            "type": "boolean",
+            "description": "False only with provider `none`: the credential was already signed out."
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "ended",
+              "token_rejected",
+              "local_only",
+              "failed",
+              "none"
+            ],
+            "description": "`ended`: SSO accepted Logout, ending the sign-in at SSO too. `token_rejected`: SSO refused the access token or the refresh before it as invalid or expired; no sealed token works at SSO, but the access-portal session may still be live. `local_only`: the sign-in has no session at an identity provider to end (aws_login, aws_web_identity), or no sealed SSO token was left. `failed`: SSO refused the refresh or Logout for another reason, or did not answer in time, or the sealed token could not be read; the session may stay live at SSO until it expires. `none`: there was no session; nothing was deleted or sent."
+          },
+          "start_url": {
+            "type": "string",
+            "description": "Present only with provider `failed`: the credential's SSO start URL, the access portal's sign-in page, where the user can sign out of the SSO session. It is not itself a sign-out action."
+          },
+          "access_token_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Present only with provider `failed`, when the sealed token was readable: when the newest SSO access token SSO issued expires, the sealed one or one refreshed for the logout. The SSO session may last longer."
+          }
+        },
+        "description": "Result of credential/logout."
+      },
+      "TagFilter": {
+        "type": "object",
+        "propertyNames": {
+          "$ref": "#/components/schemas/TagKey"
+        },
+        "additionalProperties": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "pattern": "^[ -~]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": "credential/list conditions, ANDed. A string requires the row's tag of that key to equal it; null requires only that the key is present."
+      },
+      "TagKey": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+        "description": "A tag key. ASCII A-Z fold to lowercase in the daemon at every input; folded, it matches [a-z0-9][a-z0-9._-]{0,62}. Keys are stored and returned folded. Two keys in one request that fold to the same key are INVALID_PARAMS naming both."
+      },
+      "Tags": {
+        "type": "object",
+        "maxProperties": 32,
+        "propertyNames": {
+          "$ref": "#/components/schemas/TagKey"
+        },
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[ -~]*$"
+        },
+        "description": "A credential's tags: user-chosen key=value labels, at most 32. Values are printable ASCII of at most 256 bytes and are never folded. Labels only: tags never grant or deny access and are visible to every caller that may list the credential, so they must not hold secrets."
       }
     },
     "errors": {
@@ -2327,6 +2144,13 @@
           "code": "AUTH_CANCELLED"
         }
       },
+      "IdentityMismatch": {
+        "code": -32000,
+        "message": "An aws-login sign-in was not as the principal the credential records; nothing was saved.",
+        "data": {
+          "code": "IDENTITY_MISMATCH"
+        }
+      },
       "AuthTimeout": {
         "code": -32000,
         "message": "Interactive sign-in did not complete in time.",
@@ -2341,18 +2165,25 @@
           "code": "CONFIG_DRIFTED"
         }
       },
+      "ConfigInvalid": {
+        "code": -32000,
+        "message": "config.toml or credentials.toml parses but does not validate; the message names what fails, such as a credential and tag key.",
+        "data": {
+          "code": "CONFIG_INVALID"
+        }
+      },
+      "CredentialNotFound": {
+        "code": -32000,
+        "message": "No such credential is visible to the caller.",
+        "data": {
+          "code": "CREDENTIAL_NOT_FOUND"
+        }
+      },
       "CustodyBroken": {
         "code": -32000,
         "message": "Custody of the integrity record or enrolled-key registry is broken.",
         "data": {
           "code": "CUSTODY_BROKEN"
-        }
-      },
-      "EnvironmentNotFound": {
-        "code": -32000,
-        "message": "No such environment or credential is visible to the caller.",
-        "data": {
-          "code": "ENVIRONMENT_NOT_FOUND"
         }
       },
       "IntegrityUnverifiable": {
@@ -2376,6 +2207,13 @@
       "InvalidParams": {
         "code": -32602,
         "message": "Params do not match the method's schema."
+      },
+      "LogoutUnsupportedSource": {
+        "code": -32000,
+        "message": "The credential's source has no sign-in to log out of; remove it with credential/remove.",
+        "data": {
+          "code": "LOGOUT_UNSUPPORTED_SOURCE"
+        }
       },
       "MethodNotFound": {
         "code": -32601,
@@ -2408,12 +2246,26 @@
         "data": {
           "code": "WRONG_CREDENTIAL_TYPE"
         }
+      },
+      "RoleNotAllowed": {
+        "code": -32000,
+        "message": "The credential does not allow the requested account and role.",
+        "data": {
+          "code": "ROLE_NOT_ALLOWED"
+        }
+      },
+      "RoleSelectionUnsupported": {
+        "code": -32000,
+        "message": "Account and role selection applies only to an aws-idc-sso credential.",
+        "data": {
+          "code": "ROLE_SELECTION_UNSUPPORTED"
+        }
       }
     }
   },
   "x-notifications": [
     {
-      "name": "environment/bootstrap/respond",
+      "name": "credential/bootstrap/respond",
       "direction": "client-to-server",
       "summary": "The user's selection for the step last announced (account, role, or MFA code).",
       "params": {

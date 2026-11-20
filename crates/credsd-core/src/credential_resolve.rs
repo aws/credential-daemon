@@ -32,13 +32,25 @@ pub async fn fetch_credential_in_env(
     credential: &str,
     claimed: ClaimedIdentity,
 ) -> Result<Credentials> {
-    fetch_uds(socket_path, env, Some(credential), claimed).await
+    fetch_uds(socket_path, Some(env), Some(credential), None, claimed).await
+}
+
+/// Fetch one credential by name, with no environment: served under the credential's own
+/// restrictions whether or not an environment composes it. A miss is `CREDENTIAL_NOT_FOUND`
+/// (`credential-retrieval-api` Requirement 10 AC 6, Requirement 8 AC 7).
+#[cfg(unix)]
+pub async fn fetch_credential(
+    socket_path: &std::path::Path,
+    credential: &str,
+    claimed: ClaimedIdentity,
+) -> Result<Credentials> {
+    fetch_uds(socket_path, None, Some(credential), None, claimed).await
 }
 
 /// Fetch `credential` within `env`, or the env's own default when `credential` is `None`.
 ///
-/// The `None` case is what an ad-hoc selection needs: its credentials are each served under their
-/// own name, so the name *is* the env and there is no credential to select within it.
+/// No environment is implicit: an env that composes nothing serves nothing. An ad-hoc selection of
+/// credentials by name uses [`fetch_credential`] instead.
 #[cfg(unix)]
 pub async fn fetch_credential_in_env_or_default(
     socket_path: &std::path::Path,
@@ -46,7 +58,7 @@ pub async fn fetch_credential_in_env_or_default(
     credential: Option<&str>,
     claimed: ClaimedIdentity,
 ) -> Result<Credentials> {
-    fetch_uds(socket_path, env, credential, claimed).await
+    fetch_uds(socket_path, Some(env), credential, None, claimed).await
 }
 
 /// Fetch an env's default credential from the daemon over the Unix domain socket.
@@ -56,7 +68,23 @@ pub async fn fetch_from_daemon_uds(
     env: &str,
     claimed: ClaimedIdentity,
 ) -> Result<Credentials> {
-    fetch_uds(socket_path, env, None, claimed).await
+    fetch_uds(socket_path, Some(env), None, None, claimed).await
+}
+
+/// Fetch another account and role of an `aws-idc-sso` credential's sign-in: the stored pair, or
+/// one the credential allows (`credential-retrieval-api` Requirement 17). Addressed as the other
+/// fetches are: by `credential`, within `env`, or the env's default.
+#[cfg(unix)]
+pub async fn fetch_role_credential(
+    socket_path: &std::path::Path,
+    env: Option<&str>,
+    credential: Option<&str>,
+    account_id: &str,
+    role_name: &str,
+    claimed: ClaimedIdentity,
+) -> Result<Credentials> {
+    let pair = Some((account_id, role_name));
+    fetch_uds(socket_path, env, credential, pair, claimed).await
 }
 
 /// Send one `credential/get` for `profile` (optionally selecting `credential` within it) and
@@ -69,15 +97,18 @@ pub async fn fetch_from_daemon_uds(
 #[cfg(unix)]
 async fn fetch_uds(
     socket_path: &std::path::Path,
-    environment: &str,
+    environment: Option<&str>,
     credential: Option<&str>,
+    pair: Option<(&str, &str)>,
     claimed: ClaimedIdentity,
 ) -> Result<Credentials> {
     use crate::rpc::{uds, Claim, CredentialResult, GetParams, Material, METHOD_CREDENTIAL_GET};
 
     let params = GetParams {
-        environment: environment.to_owned(),
+        environment: environment.map(str::to_owned),
         credential: credential.map(str::to_owned),
+        account_id: pair.map(|p| p.0.to_owned()),
+        role_name: pair.map(|p| p.1.to_owned()),
         scope: None,
         // Presence is the claim; the daemon only ever uses it to add restriction (Req 8.2).
         claim: (claimed == ClaimedIdentity::Agentic).then_some(Claim::Agentic),
@@ -87,7 +118,7 @@ async fn fetch_uds(
         socket_path,
         METHOD_CREDENTIAL_GET,
         &params,
-        Some(environment),
+        environment.or(credential),
     )
     .await?;
 
@@ -120,6 +151,66 @@ async fn fetch_uds(
         // `Authorization` header — is the child's business, not this cache's.
         Material::AccessToken { token, .. } => {
             Ok(Credentials::access_token(token.clone(), expires_at))
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use crate::rpc::{codec, DomainCode, Id, Response, RpcError};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+        /// `credsd get --account A --role R` reaches the daemon as both fields, exactly as given,
+        /// however the request is addressed (Requirement 17 AC 1).
+        #[test]
+        fn a_role_fetch_sends_both_fields(
+            account_id in "[0-9]{12}",
+            role_name in "[A-Za-z0-9+=,.@_-]{1,64}",
+            env in proptest::option::of("[a-z]{1,8}"),
+            credential in proptest::option::of("[a-z]{1,8}"),
+        ) {
+            proptest::prop_assume!(env.is_some() || credential.is_some());
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("s.sock");
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let sent = rt.block_on(async {
+                let listener = UnixListener::bind(&socket).unwrap();
+                let daemon = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut line = Vec::new();
+                    BufReader::new(read).read_until(b'\n', &mut line).await.unwrap();
+                    let reply = codec::encode_response::<()>(&Response::failure(
+                        Id::from(1i64),
+                        RpcError::domain(DomainCode::Internal, "stop"),
+                    ))
+                    .unwrap();
+                    write.write_all(&reply).await.unwrap();
+                    line
+                });
+                let _ = fetch_role_credential(
+                    &socket,
+                    env.as_deref(),
+                    credential.as_deref(),
+                    &account_id,
+                    &role_name,
+                    ClaimedIdentity::Unstated,
+                )
+                .await;
+                daemon.await.unwrap()
+            });
+            let request: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+            let params = &request["params"];
+            proptest::prop_assert_eq!(&params["account_id"], account_id.as_str());
+            proptest::prop_assert_eq!(&params["role_name"], role_name.as_str());
+            proptest::prop_assert_eq!(params.get("environment").and_then(|v| v.as_str()), env.as_deref());
+            proptest::prop_assert_eq!(params.get("credential").and_then(|v| v.as_str()), credential.as_deref());
         }
     }
 }

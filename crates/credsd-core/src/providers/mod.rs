@@ -12,8 +12,32 @@ pub mod sso;
 pub mod static_secret;
 
 use crate::credentials::Credentials;
-use crate::error::Result;
+use crate::error::{DaemonError, Result};
 use async_trait::async_trait;
+
+/// An SDK failure as a record must name it: the service's own message where there is one, and
+/// otherwise the error's source chain, which is the only place a failure with no service error —
+/// an unreachable endpoint, a timeout, a response that would not parse — says what it was. A fixed
+/// fallback string made all of those read as the operation name, so an unreachable STS and a
+/// missing assignment audited identically, which `credential-retrieval-api` Req 17's "audited with
+/// its reason" forbids.
+///
+/// Here rather than in one provider because the STS call the `aws-login` sign-in check and the
+/// Identity Center audit lookup share is worded through it from both.
+pub(crate) fn sdk_failure<E, R>(
+    operation: &str,
+    e: aws_sdk_sts::error::SdkError<E, R>,
+) -> DaemonError
+where
+    E: aws_sdk_sts::error::ProvideErrorMetadata + std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    use aws_sdk_sts::error::DisplayErrorContext;
+    match e.as_service_error().and_then(|service| service.message()) {
+        Some(message) => DaemonError::provider(message),
+        None => DaemonError::provider(format!("{operation} failed: {}", DisplayErrorContext(&e))),
+    }
+}
 
 /// A credential source and its renewal capability.
 ///
@@ -38,6 +62,17 @@ use async_trait::async_trait;
 pub trait CredentialProvider: Send + Sync {
     /// The unattended renewal capability, or `None` for a re-auth-only source.
     fn renewer(&self) -> Option<&dyn Renewer>;
+
+    /// The unattended renewal for another account and role of the same sign-in, or `None` for a
+    /// source with no such choice. Only `aws-idc-sso` has one (credential-retrieval-api
+    /// Requirement 17).
+    fn role_renewer<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _role_name: &'a str,
+    ) -> Option<Box<dyn Renewer + 'a>> {
+        None
+    }
 
     fn mode_name(&self) -> &'static str;
 }
@@ -89,5 +124,38 @@ impl ReauthInput {
             Self::Browser => "browser",
             Self::Code { .. } => "code",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_sts::error::{ConnectorError, ErrorMetadata, SdkError};
+
+    /// `credential-retrieval-api` Req 17 requires an unresolved sign-in audited *with its reason*,
+    /// and a failure with no service error has its reason in the source chain alone. A fixed
+    /// fallback string made an unreachable STS and a missing role assignment read identically.
+    #[test]
+    fn a_failure_with_no_service_error_is_named_by_its_source_chain() {
+        let unreachable: SdkError<ErrorMetadata, ()> = SdkError::dispatch_failure(
+            ConnectorError::io(Box::new(std::io::Error::other("tcp connect refused"))),
+        );
+        let reason = sdk_failure("get_caller_identity", unreachable).to_string();
+        assert!(
+            reason.contains("get_caller_identity") && reason.contains("tcp connect refused"),
+            "the transport failure names itself: {reason}"
+        );
+
+        let refused: SdkError<ErrorMetadata, ()> = SdkError::service_error(
+            ErrorMetadata::builder()
+                .message("No access to the role 'AdminAccess'")
+                .build(),
+            (),
+        );
+        let reason = sdk_failure("get_caller_identity", refused).to_string();
+        assert!(
+            reason.contains("No access to the role 'AdminAccess'"),
+            "and a service error still speaks for itself: {reason}"
+        );
     }
 }

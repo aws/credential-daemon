@@ -88,9 +88,9 @@ compare the two, and every field that comparison missed would be a field an atta
 between approval and performance.
 
 Two operations cannot be performed from a record, and are performed by re-send instead
-(Requirement 2.8). `environment/bootstrap` runs an interactive provider flow — a device code, an
+(Requirement 2.8). `credential/bootstrap` runs an interactive provider flow — a device code, an
 account and role selection — that streams to the requesting connection and cannot be replayed
-from memory, and both it and `environment/import` carry long-term secrets that should not wait in
+from memory, and both it and `credential/import` carry long-term secrets that should not wait in
 a pending operation for its lifetime. For these, approval grants a one-use authorization and the
 client re-sends.
 
@@ -632,7 +632,7 @@ emits exactly one audit record.
 | Signing and entitlements for the official macOS build | Hardened runtime; access-group entitlement on the daemon only |
 | `crates/credsd-daemon/src/server/uds.rs` | Serve uid 0 as an approver without a caller root; sample login identity |
 | `crates/credsd-daemon/src/server/dispatch.rs` | Route salvageable denials into the pending-operation store; the built-in gate for `config/set`, `config/unset`, and both removals; one approval flow for every operation (base-state recheck, then perform or authorize) |
-| `crates/credsd-daemon/src/server/bootstrap.rs` | The built-in gate for `environment/bootstrap` and `environment/import`: overwrite detection, the arguments digest, and spending a re-send authorization (Requirement 2.8) |
+| `crates/credsd-daemon/src/server/bootstrap.rs` | The built-in gate for `credential/bootstrap` and `credential/import`: overwrite detection, the arguments digest, and spending a re-send authorization (Requirement 2.8) |
 | `crates/credsd-core/src/rpc/methods.rs` | `request/approve`, `request/list`, `request/withdraw`, `presence/enroll`, `presence/revoke` |
 | `crates/credsd-core/src/rpc/mod.rs` | `DomainCode::{ApprovalRequired, ApprovalRefused, RequestNotFound}`; constructors carrying challenge, reason, and remediation |
 | `crates/credsd-core/src/rpc/uds.rs` | Map the three codes in `error_to_daemon` |

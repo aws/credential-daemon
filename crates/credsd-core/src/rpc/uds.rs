@@ -167,7 +167,7 @@ where
 /// Map a wire failure onto the daemon's error taxonomy.
 ///
 /// `REAUTH_REQUIRED` must land on [`DaemonError::ReauthRequired`] so an interactive `get`/`run`
-/// still drives the login flow, and `ENVIRONMENT_NOT_FOUND` on [`DaemonError::EnvNotFound`] naming
+/// still drives the login flow, and either not-found code on [`DaemonError::EnvNotFound`] naming
 /// `subject`. The two auth-lifecycle codes keep their own prose because "timed out" and
 /// "cancelled" imply different next actions for a user, as do the config-state codes. Every other
 /// failure, envelope-level failures included, reaches the caller as [`DaemonError::Remote`]: the
@@ -183,6 +183,10 @@ pub fn error_to_daemon(subject: Option<&str>, error: RpcError) -> DaemonError {
         Some(DomainCode::ReauthRequired) => DaemonError::ReauthRequired(error.message),
         Some(DomainCode::EnvironmentNotFound) => match subject {
             Some(subject) => DaemonError::EnvNotFound(NotFound::environment(subject)),
+            None => DaemonError::remote(error.message),
+        },
+        Some(DomainCode::CredentialNotFound) => match subject {
+            Some(subject) => DaemonError::EnvNotFound(NotFound::credential(subject)),
             None => DaemonError::remote(error.message),
         },
         Some(DomainCode::AuthTimeout) => {
@@ -206,6 +210,9 @@ pub fn error_to_daemon(subject: Option<&str>, error: RpcError) -> DaemonError {
         Some(DomainCode::ConfigDrifted) => {
             DaemonError::config(format!("config drifted: {}", error.message))
         }
+        Some(DomainCode::ConfigInvalid) => {
+            DaemonError::config(format!("config invalid: {}", error.message))
+        }
         Some(DomainCode::IntegrityUnverifiable) => {
             DaemonError::config(format!("config unverifiable: {}", error.message))
         }
@@ -214,7 +221,11 @@ pub fn error_to_daemon(subject: Option<&str>, error: RpcError) -> DaemonError {
         }
         Some(DomainCode::ProviderUnavailable)
         | Some(DomainCode::WrongCredentialType)
+        | Some(DomainCode::RoleNotAllowed)
+        | Some(DomainCode::RoleSelectionUnsupported)
+        | Some(DomainCode::IdentityMismatch)
         | Some(DomainCode::Internal)
+        | Some(DomainCode::LogoutUnsupportedSource)
         | Some(DomainCode::Unknown)
         | None => DaemonError::remote(error.message),
     }
@@ -229,17 +240,30 @@ mod tests {
         let cases = [
             (DomainCode::ReauthRequired, "reauth"),
             (DomainCode::EnvironmentNotFound, "not-found"),
+            (DomainCode::CredentialNotFound, "not-found"),
             (DomainCode::AuthTimeout, "timeout"),
             (DomainCode::AuthCancelled, "cancelled"),
             (DomainCode::ProviderUnavailable, "provider"),
             (DomainCode::WrongCredentialType, "provider"),
+            (DomainCode::RoleNotAllowed, "provider"),
+            (DomainCode::RoleSelectionUnsupported, "provider"),
+            (DomainCode::IdentityMismatch, "provider"),
             (DomainCode::Internal, "provider"),
             (DomainCode::ConfigDrifted, "drifted"),
+            (DomainCode::ConfigInvalid, "invalid"),
             (DomainCode::IntegrityUnverifiable, "unverifiable"),
             (DomainCode::CustodyBroken, "custody"),
         ];
         for (code, kind) in cases {
             let mapped = error_to_daemon(Some("dev"), RpcError::domain(code, "boom"));
+            if let DaemonError::EnvNotFound(ref env) = mapped {
+                let wanted = if code == DomainCode::CredentialNotFound {
+                    crate::error::Addressed::Credential
+                } else {
+                    crate::error::Addressed::Environment
+                };
+                assert_eq!(env.kind, wanted, "{code:?} must keep how it was addressed");
+            }
             let actual = match mapped {
                 DaemonError::ReauthRequired(_) => "reauth",
                 DaemonError::EnvNotFound(ref env) => {
@@ -249,6 +273,7 @@ mod tests {
                 DaemonError::Config(ref m) if m.starts_with("auth timed out") => "timeout",
                 DaemonError::Config(ref m) if m.starts_with("auth cancelled") => "cancelled",
                 DaemonError::Config(ref m) if m.starts_with("config drifted") => "drifted",
+                DaemonError::Config(ref m) if m.starts_with("config invalid") => "invalid",
                 DaemonError::Config(ref m) if m.starts_with("config unverifiable") => {
                     "unverifiable"
                 }
@@ -427,6 +452,9 @@ mod tests {
             code in proptest::sample::select(vec![
                 DomainCode::ProviderUnavailable,
                 DomainCode::WrongCredentialType,
+                DomainCode::RoleNotAllowed,
+                DomainCode::RoleSelectionUnsupported,
+                DomainCode::IdentityMismatch,
                 DomainCode::Internal,
                 DomainCode::Unknown,
             ]),

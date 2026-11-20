@@ -251,10 +251,10 @@ Requirements use RFC 2119 keywords (MUST, MUST NOT, SHALL, SHALL NOT, SHOULD, SH
 
 **Example:**
 ```markdown
-1. THE CLI MUST provide a `remove` subcommand that accepts `--environment <name>`.
-2. WHEN the named env does not exist, THE command MUST exit with code 1 and print "env '<name>' not found" to stderr.
+1. THE CLI MUST provide a `remove` subcommand that accepts `--credential <name>`.
+2. WHEN the named credential does not exist, THE command MUST exit with code 1 and print "credential '<name>' not found" to stderr.
 3. THE command SHOULD prompt for confirmation unless `--force` is provided.
-4. THE command MUST NOT delete the storage backend encryption key (shared across envs).
+4. THE command MUST NOT delete the storage backend encryption key (shared across credentials).
 ```
 
 ### `requirements.md`

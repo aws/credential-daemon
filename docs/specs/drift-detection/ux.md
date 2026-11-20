@@ -30,9 +30,9 @@ output is not part of `creds list`.
 
 ```
 $ creds list
-CREDENTIAL      MODE               STATUS
-build-cert      aws-roles-anywhere DRIFT (config.toml)
-gh-token        static-secret      active
+CREDENTIAL      KIND                STATUS
+build-cert      session_credentials DRIFT (config.toml)
+gh-token        access_token        active
 ```
 
 ## Recovery — approval screen
@@ -193,10 +193,10 @@ The code is `CUSTODY_BROKEN`. No client action is offered, revalidation included
 
 ```
 $ creds list
-CREDENTIAL      MODE               STATUS
-build-cert      aws-roles-anywhere DRIFT (config.toml)
-api-key         static-secret      DRIFT (credentials.toml)
-gh-token        static-secret      active
+CREDENTIAL      KIND                STATUS
+build-cert      session_credentials DRIFT (config.toml)
+api-key         access_token        DRIFT (credentials.toml)
+gh-token        access_token        active
 ```
 
 ## Operations table

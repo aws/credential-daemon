@@ -4,6 +4,7 @@
 )]
 use clap::{Parser, Subcommand, ValueEnum};
 use credsd_core::log::escape_terminal;
+use credsd_core::rpc::{LogoutResult, ProviderLogout};
 use credsd_core::wire::ClaimedIdentity;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,6 +30,19 @@ fn claimed_identity(agentic: bool) -> ClaimedIdentity {
     } else {
         ClaimedIdentity::Unstated
     }
+}
+
+fn names_an_environment(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| {
+            arg == "--environment"
+                || arg == "--env"
+                || arg
+                    .to_str()
+                    .is_some_and(|s| s.starts_with("--environment=") || s.starts_with("--env="))
+        })
 }
 
 #[derive(Parser)]
@@ -63,64 +77,87 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum TagAction {
+    /// Add or overwrite tags.
+    Set {
+        /// The credential to tag.
+        #[arg(long, visible_alias = "name")]
+        credential: String,
+        /// `KEY=VALUE` pairs.
+        #[arg(required = true, value_name = "KEY=VALUE", value_parser = parse_tag_pair)]
+        pairs: Vec<(String, String)>,
+    },
+    /// Remove tags by key. A key the credential lacks is not an error.
+    Unset {
+        /// The credential to untag.
+        #[arg(long, visible_alias = "name")]
+        credential: String,
+        /// Keys to remove.
+        #[arg(required = true, value_name = "KEY")]
+        keys: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 #[expect(
     clippy::large_enum_variant,
-    reason = "parsed once at startup; boxing the bootstrap arguments buys nothing"
+    reason = "parsed once per process; boxing the provider would only complicate matching"
 )]
 enum Commands {
-    /// Bootstrap a credential (provider config + initial auth), optionally wrapping it in an env.
-    ///
-    /// The flag picks the mode:
-    ///   `--credential X`            → credential X only (an atom, to compose into envs later).
-    ///   `--env Y`                   → credential Y + a same-named single-credential env Y (1:1).
-    ///   `--env Y --credential X`    → credential X + env Y referencing it.
-    /// At least one of `--env`/`--credential` is required. If the credential already exists and
-    /// no provider is given, re-authenticates using saved config.
+    /// Bootstrap a credential (provider config + initial auth). Creates only the credential. If no
+    /// provider is given, re-authenticates using saved config.
     Bootstrap {
-        /// Env to create wrapping the credential. Alone, also names the credential.
-        #[arg(long = "environment", alias = "env")]
-        env: Option<String>,
-        /// Credential to create/configure. Alone, no env is created; with `--env`, names the
-        /// credential something other than the env.
-        #[arg(long)]
+        /// Credential to create or replace.
+        #[arg(
+            long,
+            visible_alias = "name",
+            required_unless_present = "name_prefix",
+            conflicts_with = "name_prefix"
+        )]
         credential: Option<String>,
+
+        /// aws-login only: name the credential after the identity that signs in, under this
+        /// prefix (e.g. `login.`). The final name is printed.
+        #[arg(long)]
+        name_prefix: Option<String>,
+
+        /// A `KEY=VALUE` tag for the credential; repeatable. Given, the tags replace the
+        /// credential's set; absent, a replaced credential keeps its tags.
+        #[arg(long = "tag", global = true, value_name = "KEY=VALUE", value_parser = parse_tag_pair)]
+        tags: Vec<(String, String)>,
 
         #[command(subcommand)]
         provider: Option<BootstrapProvider>,
     },
-    /// Re-authenticate credentials whose unattended renewal is spent (SSO session expired, MFA
-    /// session lapsed). Runs the interactive flow each source requires and persists the result
-    /// so the daemon can serve again. `--env` loops over every credential in the env;
-    /// `--credential` re-auths a single one.
+    /// Re-authenticate a credential whose unattended renewal is spent (SSO session expired, MFA
+    /// session lapsed). Runs the interactive flow its source requires and persists the result
+    /// so the daemon can serve again.
     Login {
-        /// Env whose credentials to re-authenticate (loops over all of them).
-        #[arg(
-            long = "environment",
-            alias = "env",
-            required_unless_present = "credential"
-        )]
-        env: Option<String>,
-        /// A single credential to re-authenticate.
-        #[arg(long, required_unless_present = "env")]
-        credential: Option<String>,
+        /// The credential to re-authenticate.
+        #[arg(long, visible_alias = "name")]
+        credential: String,
+    },
+    /// Sign a credential out. Its sealed session is deleted and its entry is kept, so `creds
+    /// login --credential <name>` signs it in again. Not gated.
+    Logout {
+        /// The credential to sign out.
+        #[arg(long)]
+        credential: String,
     },
     /// Fetch credentials from the daemon (for credential_process / shell eval).
     ///
-    /// `--env <env> --credential <cred>` resolves that credential under the env's authority —
-    /// what a generated `credential_process` line calls. `--env <name>` alone resolves the
-    /// env's default (first) credential; bare `--credential <name>` resolves only when the
-    /// name is also a configured env (the shipped 1:1 shape).
+    /// `--credential <cred>` fetches that credential by name, under its own restrictions.
     Get {
-        /// Env whose default credential to fetch, or the authorization context for --credential.
-        #[arg(
-            long = "environment",
-            alias = "env",
-            required_unless_present = "credential"
-        )]
-        env: Option<String>,
-        /// A single credential to fetch, resolved under --env's authority when given.
-        #[arg(long, required_unless_present = "env")]
-        credential: Option<String>,
+        /// The credential to fetch.
+        #[arg(long, visible_alias = "name")]
+        credential: String,
+        /// With --role, another account of an aws-idc-sso credential's sign-in: its stored one, or
+        /// one it allows (--allow-role at bootstrap).
+        #[arg(long, requires = "role")]
+        account: Option<String>,
+        /// With --account, the role to fetch in that account.
+        #[arg(long, requires = "account")]
+        role: Option<String>,
         /// Output format: credential-process, shell, fish, powershell (default: raw JSON)
         #[arg(long)]
         format: Option<String>,
@@ -135,19 +172,21 @@ enum Commands {
         /// Output format: text (default) or json
         #[arg(long, default_value = "text")]
         format: String,
+        /// Only credentials carrying this tag: `KEY=VALUE`, or `KEY` for any value; repeatable.
+        #[arg(long = "tag", value_name = "KEY[=VALUE]", value_parser = parse_tag_condition)]
+        tags: Vec<(String, Option<String>)>,
     },
-    /// Remove an env, or a credential and its encrypted data.
+    /// Set or unset a credential's tags. Tags are labels for `list --tag`, not secrets and not
+    /// authorization.
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
+    },
+    /// Remove a credential and its encrypted data.
     Remove {
-        /// Env to remove (leaves its credentials intact).
-        #[arg(
-            long = "environment",
-            alias = "env",
-            required_unless_present = "credential"
-        )]
-        env: Option<String>,
         /// Credential to remove, along with its encrypted data.
-        #[arg(long)]
-        credential: Option<String>,
+        #[arg(long, visible_alias = "name")]
+        credential: String,
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
@@ -221,7 +260,7 @@ enum RequestAction {
 enum ImportSourceCmd {
     /// Import static-key profiles from the AWS shared-credentials file. Each importable profile
     /// (one carrying an `aws_access_key_id`/`aws_secret_access_key` pair) becomes an `iam-user`
-    /// credential wrapped in a same-named env; SSO and `credential_process` profiles are skipped.
+    /// credential; SSO and `credential_process` profiles are skipped.
     /// The source file is read only, never modified.
     AwsProfiles {
         /// Credentials file to read (default: $AWS_SHARED_CREDENTIALS_FILE, then ~/.aws/credentials).
@@ -240,38 +279,6 @@ enum ImportSourceCmd {
 enum ConfigAction {
     /// Print the config file path
     Path,
-    /// Set an env configuration value
-    Set {
-        /// Config key (e.g., region, sdk.retry_mode, cli.output)
-        key: String,
-        /// Value to set
-        value: String,
-        /// Env to modify (required; never inferred from $AWS_PROFILE)
-        #[arg(long = "environment", alias = "env", required = true)]
-        env: String,
-    },
-    /// Get an env configuration value
-    Get {
-        /// Config key to read
-        key: String,
-        /// Env to read from (required; never inferred from $AWS_PROFILE)
-        #[arg(long = "environment", alias = "env", required = true)]
-        env: String,
-    },
-    /// Remove an env configuration value (revert to default)
-    Unset {
-        /// Config key to remove
-        key: String,
-        /// Env to modify (required; never inferred from $AWS_PROFILE)
-        #[arg(long = "environment", alias = "env", required = true)]
-        env: String,
-    },
-    /// List available configuration keys
-    Keys {
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -289,6 +296,15 @@ enum BootstrapProvider {
         role_name: Option<String>,
         #[arg(long, value_enum)]
         identity_type: Option<CliIdentityType>,
+        /// Another account and role of the sign-in that `creds get --account --role` may fetch.
+        /// Repeatable. Without any, a new credential serves only its account and role; a
+        /// re-bootstrap keeps the stored list.
+        #[arg(long = "allow-role", value_name = "ACCOUNT_ID:ROLE_NAME", value_parser = parse_role_pair)]
+        allow_role: Vec<credsd_core::config::RolePair>,
+        /// Clear the credential's allowed roles, leaving only its stored account and role.
+        /// Without this and without `--allow-role`, a re-bootstrap keeps the stored list.
+        #[arg(long, conflicts_with = "allow_role")]
+        clear_allowed_roles: bool,
     },
     /// Bootstrap with a long-term IAM key brokered via sts:GetSessionToken.
     ///
@@ -304,7 +320,7 @@ enum BootstrapProvider {
         #[arg(long)]
         duration_seconds: Option<i32>,
         /// MFA device ARN. When set, sessions require an MFA code, so the key can't be
-        /// brokered unattended — authenticate with `credsd login --env <env>`.
+        /// brokered unattended — authenticate with `creds login --credential <name>`.
         #[arg(long)]
         mfa_serial: Option<String>,
         #[arg(long, value_enum)]
@@ -517,6 +533,12 @@ impl From<CliIdentityType> for credsd_core::config::IdentityType {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if names_an_environment(std::env::args_os()) {
+        eprintln!(
+            "error: --environment is not supported; name a credential with --credential <NAME> (or --name <NAME>)"
+        );
+        return ExitCode::from(2);
+    }
     let cli = Cli::parse();
 
     if let Some(ref dir) = cli.config_dir {
@@ -547,23 +569,33 @@ async fn main() -> ExitCode {
     );
 
     // Most commands succeed or fail, and nothing else; `succeeded` lifts those into the exit code
-    // dispatch returns. Only the shell verbs, `config get` have a code of their own to report — a
-    // child's exit status, or "the key is unset" — and they are the arms that return one directly.
+    // dispatch returns.
     let succeeded = |r: credsd_core::error::Result<()>| r.map(|()| ExitCode::SUCCESS);
 
     let result = match cli.command {
-        Commands::Login { env, credential } => succeeded(cmd_login(env, credential).await),
+        Commands::Login { credential } => succeeded(cmd_login(credential).await),
+        Commands::Logout { credential } => cmd_logout(credential).await,
         Commands::Bootstrap {
-            env,
             credential,
+            name_prefix,
+            tags,
             provider,
-        } => succeeded(cmd_bootstrap(env, credential, provider).await),
+        } => succeeded(cmd_bootstrap(credential, name_prefix, tags, provider).await),
         Commands::Get {
-            env,
             credential,
+            account,
+            role,
             format,
             agentic,
-        } => succeeded(cmd_get(env, credential, format, claimed_identity(agentic)).await),
+        } => succeeded(
+            cmd_get(
+                credential,
+                account.zip(role),
+                format,
+                claimed_identity(agentic),
+            )
+            .await,
+        ),
         Commands::Config { action } => match action {
             ConfigAction::Path => {
                 print!(
@@ -572,14 +604,9 @@ async fn main() -> ExitCode {
                 );
                 Ok(ExitCode::SUCCESS)
             }
-            ConfigAction::Set { key, value, env } => {
-                succeeded(cmd_config_set(env, &key, &value).await)
-            }
-            ConfigAction::Get { key, env } => cmd_config_get(env, &key).await,
-            ConfigAction::Unset { key, env } => succeeded(cmd_config_unset(env, &key).await),
-            ConfigAction::Keys { format } => succeeded(cmd_config_keys(&format)),
         },
-        Commands::List { format } => succeeded(cmd_list(&format).await),
+        Commands::List { format, tags } => succeeded(cmd_list(&format, tags).await),
+        Commands::Tag { action } => succeeded(cmd_tag(action).await),
         Commands::Import { source } => succeeded(cmd_import(source).await),
         #[cfg(unix)]
         Commands::Request { action } => succeeded(match action {
@@ -603,11 +630,7 @@ async fn main() -> ExitCode {
         Commands::Request { .. } | Commands::Approve { .. } | Commands::Presence { .. } => Err(
             credsd_core::error::DaemonError::config("not supported on this platform"),
         ),
-        Commands::Remove {
-            env,
-            credential,
-            force,
-        } => succeeded(cmd_remove(env, credential, force).await),
+        Commands::Remove { credential, force } => succeeded(cmd_remove(credential, force).await),
         Commands::Revalidate => succeeded(cmd_revalidate().await),
     };
 
@@ -620,13 +643,15 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `credsd import` — parse the AWS shared-credentials file client-side, then seal the discovered
-/// profiles through the daemon's `profile/import` RPC. The client never opens the keystore.
+/// `creds import` — parse the AWS shared-credentials file client-side, then seal each discovered
+/// profile through one `credential/import` call. The client never opens the keystore.
 #[cfg(unix)]
 async fn cmd_import(source: ImportSourceCmd) -> credsd_core::error::Result<()> {
     use credsd_core::config::platform;
     use credsd_core::import::{discover_import_profiles, ImportSource, RegionInputs};
-    use credsd_core::rpc::{uds, ImportParams, ImportResult, ImportStatus, METHOD_PROFILE_IMPORT};
+    use credsd_core::rpc::{
+        uds, ImportOutcome, ImportParams, ImportStatus, METHOD_CREDENTIAL_IMPORT,
+    };
 
     let (import_source, dry_run) = match source {
         ImportSourceCmd::AwsProfiles {
@@ -651,25 +676,24 @@ async fn cmd_import(source: ImportSourceCmd) -> credsd_core::error::Result<()> {
     }
 
     let socket = platform::client_socket_path();
-    let params = ImportParams { profiles, dry_run };
-    // An import that would bind into existing environments is gated. Approving grants one re-send
-    // of this exact batch, so a Touch ID approval here retries at once.
-    let result: ImportResult = match uds::call(&socket, METHOD_PROFILE_IMPORT, &params, None).await
-    {
-        Err(credsd_core::error::DaemonError::ApprovalRequired(challenge)) => {
-            if !presence::satisfy(&challenge).await? {
-                return Err(credsd_core::error::DaemonError::config(format!(
-                    "not imported: approve request {}, then re-run this import",
-                    challenge.id
-                )));
-            }
-            uds::call(&socket, METHOD_PROFILE_IMPORT, &params, None).await?
-        }
-        other => other?,
-    };
-
     let mut imported = 0usize;
-    for outcome in &result.outcomes {
+    for profile in profiles {
+        let params = ImportParams { profile, dry_run };
+        // An import over sealed data left behind is gated. Approving grants one re-send of this
+        // exact call, so a Touch ID approval here retries at once.
+        let outcome: ImportOutcome =
+            match uds::call(&socket, METHOD_CREDENTIAL_IMPORT, &params, None).await {
+                Err(credsd_core::error::DaemonError::ApprovalRequired(challenge)) => {
+                    if !presence::satisfy(&challenge).await? {
+                        return Err(credsd_core::error::DaemonError::config(format!(
+                            "not imported: approve request {}, then re-run this import",
+                            challenge.id
+                        )));
+                    }
+                    uds::call(&socket, METHOD_CREDENTIAL_IMPORT, &params, None).await?
+                }
+                other => other?,
+            };
         match outcome.status {
             ImportStatus::Imported => {
                 eprintln!("imported '{}'", outcome.name);
@@ -704,66 +728,64 @@ async fn cmd_import(_source: ImportSourceCmd) -> credsd_core::error::Result<()> 
 /// silent. When no provider is given, re-authenticates via `profile/login` (same daemon RPC).
 #[cfg(unix)]
 async fn cmd_bootstrap(
-    env: Option<String>,
     credential: Option<String>,
+    name_prefix: Option<String>,
+    tags: Vec<(String, String)>,
     provider: Option<BootstrapProvider>,
 ) -> credsd_core::error::Result<()> {
     use credsd_client::{ProfileBootstrapParams, ProfileLoginParams};
     use credsd_core::config::platform;
-    use credsd_core::error::DaemonError;
-
-    let (credential, environment, write_env) = match (credential, env) {
-        (Some(c), Some(e)) => (c, e, true),
-        (Some(c), None) => (c.clone(), c, false),
-        (None, Some(e)) => (e.clone(), e, true),
-        (None, None) => {
-            return Err(DaemonError::config(
-                "specify --env and a provider, e.g.: creds bootstrap --env <name> <provider>",
-            ))
-        }
-    };
 
     // No `ensure_config_dir()`: the daemon creates and owns `callers/<uid>/`, and a client that
     // pre-created it would either fail on the daemon-owned parent or leave a directory with the
     // wrong owner for the daemon to then refuse (Req 15).
     let socket = platform::client_socket_path();
 
+    let tags = (!tags.is_empty()).then(|| unique_keys(tags)).transpose()?;
     match provider {
+        None if tags.is_some() => Err(credsd_core::error::DaemonError::config(
+            "--tag needs a provider; use 'creds tag set' to tag an existing credential",
+        )),
         None => {
-            // Re-auth: send profile/login.
+            let credential = credential.ok_or_else(|| {
+                credsd_core::error::DaemonError::config(
+                    "--name-prefix needs a provider; give --credential to re-authenticate",
+                )
+            })?;
             let params = ProfileLoginParams {
-                environment: environment.clone(),
-                credential: if credential != environment {
-                    Some(credential)
-                } else {
-                    None
-                },
+                credential,
                 request_id: None,
             };
             send_login_rpc(&socket, &params).await
         }
         Some(p) => {
-            let _ = write_env; // write_env is implicit in the daemon model
-            let provider_params = build_provider_params(p)?;
             let params = ProfileBootstrapParams {
-                environment,
-                credential: if credential.is_empty() {
-                    None
-                } else {
-                    Some(credential)
-                },
-                provider: provider_params,
+                credential,
+                name_prefix,
+                provider: build_provider_params(p)?,
+                tags,
                 request_id: None,
             };
-            send_bootstrap_rpc(&socket, &params).await
+            let result = send_bootstrap_rpc(&socket, &params).await?;
+            if let (Some(name), Some(who)) = (&result.credential, &result.identity) {
+                eprintln!(
+                    "Saved credential '{}', signed in as {} {} in account {}.",
+                    credsd_core::log::escape_terminal(name),
+                    credsd_core::log::escape_terminal(&who.kind),
+                    credsd_core::log::escape_terminal(&who.name),
+                    credsd_core::log::escape_terminal(&who.account)
+                );
+            }
+            Ok(())
         }
     }
 }
 
 #[cfg(not(unix))]
 async fn cmd_bootstrap(
-    _env: Option<String>,
     _credential: Option<String>,
+    _name_prefix: Option<String>,
+    _tags: Vec<(String, String)>,
     _provider: Option<BootstrapProvider>,
 ) -> credsd_core::error::Result<()> {
     Err(credsd_core::error::DaemonError::config(
@@ -771,37 +793,155 @@ async fn cmd_bootstrap(
     ))
 }
 
-/// `credsd login` — thin relay to `profile/login` on the daemon.
+/// `creds login` — thin relay to `credential/login` on the daemon.
 #[cfg(unix)]
-async fn cmd_login(
-    env: Option<String>,
-    credential: Option<String>,
-) -> credsd_core::error::Result<()> {
+async fn cmd_login(credential: String) -> credsd_core::error::Result<()> {
     use credsd_client::ProfileLoginParams;
     use credsd_core::config::platform;
-    use credsd_core::error::DaemonError;
-
-    let environment = match (&env, &credential) {
-        (Some(e), _) => e.clone(),
-        (None, Some(c)) => c.clone(),
-        (None, None) => return Err(DaemonError::config("specify --env or --credential")),
-    };
 
     let socket = platform::client_socket_path();
-
     let params = ProfileLoginParams {
-        environment,
-        credential: credential.clone(),
+        credential,
         request_id: None,
     };
     send_login_rpc(&socket, &params).await
 }
 
 #[cfg(not(unix))]
-async fn cmd_login(
-    _env: Option<String>,
-    _credential: Option<String>,
-) -> credsd_core::error::Result<()> {
+async fn cmd_login(_credential: String) -> credsd_core::error::Result<()> {
+    Err(credsd_core::error::DaemonError::config(
+        "a running daemon is not yet supported on this platform",
+    ))
+}
+
+/// `ACCOUNT_ID:ROLE_NAME`, each side checked by the rules a stored pair and a request's pair
+/// share. A second `:` lands in the role, which refuses it.
+fn parse_role_pair(value: &str) -> Result<credsd_core::config::RolePair, String> {
+    let (account_id, role_name) = value
+        .split_once(':')
+        .ok_or("expected ACCOUNT_ID:ROLE_NAME")?;
+    credsd_core::config::check_account_id(account_id)?;
+    credsd_core::config::check_role_name(role_name)?;
+    Ok(credsd_core::config::RolePair {
+        account_id: account_id.to_owned(),
+        role_name: role_name.to_owned(),
+    })
+}
+
+/// What `creds logout` prints for the daemon's answer: a line for stdout, or, when SSO could not
+/// end the session, a warning for stderr and exit code 1.
+fn logout_report(credential: &str, result: &LogoutResult) -> Result<String, String> {
+    match &result.provider {
+        ProviderLogout::None => Ok(format!("{credential} was already signed out")),
+        ProviderLogout::Ended => Ok(format!(
+            "signed out of {credential}; the access-portal session ended. Run \
+             `creds login --credential {credential}` to sign in again"
+        )),
+        ProviderLogout::TokenRejected => Ok(format!(
+            "signed out of {credential}; its token no longer works at SSO, but the access-portal \
+             session may still be live. Run `creds login --credential {credential}` to sign in \
+             again"
+        )),
+        ProviderLogout::LocalOnly => Ok(format!(
+            "signed out of {credential}; run `creds login --credential {credential}` to sign in again"
+        )),
+        ProviderLogout::Failed {
+            start_url,
+            access_token_expires_at,
+        } => {
+            let token = access_token_expires_at.as_deref().map_or(String::new(), |at| {
+                format!(" The access token stays valid until {at}; the SSO session may last longer.")
+            });
+            Err(format!(
+                "warning: signed out of {credential} here, but SSO did not end the session, which \
+                 may still be live. To end the SSO session, sign out at {start_url}.{token}"
+            ))
+        }
+    }
+}
+
+/// Exits 1 with the warning on stderr when SSO could not end the session: the error-on-stderr
+/// convention of the exit-code table, though the local session is gone.
+#[cfg(unix)]
+async fn cmd_logout(credential: String) -> credsd_core::error::Result<ExitCode> {
+    let socket = credsd_core::config::platform::client_socket_path();
+    let result = credsd_client::credential_logout(&socket, &credential).await?;
+    Ok(match logout_report(&credential, &result) {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(warning) => {
+            eprintln!("{warning}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+#[cfg(not(unix))]
+async fn cmd_logout(_credential: String) -> credsd_core::error::Result<ExitCode> {
+    Err(credsd_core::error::DaemonError::config(
+        "a running daemon is not yet supported on this platform",
+    ))
+}
+
+/// Collects `pairs` into a map, refusing a key given twice by name (credential-tags 3.7).
+fn unique_keys<V>(
+    pairs: Vec<(String, V)>,
+) -> credsd_core::error::Result<std::collections::BTreeMap<String, V>> {
+    let mut map = std::collections::BTreeMap::new();
+    for (k, v) in pairs {
+        // Keys fold to lowercase, so `Team` and `team` are one key given twice.
+        if map.insert(k.to_ascii_lowercase(), v).is_some() {
+            return Err(credsd_core::error::DaemonError::config(format!(
+                "tag {k:?} is given twice"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+/// `KEY=VALUE`. The grammar itself is the daemon's to enforce; this only splits.
+fn parse_tag_pair(value: &str) -> Result<(String, String), String> {
+    value
+        .split_once('=')
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .ok_or_else(|| "expected KEY=VALUE".to_owned())
+}
+
+/// `KEY=VALUE`, or a bare `KEY` that matches any value.
+fn parse_tag_condition(value: &str) -> Result<(String, Option<String>), String> {
+    Ok(match value.split_once('=') {
+        Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+        None => (value.to_owned(), None),
+    })
+}
+
+/// `creds tag set|unset` — thin relay to `credential/tag`.
+#[cfg(unix)]
+async fn cmd_tag(action: TagAction) -> credsd_core::error::Result<()> {
+    let params = match action {
+        TagAction::Set { credential, pairs } => credsd_core::rpc::CredentialTagParams {
+            credential,
+            set: unique_keys(pairs)?,
+            unset: Vec::new(),
+        },
+        TagAction::Unset { credential, keys } => credsd_core::rpc::CredentialTagParams {
+            credential,
+            set: credsd_core::tags::Tags::new(),
+            unset: unique_keys(keys.into_iter().map(|k| (k, ())).collect())?
+                .into_keys()
+                .collect(),
+        },
+    };
+    let socket = credsd_core::config::platform::client_socket_path();
+    credsd_client::credential_tag(&socket, &params)
+        .await
+        .map(drop)
+}
+
+#[cfg(not(unix))]
+async fn cmd_tag(_action: TagAction) -> credsd_core::error::Result<()> {
     Err(credsd_core::error::DaemonError::config(
         "a running daemon is not yet supported on this platform",
     ))
@@ -828,12 +968,23 @@ fn build_provider_params(
             account_id,
             role_name,
             identity_type,
+            allow_role,
+            clear_allowed_roles,
         } => Ok(ProviderParams::AwsIdcSso(ProviderParamsSso {
             start_url,
             sso_region,
             account_id,
             role_name,
             identity_type: identity_type_str(identity_type),
+            // Absent keeps the stored list; `[]` clears it. Only an explicit flag says which,
+            // so no flag at all has to send nothing (credential-retrieval-api Req 17 AC 11).
+            allowed_roles: if clear_allowed_roles {
+                Some(Vec::new())
+            } else if allow_role.is_empty() {
+                None
+            } else {
+                Some(allow_role)
+            },
         })),
 
         BootstrapProvider::AwsIamUser {
@@ -1062,7 +1213,7 @@ fn identity_type_str(t: Option<CliIdentityType>) -> Option<String> {
 async fn send_bootstrap_rpc(
     socket: &std::path::Path,
     params: &credsd_client::ProfileBootstrapParams,
-) -> credsd_core::error::Result<()> {
+) -> credsd_core::error::Result<credsd_client::BootstrapResult> {
     use credsd_core::error::DaemonError;
     match credsd_client::bootstrap(socket, params, &StdinBootstrapHandler).await {
         // Overwriting an existing credential is gated. Approving grants one re-send of these
@@ -1273,46 +1424,14 @@ fn prompt_selection_sync(count: usize) -> credsd_core::error::Result<usize> {
     }
 }
 
-/// Ask the daemon for a profile's manifest — the client's whole view of its own configuration.
-///
-/// The client does not read `config.toml`. Under a system install the daemon owns
-/// `callers/<uid>/` at 0700 and is that tree's sole reader and writer (Req 15), so a client
-/// parsing it would get EACCES; worse, `Path::exists()` reports EACCES as "absent", so the
-/// reads this replaces turned an unreadable config into an empty one and told the user to run a
-/// bootstrap they had already run. `profile/describe` exists precisely so a shim never parses
-/// that file (Req 6 AC 3).
-#[cfg(unix)]
-async fn describe(
-    socket: &std::path::Path,
-    environment: &str,
-) -> credsd_core::error::Result<credsd_client::ProfileManifest> {
-    use credsd_core::error::DaemonError;
-    credsd_client::describe(socket, environment)
-        .await
-        .map_err(|e| match e {
-            // The daemon will not distinguish "no such env" from "you may not have it", so the
-            // remediation has to cover both: bootstrap is what creates the env *and* what
-            // provisions this uid's authorization root.
-            DaemonError::EnvNotFound(name) => DaemonError::config(format!(
-                "env '{name}' not found. Run 'creds bootstrap' first."
-            )),
-            other => other,
-        })
-}
-
-/// Fetch an env's credentials from the daemon and print them in the requested format.
-///
-/// The daemon is the only source. Fetching directly from the provider would reach the same
-/// material without the caller assessment that `serve` performs on every request, so the
-/// audit record would be avoidable by whoever most wants to avoid it.
+/// Fetch one named credential through the daemon and format it for the caller.
 #[cfg(unix)]
 async fn cmd_get(
-    env: Option<String>,
-    credential: Option<String>,
+    credential: String,
+    pair: Option<(String, String)>,
     format: Option<String>,
     claimed: ClaimedIdentity,
 ) -> credsd_core::error::Result<()> {
-    use credsd_client::{fetch_credential_in_env, fetch_from_daemon_uds};
     use credsd_core::config::platform;
     use credsd_core::error::DaemonError;
     use credsd_core::get;
@@ -1320,39 +1439,26 @@ async fn cmd_get(
 
     let fmt = get::OutputFormat::from_str_opt(format.as_deref())?;
     let socket = platform::client_socket_path();
-
-    // Errors pass through as `uds::call` classified them: only a transport failure says to start
-    // the daemon, so a reachable daemon's answer is never reworded here.
-
-    // A `--credential` alongside its `--env` selects that credential under the env's authority
-    // (the atom/group `credential_process` path). Bare `--credential X` has no authorization
-    // context, so it resolves only when X is also a configured env (the shipped 1:1 shape).
-    // `--env` alone resolves the env's default credential.
     let fetch = || async {
-        match (&credential, &env) {
-            (Some(cred), Some(env_name)) => {
-                fetch_credential_in_env(&socket, env_name, cred, claimed).await
-            }
-            (Some(cred), None) => fetch_from_daemon_uds(&socket, cred, claimed).await,
-            (None, Some(env_name)) => fetch_from_daemon_uds(&socket, env_name, claimed).await,
-            (None, None) => Err(DaemonError::config("specify --env or --credential")),
+        if let Some((account_id, role_name)) = &pair {
+            credsd_core::credential_resolve::fetch_role_credential(
+                &socket,
+                None,
+                Some(&credential),
+                account_id,
+                role_name,
+                claimed,
+            )
+            .await
+        } else {
+            credsd_core::credential_resolve::fetch_credential(&socket, &credential, claimed).await
         }
     };
 
     let creds = match fetch().await {
-        Ok(creds) => creds,
-        // Interactive terminal: drive the login flow inline and retry once, so a foreground
-        // `get`/`exec` recovers without a separate command. Non-tty (SDK, CI) just errors.
+        Ok(served) => served,
         Err(DaemonError::ReauthRequired(_)) if std::io::stdin().is_terminal() => {
-            // Route re-authentication through the daemon via profile/login so the token
-            // is updated in callers/<uid>/credentials/<cred>/sso_token.enc.
-            let environment = env
-                .as_deref()
-                .or(credential.as_deref())
-                .unwrap_or_default()
-                .to_string();
             let login_params = credsd_client::ProfileLoginParams {
-                environment,
                 credential: credential.clone(),
                 request_id: None,
             };
@@ -1361,16 +1467,11 @@ async fn cmd_get(
         }
         Err(e) => return Err(e),
     };
-    // Which variable an eval-style format exports is the credential's resolved address, not a
-    // constant, so `get --format shell` and `run` put one credential in one place. Resolved only for
-    // the formats that name a variable: `credential-process` is on an SDK's hot path and names none.
-    // A token exports under the credential's address from the env's manifest, the same declared
-    // `env_var` `run` honors. Only the formats that name a variable need it.
     let token_var = match &creds.data {
         credsd_core::credentials::CredentialData::AccessToken { .. }
             if get::names_a_variable(fmt) =>
         {
-            token_address(&socket, env.as_deref(), credential.as_deref()).await?
+            get::token_export_name(&credential)
         }
         _ => String::new(),
     };
@@ -1380,75 +1481,20 @@ async fn cmd_get(
     Ok(())
 }
 
-/// The variable a token credential exports under, resolved the way `run` resolves it. With `--env`,
-/// the env's manifest supplies the env-level address and the credential's own `env_var`. A credential
-/// named without a set of its own is described under its own name, as before.
-#[cfg(unix)]
-async fn token_address(
-    socket: &std::path::Path,
-    env: Option<&str>,
-    credential: Option<&str>,
-) -> credsd_core::error::Result<String> {
-    use credsd_core::error::DaemonError;
-
-    if let Some(env) = env {
-        let manifest = describe(socket, env).await?;
-        let found = match credential {
-            Some(name) => manifest.credentials.iter().find(|e| e.credential == name),
-            None => manifest.credentials.iter().find(|e| e.default),
-        };
-        if let Some(entry) = found {
-            return Ok(address_of(&manifest.projection.projections, entry));
-        }
-        if credential.is_none() {
-            return Err(DaemonError::config(format!(
-                "env '{env}' has no default credential"
-            )));
-        }
-    }
-    let name = credential.ok_or_else(|| DaemonError::config("specify --env or --credential"))?;
-    let manifest = describe(socket, name).await?;
-    let entry = manifest
-        .credentials
-        .iter()
-        .find(|e| e.credential == name)
-        .ok_or_else(|| {
-            DaemonError::config(format!(
-                "credential '{name}' is not served under its own name"
-            ))
-        })?;
-    Ok(address_of(&std::collections::BTreeMap::new(), entry))
-}
-
-/// One credential's address: the env-level declaration for it, then its own `env_var`, then derived.
-fn address_of(
-    env_decls: &std::collections::BTreeMap<String, credsd_core::projection::ProjectionDecl>,
-    entry: &credsd_core::rpc::CredentialEntry,
-) -> String {
-    let env_decl = env_decls
-        .get(&entry.credential)
-        .and_then(|d| d.address.as_deref());
-    credsd_core::credential_env::token_variable(
-        env_decl,
-        entry.env_var.as_deref(),
-        &entry.credential,
-    )
-}
-
 /// The format argument is still validated before the transport error, so a bad `--format`
 /// is reported as a bad `--format` on every platform rather than being masked by the
 /// missing daemon.
 #[cfg(not(unix))]
 async fn cmd_get(
-    env: Option<String>,
-    credential: Option<String>,
+    credential: String,
+    pair: Option<(String, String)>,
     format: Option<String>,
     claimed: ClaimedIdentity,
 ) -> credsd_core::error::Result<()> {
     use credsd_core::get;
 
     let _ = get::OutputFormat::from_str_opt(format.as_deref())?;
-    let _ = (env, credential, claimed);
+    let _ = (credential, pair, claimed);
 
     Err(credsd_core::error::DaemonError::config(
         "a running daemon is not yet supported on this platform \
@@ -1456,14 +1502,16 @@ async fn cmd_get(
     ))
 }
 
-/// List every credential this uid may reach, once each, with its source type and session status.
+/// List every credential this uid holds, once each, with its kind and session status.
 ///
-/// Two RPCs' worth of information: `credential/list` enumerates (it is the only method with an
-/// all-profiles form), then one `profile/describe` per profile supplies the source type that
-/// enumeration deliberately withholds (Req 13 AC 4). No local status computation — the daemon
-/// owns the sealed tokens, so it is the only party that can read their expiry.
+/// One RPC: `credential/list` enumerates credentials,
+/// and carries each one's kind. No local status computation — the daemon owns the sealed
+/// tokens, so it is the only party that can read their expiry.
 #[cfg(unix)]
-async fn cmd_list(format: &str) -> credsd_core::error::Result<()> {
+async fn cmd_list(
+    format: &str,
+    tags: Vec<(String, Option<String>)>,
+) -> credsd_core::error::Result<()> {
     use credsd_core::config::platform;
 
     match format {
@@ -1477,31 +1525,22 @@ async fn cmd_list(format: &str) -> credsd_core::error::Result<()> {
     }
 
     let socket = platform::client_socket_path();
-    let listed = credsd_client::list(&socket, None).await?;
+    let rows = credsd_client::list(
+        &socket,
+        None,
+        (!tags.is_empty()).then(|| unique_keys(tags)).transpose()?,
+    )
+    .await?
+    .credentials;
 
-    // Profile order as the daemon enumerated it, deduped: a profile appears once per credential
-    // it composes, and each is described once.
-    let mut profiles: Vec<&str> = Vec::new();
-    for summary in &listed.credentials {
-        if !profiles.contains(&summary.environment.as_str()) {
-            profiles.push(&summary.environment);
-        }
-    }
-
-    if profiles.is_empty() {
+    if rows.is_empty() {
         if format == "json" {
             println!("[]");
         } else {
-            eprintln!("No envs configured. Run 'creds bootstrap' to get started.");
+            eprintln!("No credentials configured. Run 'creds bootstrap' to get started.");
         }
         return Ok(());
     }
-
-    let mut manifests = Vec::with_capacity(profiles.len());
-    for environment in profiles {
-        manifests.push(describe(&socket, environment).await?);
-    }
-    let rows = list_rows(&manifests);
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&list_json(&rows))?);
@@ -1511,286 +1550,71 @@ async fn cmd_list(format: &str) -> credsd_core::error::Result<()> {
     Ok(())
 }
 
-/// One row per credential, in first-seen order: a credential composed into several envs is
-/// still one credential, with one source and one session.
 #[cfg(unix)]
-fn list_rows(
-    manifests: &[credsd_client::ProfileManifest],
-) -> Vec<&credsd_core::rpc::CredentialEntry> {
-    let mut rows: Vec<&credsd_core::rpc::CredentialEntry> = Vec::new();
-    for entry in manifests.iter().flat_map(|m| &m.credentials) {
-        if !rows.iter().any(|r| r.credential == entry.credential) {
-            rows.push(entry);
-        }
-    }
-    rows
-}
-
-#[cfg(unix)]
-fn list_json(rows: &[&credsd_core::rpc::CredentialEntry]) -> serde_json::Value {
+fn list_json(rows: &[credsd_core::rpc::CredentialSummary]) -> serde_json::Value {
     rows.iter()
         .map(|c| {
             serde_json::json!({
                 "name": c.credential,
-                "mode": c.source.as_str(),
+                "kind": c.kind.as_str(),
                 "status": c.status.as_str(),
+                "tags": c.tags,
             })
         })
         .collect()
 }
 
-/// MODE is as wide as the longest source spelling, `aws-roles-anywhere`.
+/// Columns are at least 15 and 19 wide (KIND fits `session_credentials`) and grow to the
+/// longest escaped value, so a long name such as `login.<account>-role-<role>` keeps the
+/// columns after it aligned.
 #[cfg(unix)]
-fn list_text(rows: &[&credsd_core::rpc::CredentialEntry]) -> String {
-    let mut out = format!("{:<15} {:<18} STATUS\n", "CREDENTIAL", "MODE");
-    for entry in rows {
-        out.push_str(&format!(
-            "{:<15} {:<18} {}\n",
-            escape_terminal(entry.credential.as_str()),
-            escape_terminal(entry.source.as_str()),
-            escape_terminal(entry.status.as_str()),
-        ));
+fn list_text(rows: &[credsd_core::rpc::CredentialSummary]) -> String {
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|entry| {
+            let tags = entry.tags.iter().map(|(k, v)| format!("{k}={v}"));
+            [
+                escape_terminal(entry.credential.as_str()).to_string(),
+                escape_terminal(entry.kind.as_str()).to_string(),
+                escape_terminal(entry.status.as_str()).to_string(),
+                escape_terminal(&tags.collect::<Vec<_>>().join(" ")).to_string(),
+            ]
+        })
+        .collect();
+    let width = |i: usize, min: usize| {
+        cells
+            .iter()
+            .filter_map(|c| c.get(i))
+            .map(|cell| cell.chars().count())
+            .fold(min, usize::max)
+    };
+    let (name_w, kind_w, status_w) = (width(0, 15), width(1, 19), width(2, 6));
+    let mut out = String::new();
+    let header = ["CREDENTIAL", "KIND", "STATUS", "TAGS"].map(str::to_owned);
+    for [name, kind, status, tags] in std::iter::once(&header).chain(&cells) {
+        let line = format!("{name:<name_w$} {kind:<kind_w$} {status:<status_w$} {tags}");
+        // Only padding is trimmed; a value may end in a space.
+        out.push_str(if tags.is_empty() {
+            line.trim_end()
+        } else {
+            &line
+        });
+        out.push('\n');
     }
     out
 }
 
 /// `list` enumerates through the daemon, and no daemon transport exists on this platform yet.
 #[cfg(not(unix))]
-async fn cmd_list(format: &str) -> credsd_core::error::Result<()> {
+async fn cmd_list(
+    format: &str,
+    _tags: Vec<(String, Option<String>)>,
+) -> credsd_core::error::Result<()> {
     let _ = format;
     Err(credsd_core::error::DaemonError::config(
         "a running daemon is not yet supported on this platform \
          (named pipe transport pending).",
     ))
-}
-
-#[cfg(unix)]
-async fn cmd_config_set(env: String, key: &str, value: &str) -> credsd_core::error::Result<()> {
-    use credsd_core::config::keys;
-    use credsd_core::error::DaemonError;
-
-    if let Some(reason) = keys::is_protected(key) {
-        return Err(DaemonError::config(format!(
-            "cannot set '{}' — {}",
-            key, reason
-        )));
-    }
-    let key_def = keys::find_key(key).ok_or_else(|| {
-        DaemonError::config(format!(
-            "unknown config key '{}'. Run 'creds config keys' to see available settings.",
-            key
-        ))
-    })?;
-    key_def.value_type.validate(value, key).map_err(|e| {
-        let type_name = match key_def.value_type {
-            keys::ValueType::String => "string",
-            keys::ValueType::Boolean => "boolean",
-            keys::ValueType::Integer => "integer",
-            keys::ValueType::Enum(_) => "enum",
-        };
-        DaemonError::config(format!(
-            "'{}' is not a valid {} for '{}'. {}",
-            value, type_name, key, e
-        ))
-    })?;
-
-    let socket = credsd_core::config::platform::client_socket_path();
-    let set: credsd_core::error::Result<credsd_core::rpc::OkResult> = credsd_core::rpc::uds::call(
-        &socket,
-        credsd_core::rpc::METHOD_CONFIG_SET,
-        &credsd_core::rpc::ConfigSetParams {
-            environment: env.clone(),
-            key: key.to_owned(),
-            value: value.to_owned(),
-        },
-        Some(&env),
-    )
-    .await;
-    performed_on_approval(set.map(|_| ())).await
-}
-
-#[cfg(not(unix))]
-async fn cmd_config_set(_: String, _: &str, _: &str) -> credsd_core::error::Result<()> {
-    Err(credsd_core::error::DaemonError::config(
-        "not supported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-async fn cmd_config_get(env: String, key: &str) -> credsd_core::error::Result<ExitCode> {
-    use credsd_core::config::keys;
-    use credsd_core::error::DaemonError;
-
-    if let Some(reason) = keys::is_protected(key) {
-        return Err(DaemonError::config(format!(
-            "cannot read '{}' via config get — {}",
-            key, reason
-        )));
-    }
-    keys::find_key(key).ok_or_else(|| {
-        DaemonError::config(format!(
-            "unknown config key '{}'. Run 'creds config keys' to see available settings.",
-            key
-        ))
-    })?;
-
-    let socket = credsd_core::config::platform::client_socket_path();
-    let result = credsd_client::config_get(&socket, &env, key).await?;
-
-    // An unset key exits 1 with no output, so `$(creds config get …)` in a shell distinguishes
-    // "unset" from "set to the empty string" without parsing prose. Not an error: nothing is
-    // printed on stderr either, so a script can test the status without filtering a message.
-    match result.value {
-        Some(val) => {
-            println!("{}", escape_terminal(&val));
-            Ok(ExitCode::SUCCESS)
-        }
-        None => Ok(ExitCode::FAILURE),
-    }
-}
-
-#[cfg(not(unix))]
-async fn cmd_config_get(_: String, _: &str) -> credsd_core::error::Result<ExitCode> {
-    Err(credsd_core::error::DaemonError::config(
-        "not supported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-async fn cmd_config_unset(env: String, key: &str) -> credsd_core::error::Result<()> {
-    use credsd_core::config::keys;
-    use credsd_core::error::DaemonError;
-
-    if let Some(reason) = keys::is_protected(key) {
-        return Err(DaemonError::config(format!(
-            "cannot unset '{}' — {}",
-            key, reason
-        )));
-    }
-    if let Some(reason) = keys::is_unset_protected(key) {
-        return Err(DaemonError::config(format!(
-            "cannot unset '{}' — {}",
-            key, reason
-        )));
-    }
-    keys::find_key(key).ok_or_else(|| {
-        DaemonError::config(format!(
-            "unknown config key '{}'. Run 'creds config keys' to see available settings.",
-            key
-        ))
-    })?;
-
-    let socket = credsd_core::config::platform::client_socket_path();
-    performed_on_approval(
-        credsd_client::config_unset(&socket, &env, key)
-            .await
-            .map(|_| ()),
-    )
-    .await
-}
-
-#[cfg(not(unix))]
-async fn cmd_config_unset(_: String, _: &str) -> credsd_core::error::Result<()> {
-    Err(credsd_core::error::DaemonError::config(
-        "not supported on this platform",
-    ))
-}
-
-fn cmd_config_keys(format: &str) -> credsd_core::error::Result<()> {
-    use credsd_core::config::keys::{self, ValueType};
-
-    match format {
-        "json" => {
-            let entries: Vec<serde_json::Value> = keys::ALLOWED_KEYS
-                .iter()
-                .map(|k| {
-                    // `values` is present only for an enum, so it is built into the object rather
-                    // than assigned afterwards — the assignment form indexed a `Value`, which
-                    // panics on anything that is not a map.
-                    let values = match k.value_type {
-                        ValueType::Enum(opts) => serde_json::json!(opts),
-                        _ => serde_json::Value::Null,
-                    };
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("key".into(), k.key.into());
-                    obj.insert(
-                        "type".into(),
-                        match k.value_type {
-                            ValueType::String => "string",
-                            ValueType::Boolean => "boolean",
-                            ValueType::Integer => "integer",
-                            ValueType::Enum(_) => "enum",
-                        }
-                        .into(),
-                    );
-                    obj.insert("description".into(), k.description.into());
-                    if !values.is_null() {
-                        obj.insert("values".into(), values);
-                    }
-                    serde_json::Value::Object(obj)
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&entries)?);
-        }
-        _ => {
-            let col_width = keys::ALLOWED_KEYS
-                .iter()
-                .map(|k| k.key.len())
-                .max()
-                .unwrap_or(20)
-                .saturating_add(2);
-            let header_key = "KEY";
-            let header_type = "TYPE";
-            let header_desc = "DESCRIPTION";
-            println!(
-                "{:<width$} {:<10} {}",
-                header_key,
-                header_type,
-                header_desc,
-                width = col_width
-            );
-            let mut last_section: Option<Option<&str>> = None;
-            for k in keys::ALLOWED_KEYS {
-                let current_section = k.section;
-                if last_section.as_ref() != Some(&current_section) {
-                    if last_section.is_some() {
-                        println!();
-                    }
-                    last_section = Some(current_section);
-                }
-                let type_str = match k.value_type {
-                    ValueType::String => "string",
-                    ValueType::Boolean => "boolean",
-                    ValueType::Integer => "integer",
-                    ValueType::Enum(opts) => {
-                        println!(
-                            "{:<width$} {:<10} {} [{}]",
-                            k.key,
-                            "enum",
-                            k.description,
-                            opts.join(", "),
-                            width = col_width
-                        );
-                        continue;
-                    }
-                };
-                println!(
-                    "{:<width$} {:<10} {}",
-                    k.key,
-                    type_str,
-                    k.description,
-                    width = col_width
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Drop an env's composition. Its credentials are untouched — they are reusable atoms.
-#[cfg(unix)]
-async fn remove_env(socket: &std::path::Path, name: &str) -> credsd_core::error::Result<()> {
-    performed_on_approval(credsd_client::env_remove(socket, name).await.map(|_| ())).await
 }
 
 /// `creds revalidate`. A caller root with nothing drifted returns without a challenge.
@@ -1846,8 +1670,7 @@ async fn performed_on_approval(
     }
 }
 
-/// Delete a credential and its sealed material. The daemon refuses while an env still
-/// references it.
+/// Delete a credential and its sealed material, on approval.
 #[cfg(unix)]
 async fn remove_credential(socket: &std::path::Path, name: &str) -> credsd_core::error::Result<()> {
     performed_on_approval(
@@ -1858,79 +1681,34 @@ async fn remove_credential(socket: &std::path::Path, name: &str) -> credsd_core:
     .await
 }
 
-/// Remove an env or a credential — every deletion through the daemon.
-///
-/// Nothing is deleted locally. The sealed material and both TOML files live under
-/// `callers/<uid>/`, a tree the daemon owns at 0700; the client-side deletion this replaces hit
-/// EACCES on that parent, read it as "nothing to delete", and reported success while the
-/// credential and its sealed key survived — the daemon could still mint sessions from it. The
-/// daemon's own answer is now the report: `ENVIRONMENT_NOT_FOUND` means nothing was removed.
-///
-/// There is no remove-everything form. Each removal is a gated operation the daemon describes
-/// and performs on its own approval; a client-side loop over them could only enumerate what
-/// `credential/list` shows, which omits credentials no env references, and would report a reset
-/// that left those credentials and their sealed keys on disk.
+/// Remove one named credential through the daemon's presence-gated mutation.
 #[cfg(unix)]
-async fn cmd_remove(
-    env: Option<String>,
-    credential: Option<String>,
-    force: bool,
-) -> credsd_core::error::Result<()> {
+async fn cmd_remove(credential: String, force: bool) -> credsd_core::error::Result<()> {
     use credsd_core::config::platform;
-    use credsd_core::error::DaemonError;
     use std::io::{self, BufRead, Write};
 
     let socket = platform::client_socket_path();
-
-    let confirm = |prompt: &str| -> credsd_core::error::Result<bool> {
-        if force {
-            return Ok(true);
-        }
-        eprint!("{}", prompt);
+    if !force {
+        eprint!(
+            "Remove credential '{}' and its encrypted data? [y/N] ",
+            credential
+        );
         io::stdout().flush()?;
         let mut line = String::new();
         io::stdin().lock().read_line(&mut line)?;
-        Ok(line.trim().eq_ignore_ascii_case("y"))
-    };
-
-    // Removing a credential (an atom): the daemon refuses while any env still references it,
-    // since that would leave the env pointing at a credential it can no longer resolve.
-    if let Some(credential) = credential {
-        if !confirm(&format!(
-            "Remove credential '{}' and its encrypted data? [y/N] ",
-            credential
-        ))? {
+        if !line.trim().eq_ignore_ascii_case("y") {
             eprintln!("Cancelled.");
             return Ok(());
         }
-        remove_credential(&socket, &credential).await?;
-        eprintln!("Removed credential '{}' and its sealed data.", credential);
-        return Ok(());
     }
-
-    // Removing an env: drop the composition only. Credentials are reusable atoms and are
-    // left intact — `remove --credential` deletes those.
-    let env = env.ok_or_else(|| DaemonError::config("specify --env or --credential"))?;
-    if !confirm(&format!(
-        "Remove env '{}'? (its credentials are left intact) [y/N] ",
-        env
-    ))? {
-        eprintln!("Cancelled.");
-        return Ok(());
-    }
-    remove_env(&socket, &env).await?;
-    eprintln!("Removed env '{}'. Credentials left intact.", env);
+    remove_credential(&socket, &credential).await?;
+    eprintln!("Removed credential '{}' and its sealed data.", credential);
     Ok(())
 }
 
-/// Removal is a daemon mutation, and no daemon transport exists on this platform yet.
 #[cfg(not(unix))]
-async fn cmd_remove(
-    env: Option<String>,
-    credential: Option<String>,
-    force: bool,
-) -> credsd_core::error::Result<()> {
-    let _ = (env, credential, force);
+async fn cmd_remove(credential: String, force: bool) -> credsd_core::error::Result<()> {
+    let _ = (credential, force);
     Err(credsd_core::error::DaemonError::config(
         "a running daemon is not yet supported on this platform \
          (named pipe transport pending).",
@@ -2028,13 +1806,144 @@ mod tests {
     #[test]
     fn get_parses_credential_flag() {
         match parse(&["get", "--credential", "ra-main"]) {
-            Commands::Get {
-                env, credential, ..
-            } => {
-                assert_eq!(env, None);
-                assert_eq!(credential.as_deref(), Some("ra-main"));
-            }
+            Commands::Get { credential, .. } => assert_eq!(credential, "ra-main"),
             _ => panic!("expected Get"),
+        }
+    }
+
+    #[test]
+    fn credential_selector_is_required_and_name_is_its_alias() {
+        // Each command, and the arguments it needs besides the selector.
+        let commands: [(&[&str], &[&str]); 6] = [
+            (&["bootstrap"], &[]),
+            (&["login"], &[]),
+            (&["get"], &[]),
+            (&["remove"], &[]),
+            (&["tag", "set"], &["team=payments"]),
+            (&["tag", "unset"], &["team"]),
+        ];
+        let argv = |command: &[&str], selector: &[&str], rest: &[&str]| {
+            let mut argv = vec!["creds"];
+            argv.extend(command.iter().chain(selector).chain(rest));
+            Cli::try_parse_from(argv)
+        };
+        for (command, rest) in commands {
+            assert!(argv(command, &[], rest).is_err(), "{command:?}");
+            for spelling in ["--credential", "--name"] {
+                assert!(
+                    argv(command, &[spelling, "work"], rest).is_ok(),
+                    "{command:?} {spelling}"
+                );
+                assert!(
+                    argv(command, &[spelling, "work", "--credential", "other"], rest).is_err(),
+                    "{command:?} repeats the selector"
+                );
+            }
+        }
+    }
+
+    /// credential-tags 5.4: the tag filter exists only on `list`, and only `bootstrap` sets tags
+    /// through `--tag`. Walks every command, so a new one that grows `--tag` fails here.
+    #[test]
+    fn only_list_and_bootstrap_take_a_tag() {
+        fn walk(cmd: &clap::Command, path: String, out: &mut Vec<String>) {
+            if cmd.get_arguments().any(|a| a.get_long() == Some("tag")) {
+                out.push(path.clone());
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut found = Vec::new();
+        walk(
+            &<Cli as clap::CommandFactory>::command(),
+            "creds".into(),
+            &mut found,
+        );
+        assert_eq!(found, ["creds bootstrap", "creds list"]);
+    }
+
+    /// `bootstrap` takes exactly one of the credential selector and `--name-prefix`
+    /// (`credential-only-addressing` Requirement 1.2).
+    #[test]
+    fn bootstrap_takes_a_selector_or_a_name_prefix_but_not_both() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["creds", "bootstrap"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+        };
+        assert!(parse(&["--name-prefix", "login."]).is_ok());
+        for spelling in ["--credential", "--name"] {
+            assert!(parse(&[spelling, "work", "--name-prefix", "login."]).is_err());
+        }
+        assert!(parse(&[]).is_err());
+    }
+
+    proptest::proptest! {
+        /// `--account` and `--role` select a pair together or not at all, as the daemon requires
+        /// (Requirement 17 AC 1): either alone is refused before anything is sent.
+        #[test]
+        fn get_takes_account_and_role_together_or_neither(
+            account in "[0-9]{12}",
+            role in "[A-Za-z0-9+=,.@_-]{1,64}",
+        ) {
+            let get = |extra: &[&str]| {
+                let mut args = vec!["credsd", "get", "--credential", "acme"];
+                args.extend_from_slice(extra);
+                Cli::try_parse_from(args)
+            };
+            // `=` keeps a role that starts with `-` a value, not a flag.
+            let (account, role) = (format!("--account={account}"), format!("--role={role}"));
+            proptest::prop_assert!(get(&[&account, &role]).is_ok());
+            proptest::prop_assert!(get(&[&account]).is_err());
+            proptest::prop_assert!(get(&[&role]).is_err());
+        }
+
+        /// Each `--allow-role ACCOUNT:ROLE` becomes one allowed pair of the credential, in order;
+        /// anything missing a side or the separator is refused at parse time. Naming no pair at
+        /// all sends no list, which keeps a credential's own (credential-retrieval-api Req 17
+        /// AC 11), so it must never be confused with the empty list that clears one.
+        #[test]
+        fn bootstrap_sso_allow_role_becomes_the_allowed_pairs(
+            pairs in proptest::collection::vec(("[0-9]{12}", "[A-Za-z0-9+=,.@_-]{1,64}"), 0..5),
+            // Missing a side or the separator, a short or non-digit account, a role outside
+            // Identity Center's characters or over 64, and a second `:` (which would land in
+            // the role): each would seal a pair no request can ever match.
+            malformed in proptest::prop_oneof![
+                "[0-9]{12}", ":[A-Za-z]{1,8}", "[0-9]{12}:",
+                "[0-9]{1,11}:[A-Za-z]{1,8}", "[0-9]{13,16}:[A-Za-z]{1,8}", "[0-9]{6}[a-z]{6}:Admin",
+                "[0-9]{12}:[A-Za-z]{1,8}[/ *!]{1,3}", "[0-9]{12}:[A-Za-z]{65,70}",
+                "[0-9]{12}:[A-Za-z]{1,8}:[A-Za-z]{1,8}",
+            ],
+        ) {
+            let base = [
+                "credsd", "bootstrap", "--credential", "acme", "aws-idc-sso",
+                "--start-url", "https://example.awsapps.com/start", "--sso-region", "us-east-1",
+            ];
+            let flags: Vec<String> = pairs.iter().map(|(a, r)| format!("{a}:{r}")).collect();
+            let mut args: Vec<&str> = base.to_vec();
+            let flags: Vec<String> = flags.iter().map(|f| format!("--allow-role={f}")).collect();
+            args.extend(flags.iter().map(String::as_str));
+            let Commands::Bootstrap { provider: Some(provider), .. } = Cli::try_parse_from(&args).expect("parses").command else {
+                return Err(proptest::test_runner::TestCaseError::fail("expected Bootstrap"));
+            };
+            let Ok(credsd_client::ProviderParams::AwsIdcSso(sso)) = build_provider_params(provider) else {
+                return Err(proptest::test_runner::TestCaseError::fail("expected aws-idc-sso params"));
+            };
+            match sso.allowed_roles {
+                None => proptest::prop_assert!(pairs.is_empty(), "a named pair always sends a list"),
+                Some(list) => {
+                    let got: Vec<(String, String)> =
+                        list.into_iter().map(|p| (p.account_id, p.role_name)).collect();
+                    proptest::prop_assert_eq!(&got, &pairs);
+                    proptest::prop_assert!(!got.is_empty(), "no pair sends no list, never an empty one");
+                }
+            }
+
+            let mut bad: Vec<&str> = base.to_vec();
+            let malformed = format!("--allow-role={malformed}");
+            bad.push(&malformed);
+            proptest::prop_assert!(Cli::try_parse_from(&bad).is_err());
         }
     }
 
@@ -2058,6 +1967,81 @@ mod tests {
     #[test]
     fn standalone_is_not_accepted_anywhere() {
         assert!(Cli::try_parse_from(["credsd", "get", "--env", "dev", "--standalone"]).is_err());
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Commands, clap::Error> {
+        let argv = std::iter::once("credsd").chain(args.iter().copied());
+        Cli::try_parse_from(argv).map(|cli| cli.command)
+    }
+
+    const SSO_BOOTSTRAP: [&str; 8] = [
+        "bootstrap",
+        "--credential",
+        "dev",
+        "aws-idc-sso",
+        "--start-url",
+        "https://example.awsapps.com/start",
+        "--sso-region",
+        "us-west-2",
+    ];
+
+    #[test]
+    fn bootstrap_takes_repeatable_tags() {
+        let mut args = SSO_BOOTSTRAP.to_vec();
+        args.extend(["--tag", "team=payments", "--tag", "stage=prod"]);
+        try_parse(&args).expect("--tag is repeatable on bootstrap");
+    }
+
+    /// Bootstrap sets tags, so a bare key has nothing to set: refused as a bad value, not as an
+    /// unknown flag.
+    #[test]
+    fn bootstrap_tag_needs_a_value() {
+        let mut args = SSO_BOOTSTRAP.to_vec();
+        args.extend(["--tag", "team"]);
+        let err = try_parse(&args).expect_err("a bare key was accepted");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{err}");
+    }
+
+    #[test]
+    fn tag_set_and_unset_parse() {
+        try_parse(&[
+            "tag",
+            "set",
+            "--credential",
+            "dev",
+            "team=payments",
+            "stage=prod",
+        ])
+        .expect("tag set");
+        try_parse(&["tag", "unset", "--credential", "dev", "team", "stage"]).expect("tag unset");
+    }
+
+    proptest::proptest! {
+        /// Distinct keys pass through unchanged; any repeat, in any case, is refused naming the
+        /// key as the repeat spelled it, since keys fold to lowercase (spec 1.4, 3.7).
+        #[test]
+        fn a_repeated_tag_key_is_refused_by_name(
+            pairs in proptest::collection::btree_map("[a-z0-9][a-z0-9._-]{0,20}", "[ -~]{0,20}", 0..8),
+            dup in proptest::option::of(proptest::prelude::any::<proptest::sample::Index>()),
+            upper in proptest::prelude::any::<bool>(),
+        ) {
+            let mut list: Vec<(String, String)> = pairs.clone().into_iter().collect();
+            match dup.filter(|_| !list.is_empty()) {
+                None => proptest::prop_assert_eq!(unique_keys(list).expect("distinct"), pairs),
+                Some(i) => {
+                    let (k, _) = list[i.index(list.len())].clone();
+                    let k = if upper { k.to_ascii_uppercase() } else { k };
+                    list.push((k.clone(), "again".into()));
+                    let err = unique_keys(list).expect_err("repeat accepted").to_string();
+                    proptest::prop_assert!(err.contains(&format!("{k:?}")), "{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn list_takes_a_tag_filter_with_key_only_entries() {
+        try_parse(&["list", "--tag", "team=payments", "--tag", "stage"]).expect("list --tag");
     }
 
     #[test]
@@ -2092,6 +2076,68 @@ mod tests {
             "AdminRole",
         ]);
         assert!(matches!(cmd, Commands::Bootstrap { .. }));
+    }
+
+    /// Clearing the allowed list is its own flag, because no `--allow-role` means "keep what the
+    /// credential has" (credential-retrieval-api Req 17 AC 11) and so cannot also mean "empty it".
+    /// Asking for both at once is a parse error rather than a silent winner.
+    #[test]
+    fn bootstrap_sso_clear_allowed_roles_sends_an_empty_list() {
+        let allowed = |args: &[&str]| {
+            let base = [
+                "bootstrap",
+                "--credential",
+                "dev",
+                "aws-idc-sso",
+                "--start-url",
+                "https://example.awsapps.com/start",
+                "--sso-region",
+                "us-west-2",
+            ];
+            let Commands::Bootstrap {
+                provider: Some(provider),
+                ..
+            } = parse(&[&base[..], args].concat())
+            else {
+                panic!("expected a bootstrap with a provider");
+            };
+            let Ok(credsd_client::ProviderParams::AwsIdcSso(sso)) = build_provider_params(provider)
+            else {
+                panic!("expected aws-idc-sso params");
+            };
+            sso.allowed_roles
+        };
+        assert_eq!(allowed(&[]), None, "no flag keeps the stored list");
+        assert_eq!(
+            allowed(&["--clear-allowed-roles"]),
+            Some(Vec::new()),
+            "the flag clears it"
+        );
+        assert_eq!(
+            allowed(&["--allow-role", "111111111111:Admin"])
+                .expect("a named pair sends a list")
+                .len(),
+            1
+        );
+
+        let both = [
+            "credsd",
+            "bootstrap",
+            "--credential",
+            "dev",
+            "aws-idc-sso",
+            "--start-url",
+            "https://example.awsapps.com/start",
+            "--sso-region",
+            "us-west-2",
+            "--allow-role",
+            "111111111111:Admin",
+            "--clear-allowed-roles",
+        ];
+        assert!(
+            Cli::try_parse_from(both).is_err(),
+            "allowing a pair and clearing the list are contradictory"
+        );
     }
 
     /// A remote login binds no listener, so a fixed callback port would record a redirect URI
@@ -2320,19 +2366,114 @@ mod tests {
     }
 
     #[test]
-    fn login_parses_with_env() {
-        match parse(&["login", "--env", "work"]) {
-            Commands::Login { env, credential } => {
-                assert_eq!(env.as_deref(), Some("work"));
-                assert_eq!(credential, None);
+    fn logout_names_one_credential() {
+        match parse(&["logout", "--credential", "work"]) {
+            Commands::Logout { credential } => assert_eq!(credential, "work"),
+            _ => panic!("expected Logout"),
+        }
+        assert!(
+            Cli::try_parse_from(["creds", "logout"]).is_err(),
+            "logout must name the credential"
+        );
+    }
+
+    /// AC 17: only `ended`, an accepted `Logout`, may say the access-portal session ended.
+    #[test]
+    fn an_ended_logout_says_the_access_portal_session_ended() {
+        let Ok(line) = logout_report("work", &LogoutResult::from(ProviderLogout::Ended)) else {
+            panic!("an ended provider logout must exit zero");
+        };
+        assert!(line.contains("signed out of work"), "{line}");
+        assert!(line.contains("the access-portal session ended"), "{line}");
+        assert!(!line.contains("may still be live"), "{line}");
+    }
+
+    /// AC 17: `token_rejected` says only that the token no longer works at SSO and that the
+    /// access-portal session may still be live, never that it ended.
+    #[test]
+    fn a_token_rejected_logout_says_the_token_no_longer_works_and_the_session_may_be_live() {
+        let Ok(line) = logout_report("work", &LogoutResult::from(ProviderLogout::TokenRejected))
+        else {
+            panic!("a token_rejected provider logout must exit zero");
+        };
+        assert!(line.contains("signed out of work"), "{line}");
+        assert!(line.contains("token no longer works at SSO"), "{line}");
+        assert!(
+            line.contains("access-portal session may still be live"),
+            "{line}"
+        );
+        assert!(!line.contains("session ended"), "{line}");
+    }
+
+    #[test]
+    fn logout_says_whether_it_signed_out_and_warns_when_the_provider_logout_failed() {
+        assert_eq!(
+            logout_report("work", &LogoutResult::from(ProviderLogout::LocalOnly)),
+            Ok("signed out of work; run `creds login --credential work` to sign in again".into())
+        );
+        assert_eq!(
+            logout_report("work", &LogoutResult::from(ProviderLogout::None)),
+            Ok("work was already signed out".into())
+        );
+        let url = "https://example.awsapps.com/start";
+        for expires in [Some("2999-01-01T00:00:00Z"), None] {
+            let failed = LogoutResult::from(ProviderLogout::Failed {
+                start_url: url.into(),
+                access_token_expires_at: expires.map(Into::into),
+            });
+            let Err(warning) = logout_report("work", &failed) else {
+                panic!("a failed provider logout must exit non-zero");
+            };
+            assert!(warning.contains("signed out of work here"), "{warning}");
+            assert!(
+                warning.contains(&format!("To end the SSO session, sign out at {url}")),
+                "{warning}"
+            );
+            // The expiry is the access token's, never presented as the session's end.
+            match expires {
+                Some(at) => {
+                    assert!(
+                        warning.contains(&format!("The access token stays valid until {at}")),
+                        "{warning}"
+                    );
+                    assert!(
+                        warning.contains("the SSO session may last longer"),
+                        "{warning}"
+                    );
+                    assert_eq!(warning.matches(at).count(), 1, "{warning}");
+                }
+                None => assert!(!warning.contains("until"), "{warning}"),
             }
-            _ => panic!("expected Login"),
         }
     }
 
     #[test]
-    fn login_requires_a_env() {
-        assert!(Cli::try_parse_from(["credsd", "login"]).is_err());
+    fn login_names_one_credential() {
+        match parse(&["login", "--credential", "work"]) {
+            Commands::Login { credential } => assert_eq!(credential, "work"),
+            _ => panic!("expected Login"),
+        }
+    }
+
+    /// Login and bootstrap are credential-addressed: `--env` is refused rather than ignored, and
+    /// a credential is required (credential-retrieval-api Requirement 15 AC 10).
+    #[test]
+    fn login_and_bootstrap_take_a_credential_and_refuse_an_env() {
+        for argv in [
+            &["creds", "login"][..],
+            &["creds", "login", "--env", "work"],
+            &[
+                "creds",
+                "bootstrap",
+                "--env",
+                "work",
+                "jwt",
+                "--token-file",
+                "t",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
     }
 
     #[test]
@@ -2355,71 +2496,18 @@ mod tests {
     }
 
     #[test]
-    fn config_set_parses() {
-        let cmd = parse(&["config", "set", "region", "us-east-2", "--env", "demo"]);
-        match cmd {
+    fn config_only_exposes_path() {
+        assert!(matches!(
+            parse(&["config", "path"]),
             Commands::Config {
-                action: ConfigAction::Set { key, value, env },
-            } => {
-                assert_eq!(key, "region");
-                assert_eq!(value, "us-east-2");
-                assert_eq!(env, "demo");
+                action: ConfigAction::Path
             }
-            _ => panic!("expected Config Set"),
-        }
-    }
-
-    #[test]
-    fn config_get_parses() {
-        let cmd = parse(&["config", "get", "region", "--env", "demo"]);
-        match cmd {
-            Commands::Config {
-                action: ConfigAction::Get { key, env },
-            } => {
-                assert_eq!(key, "region");
-                assert_eq!(env, "demo");
+        ));
+        for action in ["set", "get", "unset", "keys"] {
+            match Cli::try_parse_from(["credsd", "config", action]) {
+                Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand),
+                Ok(_) => panic!("config {action} unexpectedly parsed"),
             }
-            _ => panic!("expected Config Get"),
-        }
-    }
-
-    #[test]
-    fn config_unset_parses() {
-        let cmd = parse(&["config", "unset", "sdk.retry_mode", "--env", "demo"]);
-        match cmd {
-            Commands::Config {
-                action: ConfigAction::Unset { key, env },
-            } => {
-                assert_eq!(key, "sdk.retry_mode");
-                assert_eq!(env, "demo");
-            }
-            _ => panic!("expected Config Unset"),
-        }
-    }
-
-    #[test]
-    fn config_keys_parses() {
-        let cmd = parse(&["config", "keys"]);
-        match cmd {
-            Commands::Config {
-                action: ConfigAction::Keys { format },
-            } => {
-                assert_eq!(format, "text");
-            }
-            _ => panic!("expected Config Keys"),
-        }
-    }
-
-    #[test]
-    fn config_keys_json_parses() {
-        let cmd = parse(&["config", "keys", "--format", "json"]);
-        match cmd {
-            Commands::Config {
-                action: ConfigAction::Keys { format },
-            } => {
-                assert_eq!(format, "json");
-            }
-            _ => panic!("expected Config Keys with json format"),
         }
     }
 
@@ -2427,7 +2515,7 @@ mod tests {
     fn list_default_format_is_text() {
         let cmd = parse(&["list"]);
         match cmd {
-            Commands::List { format } => assert_eq!(format, "text"),
+            Commands::List { format, .. } => assert_eq!(format, "text"),
             _ => panic!("expected List"),
         }
     }
@@ -2436,86 +2524,9 @@ mod tests {
     fn list_json_format_parses() {
         let cmd = parse(&["list", "--format", "json"]);
         match cmd {
-            Commands::List { format } => assert_eq!(format, "json"),
+            Commands::List { format, .. } => assert_eq!(format, "json"),
             _ => panic!("expected List with json format"),
         }
-    }
-
-    #[tokio::test]
-    async fn config_set_rejects_protected_key() {
-        let result = cmd_config_set("demo".into(), "credential", "other").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("cannot set 'credential'"));
-        assert!(err.contains("bootstrap"));
-    }
-
-    #[tokio::test]
-    async fn config_set_rejects_unknown_key() {
-        let result = cmd_config_set("demo".into(), "typo.key", "value").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("unknown config key 'typo.key'"));
-        assert!(err.contains("creds config keys"));
-    }
-
-    #[tokio::test]
-    async fn config_set_rejects_invalid_value() {
-        let result = cmd_config_set("demo".into(), "sdk.max_attempts", "-1").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("'-1' is not a valid integer for 'sdk.max_attempts'"));
-    }
-
-    #[tokio::test]
-    async fn config_set_rejects_invalid_enum() {
-        let result = cmd_config_set("demo".into(), "sdk.retry_mode", "exponential").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("'exponential' is not a valid enum for 'sdk.retry_mode'"));
-        assert!(err.contains("expected one of"));
-    }
-
-    #[tokio::test]
-    async fn config_set_rejects_invalid_boolean() {
-        let result = cmd_config_set("demo".into(), "sdk.use_fips_endpoint", "yes").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("'yes' is not a valid boolean for 'sdk.use_fips_endpoint'"));
-    }
-
-    /// Credential-source fields moved to credentials.toml, which `config set` does not edit
-    /// at all — so they are rejected as unknown rather than as protected.
-    #[tokio::test]
-    async fn config_set_rejects_credential_source_keys() {
-        let result = cmd_config_set("demo".into(), "sso.start_url", "https://x.com").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("unknown config key 'sso.start_url'"));
-    }
-
-    #[tokio::test]
-    async fn config_unset_rejects_protected_key() {
-        let result = cmd_config_unset("demo".into(), "credential").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("cannot unset 'credential'"));
-    }
-
-    #[tokio::test]
-    async fn config_unset_rejects_unknown_key() {
-        let result = cmd_config_unset("demo".into(), "fake.key").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("unknown config key 'fake.key'"));
-    }
-
-    #[tokio::test]
-    async fn config_get_rejects_unknown_key() {
-        let result = cmd_config_get("demo".into(), "bogus").await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("unknown config key 'bogus'"));
     }
 
     /// The Info.plist `build.rs` embeds in this binary's `__TEXT,__info_plist` section, read as
@@ -2542,98 +2553,119 @@ mod tests {
     }
 
     #[test]
-    fn environment_flag_is_the_canonical_spelling() {
-        // --environment is the primary flag; --env is a hidden alias. Both must parse.
-        let with_canonical = parse(&["get", "--environment", "dev"]);
-        let with_alias = parse(&["get", "--env", "dev"]);
-        match (with_canonical, with_alias) {
-            (Commands::Get { env: a, .. }, Commands::Get { env: b, .. }) => {
-                assert_eq!(a.as_deref(), Some("dev"));
-                assert_eq!(b.as_deref(), Some("dev"));
-            }
-            _ => panic!("expected Get command"),
+    fn environment_flags_are_detected_exactly() {
+        for flag in ["--environment", "--env", "--environment=dev", "--env=dev"] {
+            assert!(names_an_environment(["get".into(), flag.into()]));
+        }
+        assert!(!names_an_environment([
+            "get".into(),
+            "--env-var=TOKEN".into()
+        ]));
+        assert!(!names_an_environment([
+            "get".into(),
+            "--".into(),
+            "--env".into()
+        ]));
+    }
+
+    #[cfg(unix)]
+    fn summary(name: &str) -> credsd_core::rpc::CredentialSummary {
+        credsd_core::rpc::CredentialSummary {
+            environment: None,
+            credential: name.to_owned(),
+            kind: credsd_core::credentials::CredentialType::SessionCredentials,
+            source: credsd_core::rpc::CredentialSourceType::AwsRolesAnywhere,
+            status: credsd_core::rpc::SessionStatus::Active,
+            tags: credsd_core::tags::Tags::new(),
         }
     }
 
-    #[cfg(unix)]
-    fn manifest(
-        environment: &str,
-        credentials: &[(&str, credsd_core::rpc::CredentialSourceType)],
-    ) -> credsd_client::ProfileManifest {
-        use credsd_core::rpc::{CredentialEntry, SessionStatus};
-        credsd_client::ProfileManifest {
-            environment: environment.to_owned(),
-            credentials: credentials
-                .iter()
-                .map(|(name, source)| CredentialEntry {
-                    credential: (*name).to_owned(),
-                    kind: credsd_core::credentials::CredentialType::SessionCredentials,
-                    source: *source,
-                    env_var: None,
-                    projection: None,
-                    status: SessionStatus::Active,
-                    default: true,
-                })
-                .collect(),
-            projection: Default::default(),
-        }
-    }
-
-    /// A credential shared by two envs lists once, in the order first enumerated.
+    /// Requirement 4.7: `--format json` rows carry `tags`, `{}` when there are none.
     #[cfg(unix)]
     #[test]
-    fn list_rows_are_one_per_credential() {
-        use credsd_core::rpc::CredentialSourceType::{AwsIamUser, AwsIdcSso};
-        let manifests = [
-            manifest("dev", &[("shared", AwsIdcSso)]),
-            manifest("prod", &[("shared", AwsIdcSso), ("ci", AwsIamUser)]),
-        ];
-        let names: Vec<&str> = list_rows(&manifests)
-            .iter()
-            .map(|r| r.credential.as_str())
-            .collect();
-        assert_eq!(names, ["shared", "ci"]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn list_json_is_a_flat_array_of_name_mode_status() {
-        use credsd_core::rpc::CredentialSourceType::AwsRolesAnywhere;
-        let manifests = [manifest("dev", &[("ra", AwsRolesAnywhere)])];
+    fn list_json_is_a_flat_array_of_name_kind_status_and_tags() {
         assert_eq!(
-            list_json(&list_rows(&manifests)),
+            list_json(&[summary("ra")]),
             serde_json::json!([
-                { "name": "ra", "mode": "aws-roles-anywhere", "status": "active" }
+                { "name": "ra", "kind": "session_credentials", "status": "active", "tags": {} }
             ])
         );
     }
 
-    /// The longest source spelling still leaves a gap before STATUS, and no env or region
+    /// The longest kind spelling still leaves a gap before STATUS, and no env or region
     /// column is printed.
     #[cfg(unix)]
     #[test]
-    fn list_text_has_three_aligned_columns() {
-        use credsd_core::rpc::CredentialSourceType::AwsRolesAnywhere;
-        let manifests = [manifest("dev", &[("ra", AwsRolesAnywhere)])];
-        let text = list_text(&list_rows(&manifests));
+    fn list_text_has_four_aligned_columns() {
+        let text = list_text(&[summary("ra")]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0].split_whitespace().collect::<Vec<_>>(),
-            ["CREDENTIAL", "MODE", "STATUS"]
+            ["CREDENTIAL", "KIND", "STATUS", "TAGS"]
         );
         assert_eq!(
             lines[1].split_whitespace().collect::<Vec<_>>(),
-            ["ra", "aws-roles-anywhere", "active"]
+            ["ra", "session_credentials", "active"]
         );
         assert_eq!(lines[0].find("STATUS"), lines[1].find("active"));
+    }
+
+    /// A name longer than the minimum width widens its column instead of pushing KIND and
+    /// STATUS out of line; short names keep the minimum widths.
+    #[cfg(unix)]
+    #[test]
+    fn list_text_widens_for_a_long_name() {
+        let long = "login.123456789012-role-AWSReservedSSO_PowerUserAccess_-2509f939";
+        let text = list_text(&[summary("ra"), summary(long)]);
+        let lines: Vec<&str> = text.lines().collect();
+        let kind_at = lines[0].find("KIND").unwrap();
+        let status_at = lines[0].find("STATUS").unwrap();
+        assert_eq!(kind_at, long.len() + 1);
+        for line in &lines[1..] {
+            assert_eq!(line.find("session_credentials"), Some(kind_at), "{line}");
+            assert_eq!(line.find("active"), Some(status_at), "{line}");
+        }
+        assert_eq!(list_text(&[summary("ra")]).find("KIND"), Some(16));
+    }
+
+    #[cfg(unix)]
+    proptest::proptest! {
+        /// Requirement 4.7: every row's TAGS cell starts under the header and holds the row's
+        /// tags as `key=value` pairs in key order, whatever the names, statuses, and tags.
+        #[test]
+        fn list_text_shows_each_rows_tags_under_tags(
+            rows in proptest::collection::vec((
+                "[a-z0-9][a-z0-9._-]{0,40}",
+                proptest::sample::select(vec![
+                    credsd_core::rpc::SessionStatus::Active,
+                    credsd_core::rpc::SessionStatus::NoSession,
+                    credsd_core::rpc::SessionStatus::DecryptFailed,
+                ]),
+                proptest::collection::btree_map("[a-z0-9][a-z0-9._-]{0,10}", "[ -~]{0,12}", 0..4),
+            ), 1..6)
+        ) {
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|(name, status, tags)| credsd_core::rpc::CredentialSummary { status, tags, ..summary(&name) })
+                .collect();
+            let text = list_text(&rows);
+            let lines: Vec<&str> = text.lines().collect();
+            let at = lines[0].find("TAGS").expect("TAGS header");
+            proptest::prop_assert_eq!(lines[0].get(at..), Some("TAGS"));
+            for (row, line) in rows.iter().zip(&lines[1..]) {
+                let want = row.tags.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
+                proptest::prop_assert_eq!(line.get(at..).unwrap_or(""), want.as_str(), "{}", line);
+                if !want.is_empty() {
+                    proptest::prop_assert_eq!(line.get(at.saturating_sub(1)..at), Some(" "));
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn list_text_escapes_daemon_supplied_names() {
-        use credsd_core::rpc::CredentialSourceType::AwsIdcSso;
-        let manifests = [manifest("dev", &[("evil\x1b[2J", AwsIdcSso)])];
-        assert!(!list_text(&list_rows(&manifests)).contains('\x1b'));
+        assert!(!list_text(&[summary("evil\x1b[2J")]).contains('\x1b'));
     }
 }

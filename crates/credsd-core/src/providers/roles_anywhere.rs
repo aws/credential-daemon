@@ -389,7 +389,11 @@ mod tests {
 fn cert_not_after(cert_der: &[u8]) -> Result<Duration> {
     let cert = x509_cert::Certificate::from_der(cert_der)
         .map_err(|e| DaemonError::provider(format!("certificate: cert-parse-failed: {e}")))?;
-    Ok(cert.tbs_certificate.validity.not_after.to_unix_duration())
+    Ok(cert
+        .tbs_certificate()
+        .validity()
+        .not_after
+        .to_unix_duration())
 }
 
 /// Refuse `now` at or past `not_after`. Only the end of the window is checked: a start bound would

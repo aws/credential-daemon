@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use aws_lc_rs::digest;
 
-use crate::config::{credentials::CredentialSources, DaemonConfig};
+use crate::config::{credentials::CredentialEntries, DaemonConfig};
 use crate::encryption::EncryptionService;
 use crate::error::Result;
 
@@ -183,7 +183,7 @@ pub fn canonical_config(uid: u32, path: &Path, config: &DaemonConfig) -> Result<
         .envs
         .iter()
         .map(|(name, env)| {
-            let creds = env.credential_list(name);
+            let creds = env.credential_list();
             let projections: BTreeMap<&str, String> = env
                 .projections
                 .iter()
@@ -217,16 +217,22 @@ pub fn canonical_config(uid: u32, path: &Path, config: &DaemonConfig) -> Result<
 /// Covers every field of every credential source — provider type, ARNs, endpoints,
 /// role names, regions, token URLs, scopes, etc. A change to any provider-specific
 /// field changes what credential material is fetched.
+///
+/// A credential's tags are covered too, so a hand edit to them is drift. An empty tag set adds
+/// nothing, so an untagged entry keeps the form it was sealed under before tags existed.
 pub fn canonical_credentials(
     uid: u32,
     path: &Path,
-    sources: &CredentialSources,
+    entries: &CredentialEntries,
 ) -> Result<Vec<u8>> {
-    let creds: BTreeMap<&str, serde_json::Value> = sources
+    let creds: BTreeMap<&str, serde_json::Value> = entries
         .iter()
-        .map(|(name, source)| {
-            let v = serde_json::to_value(source)
+        .map(|(name, entry)| {
+            let mut v = serde_json::to_value(&entry.source)
                 .map_err(|e| crate::error::DaemonError::config(e.to_string()))?;
+            if let (false, Some(object)) = (entry.tags.is_empty(), v.as_object_mut()) {
+                object.insert("tags".into(), serde_json::json!(entry.tags));
+            }
             Ok::<_, crate::error::DaemonError>((name.as_str(), v))
         })
         .collect::<std::result::Result<_, _>>()?;

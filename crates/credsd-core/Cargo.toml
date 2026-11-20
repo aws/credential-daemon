@@ -35,7 +35,7 @@ aws-lc-rs = "1"
 # under vendor/rolesanywhere/. Kept as a path dependency so it can later be swapped for a
 # published crate with a one-line change here. Imported as `rolesanywhere_core`.
 rolesanywhere-core = { path = "../../vendor/rolesanywhere/crates/core" }
-x509-cert = "0.2"
+x509-cert = "0.3"
 tempfile = "3"
 
 [features]
@@ -74,6 +74,11 @@ jwt-bearer = []
 # code stays in the tree and CI builds and tests it with this feature.
 kkrs = ["dep:linux-keyutils"]
 
+# Exposes the SSO portal endpoint override used only by tests in dependent crates. Never in
+# `default` and never in a shipped build; see the note above about why this crate has no
+# `default` feature.
+test-seam = []
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["socket", "process", "resource", "signal", "user"] }
 libc = "0.2"
@@ -96,6 +101,7 @@ tempfile = "3"
 proptest = "1"
 wiremock = "0.6"
 mockito = "1"
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

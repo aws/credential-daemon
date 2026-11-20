@@ -1,0 +1,5 @@
+baseurl: "/credential-daemon"
+exclude:
+  - AGENTS.md
+  - docs/specs
+  - docs/design

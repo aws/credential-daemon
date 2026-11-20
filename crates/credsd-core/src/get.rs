@@ -18,6 +18,13 @@ pub fn names_a_variable(format: OutputFormat) -> bool {
     )
 }
 
+/// The variable `creds get` exports a token credential under: the name derived from the
+/// credential, whatever `env_var` the credential records. The recorded `env_var` is not read
+/// here (`credential-only-addressing`; `static-secret-credentials` applicability note).
+pub fn token_export_name(credential: &str) -> String {
+    crate::credential_env::token_variable(None, None, credential)
+}
+
 /// Credential output serialization formats for CLI consumers.
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {

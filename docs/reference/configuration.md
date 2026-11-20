@@ -14,9 +14,9 @@ Source of truth: `crates/credsd-core/src/config/keys.rs` (`ALLOWED_KEYS`),
 `crates/credsd-core/src/config/platform.rs` (paths), and each `std::env::var` call site for
 environment variables.
 
-The daemon owns every file below and is their only writer. Change them with
-[`creds`](commands.md) (`bootstrap`, `config set`, `remove`), not by hand: under a system
-install they belong to the `credsd` account and users cannot read them.
+The daemon owns every file below and is their only writer. Credential sources can be changed
+with [`creds`](commands.md) (`bootstrap`, `remove`). Environment tables are currently invalid. Under a system install the files belong to the `credsd` account and users
+cannot read them.
 
 ## Files and where they live
 
@@ -45,7 +45,7 @@ system socket.
 ├── config.toml                 daemon-wide: [log]
 ├── callers/<uid>/              one per authorized user, mode 0700
 │   ├── owner                   username recorded at provisioning
-│   ├── config.toml             this user's environments
+│   ├── config.toml             this user's settings
 │   ├── credentials.toml        this user's credential sources (no secrets)
 │   └── credentials/<name>/     sealed material for one credential (*.enc)
 └── quarantine/                 Linux: sealed files moved aside after a TPM or keyring reset
@@ -56,56 +56,27 @@ user's first bootstrap. Files are written mode 0600, and credsd warns when it fi
 permissive. Where the master key lives depends on the storage backend; see
 [key security](../key-security.md).
 
-Environment and credential names are 1–64 characters of letters, digits, `.`, `_`, `-`, and
-do not start with `.`.
+Credential names are 1–64 characters of letters, digits, `.`, `_`, `-`, do
+not start with `.`, and are not `default`.
 
 ## config.toml
 
-### Environments
+### Environment tables
 
-An environment is an ordered list of credentials plus the settings handed to a child process.
-
-```toml
-[environments.work]
-credentials = ["work-sso", "audit"]
-identity_type = "human"
-region = "us-west-2"
-
-[environments.work.sdk]
-retry_mode = "adaptive"
-```
-
-| Key | Type | Meaning |
-|---|---|---|
-| `credentials` | array of names | Credentials composed, in order. The first is the default identity, which `creds get` returns when `--credential` is omitted. Omitted: one credential named after the environment. |
-| `credential` | name | Legacy single-credential form. Read, never written. |
-
-Every listed credential must exist in `credentials.toml`, or the file fails to load.
+`[environment]`, `[environments]`, and `[environments.<name>]` are invalid in a caller's
+`config.toml`. Remove these tables from an existing file before revalidating it. The daemon
+does not rewrite the file. Environment parsing and validation code remains for a possible
+future release, but no environment settings are served now.
 
 ### Identity types
 
-`identity_type` classifies an environment or a credential: `human` (default), `automation`,
-`agent`. Privilege ascends `agent` < `automation` < `human`. An environment may compose only
-credentials whose type is no more privileged than its own: a `human` environment composes any,
-an `automation` environment composes `automation` and `agent`, an `agent` environment composes
-only `agent`. An unrecognized value on an environment is treated as `agent` (least-privileged).
-An unrecognized value on a credential is treated as more privileged than `human`: only a
-`human` environment may compose it; `config.toml` fails to load if any other environment does.
-An `agent` environment logs a warning: agent credentials are not yet scoped down and carry the
-role's full permissions.
+`identity_type` classifies a credential as `human` (default), `automation`, or `agent`.
+The credential's type is set at bootstrap and applies to every request for it.
 
 ### Settable keys
 
-`creds config set|get|unset <key> --environment <env>` edits these. `creds config keys` lists
-them. The Variable and AWS config columns name where a consumer that delivers an environment to a
-process — run-time tooling built on the [API](api.md) — places each key: the environment variable
-it exports, and the setting it writes to every section of a generated AWS config.
-
-Two keys are restricted, in different ways. `credential` is blocked for `config get`, `config set`
-and `config unset` alike; change a credential with `creds bootstrap`. `identity_type` is readable
-and settable but cannot be unset: an absent `identity_type` is read as `human`, the most
-privileged tier, so removing it would grant privilege rather than drop it — set it to an explicit
-[tier](#identity-types) instead.
+The keys below describe retained environment configuration code. Because environment tables
+are invalid, these keys cannot currently be set or served. `creds config` exposes only `path`.
 
 | Key | Type | Variable | AWS config | Meaning |
 |---|---|---|---|---|
@@ -153,7 +124,9 @@ them.
 
 One table per credential, keyed by name, tagged by `type`. Secrets are never in this file: each
 is sealed under `credentials/<name>/`. Every type also takes `identity_type`
-(default `human`). An unknown `type` loads as unsupported rather than failing the file.
+(default `human`) and `tags`, an inline table of string values. Tag keys are folded to
+lowercase; two keys that fold to the same key are refused, as are more than 32 tags. An unknown
+`type` loads as unsupported rather than failing the file.
 
 ```toml
 [work-sso]
@@ -172,6 +145,7 @@ role_name = "Developer"
 | `sso_region` | yes | SSO region. |
 | `account_id` | yes | Account. |
 | `role_name` | yes | Role. |
+| `allowed_roles` | no | Other `{ account_id, role_name }` pairs a request may select. The account is 12 digits. Set by `--allow-role` on bootstrap. Default: only the stored pair. |
 
 Sealed: `sso_token.enc`.
 
@@ -222,18 +196,18 @@ AWS Sign-In (`aws login`). No role and no STS call: the token endpoint returns c
 
 | Field | Required | Meaning |
 |---|---|---|
-| `region` | yes | Sign-In region; selects `https://{region}.signin.aws.amazon.com`. Required; no default. The `bootstrap` CLI requires `--region`. |
+| `region` | yes | Sign-In region. Selects the partition's Sign-In host, for example `https://us-east-1.signin.aws.amazon.com`, `https://us-gov-west-1.signin.amazonaws-us-gov.com`, or `https://cn-north-1.signin.amazonaws.cn`. A region in no known AWS partition is refused. Required; no default. The `bootstrap` CLI requires `--region`. |
 | `callback_port` | no | Fixed loopback callback port. Default: ephemeral. Not valid with `remote`. |
 | `remote` | no | Boolean. Cross-device login: no loopback listener; the authorization code is pasted back. Default `false`. |
 | `identity_type` | no | Who the credential is for. Default `human`. |
 
-Sealed: `aws_login_token.enc` (includes the DPoP key).
+Sealed: `aws_login_token.enc`, `dpop_key.enc` (the DPoP key), and `identity.enc` (who signed in).
 
 ### jwt
 
 | Field | Required | Meaning |
 |---|---|---|
-| `env_var` | no | Variable the token is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_` (`my-token` exports `MY_TOKEN`). |
+| `env_var` | no | Variable the token is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_`, and a leading `_` when it would start with a digit (`my-token` exports `MY_TOKEN`). |
 
 Sealed: `jwt.enc`. Expiry is the JWT's `exp` claim. No path is stored.
 
@@ -255,7 +229,7 @@ Sealed: `oauth_client_secret.enc` (`client_secret_basic`) or `oauth_client_key.e
 
 | Field | Required | Meaning |
 |---|---|---|
-| `env_var` | no | Variable the secret is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_`. |
+| `env_var` | no | Variable the secret is exported as to a child. Default: the credential name, upper-cased, with `.`, `-`, and `_` folded to `_`, and a leading `_` when it would start with a digit. |
 | `expires_at` | no | RFC 3339 expiry. Omitted: never expires. |
 | `secret_source` | no | Where the secret came from. Recorded for diagnostics; never read at runtime. |
 

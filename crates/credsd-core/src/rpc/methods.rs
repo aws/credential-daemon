@@ -22,6 +22,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::PROTOCOL_VERSION;
 use crate::config::credentials::validate_name;
+use crate::config::{check_account_id, check_role_name};
 
 /// The kind discriminant, reused verbatim from the credential model rather than
 /// paralleled here. Re-exported so the protocol surface is readable as one thing.
@@ -141,6 +142,12 @@ fn optional_profile_name<'de, D: serde::Deserializer<'de>>(
     Ok(name)
 }
 
+fn credential_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    checked("credential", &name)?;
+    Ok(name)
+}
+
 fn optional_credential_name<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
@@ -151,19 +158,46 @@ fn optional_credential_name<'de, D: serde::Deserializer<'de>>(
     Ok(name)
 }
 
+/// Identity Center's own shapes, the same rules as a stored `RolePair`, so a malformed pair fails
+/// here and never reaches the provider or a log. Like `NAME_RULE`, the message states the rule
+/// and never the value.
+fn optional_account_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    optional_checked(deserializer, check_account_id)
+}
+
+fn optional_role_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    optional_checked(deserializer, check_role_name)
+}
+
+fn optional_checked<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    check: fn(&str) -> Result<(), &'static str>,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(v) = value.as_deref() {
+        check(v).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
 /// Atomic retrieval: material for exactly one credential, or a failure. Never a
 /// default, a sibling, or a profile-shaped result.
 ///
 /// Material-bearing, so this method is reachable over the Unix socket only. It
 /// must never appear in an MCP `tools/list`, under any configuration — a
 /// credential in a model's context is a credential in a transcript. The same
-/// holds for [`METHOD_CREDENTIAL_GET_BATCH`].
+/// holds for [`METHOD_ENVIRONMENT_CREDENTIALS`].
 pub const METHOD_CREDENTIAL_GET: &str = "credential/get";
 
-/// Aggregate retrieval: every credential a profile names, satisfied wholly or not
-/// at all. The caller names the profile and *not* the membership; see
-/// [`GetBatchParams`] for why that is the load-bearing part.
-pub const METHOD_CREDENTIAL_GET_BATCH: &str = "credential/get_batch";
+/// Aggregate retrieval: every credential an environment composes, satisfied wholly or not
+/// at all. The caller names the environment and *not* the membership; see
+/// [`GetBatchParams`] for why that is the load-bearing part. Renamed from
+/// `credential/get_batch` because its subject is an environment.
+pub const METHOD_ENVIRONMENT_CREDENTIALS: &str = "environment/credentials";
 
 /// Enumeration: what credentials exist, what kind each is, and whether it has a
 /// live session. Carries no material, so this is the one retrieval-adjacent method
@@ -192,13 +226,11 @@ pub const NOTIFICATION_PROGRESS: &str = "notifications/progress";
 
 /// Params for [`METHOD_CREDENTIAL_GET`].
 ///
-/// The request names both halves of the decision: `profile` is the authorization
-/// context that supplies restriction (boundary, region, subprocess config), and
-/// `credential` selects the material within it. Naming them separately is what
-/// keeps an atomic retrieval from yielding material that escaped a restriction
-/// the same material would carry under an aggregate retrieval — a credential the
-/// named profile does not reach fails as *not found*, indistinguishably from one
-/// that does not exist.
+/// `credential` alone is a credential-addressed request: served from the credential under its
+/// own restrictions, whatever environments do or do not compose it. `environment` narrows: with
+/// it, the environment must compose the credential (or, without `credential`, supplies the first
+/// entry of its list), and a miss is `ENVIRONMENT_NOT_FOUND` rather than `CREDENTIAL_NOT_FOUND`.
+/// See `credential-retrieval-api` Requirement 10 AC 6-12.
 ///
 /// Unknown members are rejected rather than ignored: silently dropping a
 /// misspelled `claim` would *reduce* restriction, so the strict reading is the
@@ -209,8 +241,13 @@ pub const NOTIFICATION_PROGRESS: &str = "notifications/progress";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetParams {
-    #[serde(deserialize_with = "profile_name")]
-    pub environment: String,
+    /// Absent makes the request credential-addressed (Requirement 10 AC 6).
+    #[serde(
+        default,
+        deserialize_with = "optional_profile_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub environment: Option<String>,
     /// Absent means the credential the profile is configured with. It never
     /// widens to a default or a sibling of the requested one.
     #[serde(
@@ -219,6 +256,20 @@ pub struct GetParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub credential: Option<String>,
+    /// With `role_name`, the Identity Center account an `aws-idc-sso` credential's sign-in mints
+    /// for, in place of its stored one (Requirement 17). Both or neither.
+    #[serde(
+        default,
+        deserialize_with = "optional_account_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub account_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "optional_role_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub role_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<Scope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,7 +318,7 @@ pub enum Claim {
     Unknown,
 }
 
-/// Params for [`METHOD_CREDENTIAL_GET_BATCH`]: a profile, and nothing that names
+/// Params for [`METHOD_ENVIRONMENT_CREDENTIALS`]: a profile, and nothing that names
 /// membership.
 ///
 /// The absence of a `requests` list is the design. A caller-composed set would be
@@ -302,24 +353,25 @@ pub struct GetBatchParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {
-    /// Restricts the manifest to one profile. Absent means every profile.
+    /// Restricts the list to one environment's credentials. Absent means every credential.
     #[serde(
         default,
         deserialize_with = "optional_profile_name",
         skip_serializing_if = "Option::is_none"
     )]
     pub environment: Option<String>,
+    /// Keeps only rows carrying every pair; a `null` value requires the key alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<crate::tags::TagFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
 /// Result of [`METHOD_CREDENTIAL_LIST`]: enumeration, capped by Requirement 13 AC 4.
 ///
-/// Flat rather than grouped by profile. Each entry carries the profile it belongs
-/// to because the model's use for this method is composing a `launch_command`, which
-/// names a profile — the association is what makes the list actionable, not an extra
-/// disclosure about the credential. AC 4's "nothing more" governs the credential's own
-/// attributes, and `source` and `default` are the two this deliberately omits.
+/// One entry per credential the caller holds, whether or not an environment composes it
+/// (Requirement 16 AC 4). With an `environment` filter, the entries are that environment's
+/// credentials, each naming it. `default` stays omitted.
 ///
 /// This type MUST NOT grow toward [`ProfileManifest`]. Requirement 11 AC 2 makes any
 /// field it gains permanent, and AC 4 binds it on the model-facing carrier.
@@ -332,10 +384,20 @@ pub struct ListResult {
 /// whether it would work right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialSummary {
-    pub environment: String,
+    /// The environment the row was listed under, present only when the request filtered by one.
+    /// A credential is listed once whether or not an environment composes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     pub credential: String,
     pub kind: CredentialType,
+    /// Defaulted on decode, as `tags` is, so a newer client still lists from an older daemon.
+    #[serde(default)]
+    pub source: CredentialSourceType,
     pub status: SessionStatus,
+    /// The credential's full tag set, `{}` when it has none, so a row's shape does not depend on
+    /// its content.
+    #[serde(default)]
+    pub tags: crate::tags::Tags,
 }
 
 /// Params for [`METHOD_PROFILE_DESCRIBE`]: exactly one profile, required.
@@ -472,7 +534,7 @@ pub struct CredentialEntry {
 /// spelled for `credentials.toml`, a file a shim never reads — which is the whole
 /// point of Requirement 6 AC 3 — so inheriting its spelling would buy no
 /// compatibility while splitting the casing of a single wire protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSourceType {
     AwsIdcSso,
@@ -501,6 +563,7 @@ pub enum CredentialSourceType {
     /// A pre-issued opaque secret served verbatim, for an API that is not AWS. Carries no
     /// issuer-stated lifetime, so its `expires_at` is whatever the user declared, or `null`.
     StaticSecret,
+    #[default]
     #[serde(other)]
     Unsupported,
 }
@@ -623,7 +686,7 @@ pub enum Provenance {
     Unknown,
 }
 
-/// Result of [`METHOD_CREDENTIAL_GET_BATCH`]: every credential the profile names.
+/// Result of [`METHOD_ENVIRONMENT_CREDENTIALS`]: every credential the profile names.
 ///
 /// There is no per-element status and no partial-success flag, by construction: a
 /// batch either yields every credential or returns one error and no material at
@@ -718,8 +781,12 @@ pub const METHOD_CONFIG_GET: &str = "config/get";
 pub const METHOD_CONFIG_UNSET: &str = "config/unset";
 /// Remove a credential (source + encrypted material). Daemon-side, caller-scoped.
 pub const METHOD_CREDENTIAL_REMOVE: &str = "credential/remove";
+/// Sign a credential out: delete its sealed session, keep its entry. Daemon-side, caller-scoped.
+pub const METHOD_CREDENTIAL_LOGOUT: &str = "credential/logout";
 /// Remove an env. Daemon-side, caller-scoped.
 pub const METHOD_ENV_REMOVE: &str = "environment/remove";
+/// Edit a credential's tags. Daemon-side, caller-scoped.
+pub const METHOD_CREDENTIAL_TAG: &str = "credential/tag";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSetParams {
@@ -754,6 +821,70 @@ pub struct CredentialRemoveParams {
     pub credential: String,
 }
 
+/// Params for [`METHOD_CREDENTIAL_LOGOUT`]: the same shape as a removal.
+pub type CredentialLogoutParams = CredentialRemoveParams;
+
+/// Result of [`METHOD_CREDENTIAL_LOGOUT`]. A logout that returns one has deleted the local session,
+/// if there was one; `provider` says what happened at the identity provider. Build it with
+/// [`LogoutResult::from`], which derives `signed_out`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogoutResult {
+    /// False only for [`ProviderLogout::None`]: there was no session to end.
+    pub signed_out: bool,
+    #[serde(flatten)]
+    pub provider: ProviderLogout,
+}
+
+/// What a logout did at the identity provider, on the wire as `provider`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ProviderLogout {
+    /// SSO accepted `Logout`, ending the sign-in there too.
+    Ended,
+    /// SSO refused the access token or the refresh before it as invalid or expired: no sealed
+    /// token works at SSO, but the access-portal session may still be live.
+    TokenRejected,
+    /// The sign-in has no session at a provider to end (aws-login, aws-web-identity), or no
+    /// sealed SSO token was left to end it with.
+    LocalOnly,
+    /// SSO refused the refresh or `Logout` for another reason, did not answer in time, or the
+    /// sealed token could not be read:
+    /// the session may stay live at the provider until it expires.
+    Failed {
+        /// The credential's SSO start URL, the portal's sign-in page, where the user can sign out
+        /// of the SSO session. Not itself a sign-out action.
+        start_url: String,
+        /// When the newest access token SSO issued expires, the sealed one or one refreshed for
+        /// the logout, from the OIDC `expires_in`; the SSO session may
+        /// last longer. Absent when the token could not be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access_token_expires_at: Option<String>,
+    },
+    /// There was no session to delete, and nothing was sent.
+    None,
+}
+
+impl From<ProviderLogout> for LogoutResult {
+    fn from(provider: ProviderLogout) -> Self {
+        Self {
+            signed_out: provider != ProviderLogout::None,
+            provider,
+        }
+    }
+}
+
+/// Params for [`METHOD_CREDENTIAL_TAG`]: `set` is applied, then `unset` removed, in one write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialTagParams {
+    #[serde(deserialize_with = "credential_name")]
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "crate::tags::Tags::is_empty")]
+    pub set: crate::tags::Tags,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvRemoveParams {
     #[serde(deserialize_with = "profile_name")]
@@ -764,26 +895,38 @@ pub struct EnvRemoveParams {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OkResult {}
 
+/// `credential/bootstrap`'s result. Empty for most providers; an `aws-login` bootstrap names the
+/// credential it saved and who signed in (`aws-login-identity` Requirements 1.4 and 4.4), and
+/// never a token.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootstrapResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::providers::aws_login::Identity>,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Import (UDS only; non-streaming batch seal of discovered static-key profiles)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Import a batch of discovered static-key profiles as `iam-user` credentials.
+/// Import one credential holding a long-term key pair, as an `iam-user` credential.
 ///
 /// Non-streaming: the client parses the AWS shared-credentials file (which the scoped daemon
-/// user cannot read) and sends the discovered profiles; the daemon seals each key pair and
-/// writes the per-uid tree under one write lock. Additive — a name that already exists is
+/// user cannot read) and sends one call per discovered profile; the daemon seals the key pair
+/// and writes the credential only, no environment. Additive — a name that already exists is
 /// skipped, never clobbered.
-pub const METHOD_PROFILE_IMPORT: &str = "environment/import";
+pub const METHOD_CREDENTIAL_IMPORT: &str = "credential/import";
 
-/// Params for [`METHOD_PROFILE_IMPORT`]: the discovered profiles and a dry-run flag.
+/// Params for [`METHOD_CREDENTIAL_IMPORT`]: one credential's fields, flat, and a dry-run flag.
 ///
-/// No `Zeroize` derive on the struct itself: each [`ImportProfile`] is `ZeroizeOnDrop`, so the
-/// secrets scrub when the `Vec` drops. Names are NOT validated at deserialize time — an invalid
-/// name is a per-profile *skip* (Req 2.4), not a params error, so it must survive decoding.
+/// No `Zeroize` derive on the struct itself: [`ImportProfile`] is `ZeroizeOnDrop`, so the secret
+/// scrubs when it drops. The name is NOT validated at deserialize time — an invalid name is a
+/// *skip* (Req 2.4), not a params error, so it must survive decoding.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImportParams {
-    pub profiles: Vec<ImportProfile>,
+    #[serde(flatten)]
+    pub profile: ImportProfile,
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -792,7 +935,9 @@ pub struct ImportParams {
 /// zeroizing conventions: the secret is zeroized on drop and redacted from `Debug` (Req 6.1).
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ImportProfile {
+    /// The credential to create, named after the discovered profile.
     #[zeroize(skip)]
+    #[serde(rename = "credential")]
     pub name: String,
     #[zeroize(skip)]
     pub access_key_id: String,
@@ -800,7 +945,9 @@ pub struct ImportProfile {
     pub secret_access_key: String,
     #[zeroize(skip)]
     pub region: String,
-    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`.
+    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`, and not the tier a
+    /// credential already has: import skips a name that has an entry, so there is never one to
+    /// keep.
     #[zeroize(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
@@ -818,15 +965,11 @@ impl fmt::Debug for ImportProfile {
     }
 }
 
-/// Result of [`METHOD_PROFILE_IMPORT`]: one outcome per submitted profile, in order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportResult {
-    pub outcomes: Vec<ImportOutcome>,
-}
-
-/// A single profile's import outcome, so the client can print the summary without re-deciding.
+/// Result of [`METHOD_CREDENTIAL_IMPORT`]: the credential's outcome, so the client can print the
+/// summary without re-deciding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportOutcome {
+    #[serde(rename = "credential")]
     pub name: String,
     pub status: ImportStatus,
     /// Present for a skip; names why (already exists, invalid name). Never carries secret material.
@@ -856,16 +999,16 @@ pub type DecodedDer = (Vec<u8>, Vec<u8>, Vec<Vec<u8>>);
 /// Run a provider's full bootstrap flow on the daemon and stream notifications back.
 /// The three provider flows: SSO (interactive device code + account/role selection),
 /// IAM-user (client sends key material), Roles Anywhere (client sends cert/key DER).
-pub const METHOD_PROFILE_BOOTSTRAP: &str = "environment/bootstrap";
+pub const METHOD_CREDENTIAL_BOOTSTRAP: &str = "credential/bootstrap";
 
 /// Re-authenticate using saved provider config. SSO re-runs the device code flow;
 /// IAM-user with MFA asks for a code; other sources are no-ops.
-pub const METHOD_PROFILE_LOGIN: &str = "environment/login";
+pub const METHOD_CREDENTIAL_LOGIN: &str = "credential/login";
 
 /// Client-to-daemon notification (no `id`) carrying the user's selection in response to a
 /// `notifications/progress` step during bootstrap/login (account, role, or MFA code).
 /// Not a dispatchable method — `serve_connection` routes it into the in-flight slot directly.
-pub const METHOD_PROFILE_BOOTSTRAP_RESPOND: &str = "environment/bootstrap/respond";
+pub const METHOD_CREDENTIAL_BOOTSTRAP_RESPOND: &str = "credential/bootstrap/respond";
 
 /// Re-seal the snapshot of every drifted load-bearing file in the caller's own caller root. Gated:
 /// a drifted root raises one challenge whose description is the drifted files' contents.
@@ -938,7 +1081,7 @@ impl fmt::Debug for ProviderParams {
 /// `static-secret` provider params — carries the secret itself alongside the non-secret knobs,
 /// the same shape `jwt` uses: the daemon-side bootstrap seals it inline, so a client holding the
 /// secret needs no second round trip. Debug redacts the secret (manual impl below). Rotating it
-/// later is another [`METHOD_PROFILE_BOOTSTRAP`] with a fresh value — there is no standalone
+/// later is another [`METHOD_CREDENTIAL_BOOTSTRAP`] with a fresh value — there is no standalone
 /// seal method, and no way to ask credsd to obtain one.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ProviderParamsStaticSecret {
@@ -960,7 +1103,8 @@ pub struct ProviderParamsStaticSecret {
     #[zeroize(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_source: Option<String>,
-    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`.
+    /// `"human"`, `"automation"`, or `"agent"`. Absent keeps the tier a credential already has,
+    /// and means `"human"` for a new one.
     #[zeroize(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
@@ -982,17 +1126,17 @@ impl fmt::Debug for ProviderParamsStaticSecret {
 /// the same pattern iam-user and roles-anywhere follow: the daemon-side bootstrap seals the
 /// secret inline, so a client with the token already in hand does not need a second round trip.
 /// Debug redacts the JWT (manual impl below). Re-sealing later is another
-/// [`METHOD_PROFILE_BOOTSTRAP`] with a fresh token — there is no standalone seal method.
+/// [`METHOD_CREDENTIAL_BOOTSTRAP`] with a fresh token — there is no standalone seal method.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ProviderParamsJwt {
     /// The bearer JWT. MUST NOT appear in logs or Debug output.
     pub jwt: String,
-    /// Variable this credential projects as into a child process. `None` means the default
-    /// (the credential name, upper-cased), same one `credsd get --format shell` uses.
+    /// Retained variable declaration for a future child-process projection.
     #[zeroize(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_var: Option<String>,
-    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`.
+    /// `"human"`, `"automation"`, or `"agent"`. Absent keeps the tier a credential already has,
+    /// and means `"human"` for a new one.
     #[zeroize(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
@@ -1036,7 +1180,8 @@ pub struct ProviderParamsAwsWebIdentity {
     pub duration_seconds: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_session_name: Option<String>,
-    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`.
+    /// `"human"`, `"automation"`, or `"agent"`. Absent keeps the tier a credential already has,
+    /// and means `"human"` for a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
     /// Fixed loopback port for the OAuth callback server. Use when the IdP requires
@@ -1057,7 +1202,8 @@ pub struct ProviderParamsAwsLogin {
     /// back by hand. For a host whose browser is somewhere else, such as one reached over SSH.
     #[serde(default)]
     pub remote: bool,
-    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`.
+    /// `"human"`, `"automation"`, or `"agent"`. Absent keeps the tier a credential already has,
+    /// and means `"human"` for a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
 }
@@ -1068,13 +1214,31 @@ pub struct ProviderParamsSso {
     pub start_url: String,
     /// Region of the IAM Identity Center instance. Required, with no default.
     pub sso_region: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// With `role_name`, the pair this credential signs in for. Both or neither, like `GetParams`'s
+    /// pair, which the handler enforces over the two fields together. Checked here, also like
+    /// `GetParams`'s pair: an empty value would otherwise reach the gate as a pair the challenge
+    /// renders as nothing and the sign-in then resolves interactively, installing one the approver
+    /// never saw, and a malformed one would be stored as a pair `credential/get` can never match.
+    #[serde(
+        default,
+        deserialize_with = "optional_account_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub account_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "optional_role_name",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub role_name: Option<String>,
-    /// `"human"`, `"automation"`, or `"agent"`. Absent means `"human"`.
+    /// `"human"`, `"automation"`, or `"agent"`. Absent keeps the tier a credential already has,
+    /// and means `"human"` for a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
+    /// Other pairs a request may select; stored as `SsoConfig::allowed_roles`. Absent keeps the
+    /// list a credential already has, so an empty list is the only way to clear one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_roles: Option<Vec<crate::config::RolePair>>,
 }
 
 /// IAM-user provider params — contains secret material; Debug redacts `secret_access_key`.
@@ -1265,38 +1429,40 @@ impl fmt::Debug for ProviderParamsJwtBearer {
     }
 }
 
-/// Params for [`METHOD_PROFILE_BOOTSTRAP`].
+/// Params for [`METHOD_CREDENTIAL_BOOTSTRAP`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProfileBootstrapParams {
-    #[serde(deserialize_with = "profile_name")]
-    pub environment: String,
+    /// The credential to create or replace. Bootstrap never writes an environment
+    /// (`credential-retrieval-api` Requirement 16). Exactly one of this and `name_prefix`.
     #[serde(
         default,
         deserialize_with = "optional_credential_name",
         skip_serializing_if = "Option::is_none"
     )]
     pub credential: Option<String>,
+    /// `aws-login` only: name the credential from the identity that signs in, under this prefix
+    /// (`aws-login-identity` Requirement 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_prefix: Option<String>,
+    /// The credential's tag set after the bootstrap. Absent keeps an existing credential's set;
+    /// a new credential starts with none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<crate::tags::Tags>,
     pub provider: ProviderParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
-/// Params for [`METHOD_PROFILE_LOGIN`].
+/// Params for [`METHOD_CREDENTIAL_LOGIN`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileLoginParams {
-    #[serde(deserialize_with = "profile_name")]
-    pub environment: String,
-    #[serde(
-        default,
-        deserialize_with = "optional_credential_name",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub credential: Option<String>,
+    #[serde(deserialize_with = "credential_name")]
+    pub credential: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
-/// Client-to-daemon notification for [`METHOD_PROFILE_BOOTSTRAP_RESPOND`].
+/// Client-to-daemon notification for [`METHOD_CREDENTIAL_BOOTSTRAP_RESPOND`].
 /// Carries the user's selection (account id, role name, or MFA code).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapRespondParams {
@@ -1370,7 +1536,7 @@ mod tests {
     #[test]
     fn aws_web_identity_rpc_without_region_fails_to_parse() {
         let value = serde_json::json!({
-            "environment": "dev",
+            "credential": "dev",
             "provider": {
                 "type": "aws_web_identity",
                 "authorization_endpoint": "https://idp.example/authorize",
@@ -1396,7 +1562,7 @@ mod tests {
     #[test]
     fn aws_iam_user_rpc_without_region_fails_to_parse() {
         let value = serde_json::json!({
-            "environment": "dev",
+            "credential": "dev",
             "provider": {
                 "type": "aws_iam_user",
                 "access_key_id": "AKIAEXAMPLE",
@@ -1413,6 +1579,32 @@ mod tests {
         .params_as::<ProfileBootstrapParams>()
         .expect_err("missing region must not parse");
         assert!(err.to_string().contains("missing field `region`"), "{err}");
+    }
+
+    proptest::proptest! {
+        /// The logout result on the wire: only `none` is not signed out, only `failed` carries a
+        /// start URL and an access token expiry, and every outcome reads back as it was written.
+        #[test]
+        fn a_logout_result_carries_a_start_url_only_when_the_provider_logout_failed(
+            url in ".*",
+            expires in proptest::option::of(".*"),
+            pick in 0usize..5,
+        ) {
+            let provider = [
+                ProviderLogout::Ended,
+                ProviderLogout::TokenRejected,
+                ProviderLogout::LocalOnly,
+                ProviderLogout::None,
+                ProviderLogout::Failed { start_url: url, access_token_expires_at: expires.clone() },
+            ][pick].clone();
+            let result = LogoutResult::from(provider.clone());
+            let wire = serde_json::to_value(&result).unwrap();
+            let failed = matches!(provider, ProviderLogout::Failed { .. });
+            proptest::prop_assert_eq!(&wire["signed_out"], &serde_json::json!(provider != ProviderLogout::None));
+            proptest::prop_assert_eq!(wire.get("start_url").is_some(), failed);
+            proptest::prop_assert_eq!(wire.get("access_token_expires_at").is_some(), failed && expires.is_some());
+            proptest::prop_assert_eq!(serde_json::from_value::<LogoutResult>(wire).unwrap(), result);
+        }
     }
 
     proptest::proptest! {
@@ -1438,7 +1630,7 @@ mod tests {
             if let Some(region) = &region {
                 provider.insert("region".into(), region.as_str().into());
             }
-            let params = serde_json::json!({ "environment": "dev", "provider": provider });
+            let params = serde_json::json!({ "credential": "dev", "provider": provider });
             let parsed = Request {
                 jsonrpc: Version::V2,
                 id: Id::from(1),
@@ -1459,12 +1651,76 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// `account_id` and `role_name` parse exactly when they satisfy Identity Center's rules,
+        /// independently of each other, and a rejection names the field without echoing the value
+        /// (credential-retrieval-api Requirement 17 AC 2). Both-or-neither is the handler's to
+        /// decide, so either field alone still parses here.
+        #[test]
+        fn a_role_pair_parses_exactly_when_each_part_is_well_formed(
+            account_id in proptest::option::of(proptest::prop_oneof![
+                "[0-9]{12}",
+                "[0-9]{0,14}",
+                ".{0,16}",
+            ]),
+            role_name in proptest::option::of(proptest::prop_oneof![
+                "[A-Za-z0-9+=,.@_-]{1,64}",
+                "[A-Za-z0-9+=,.@_-]{60,70}",
+                ".{0,70}",
+            ]),
+        ) {
+            let account_ok = |v: &str| v.len() == 12 && v.bytes().all(|b| b.is_ascii_digit());
+            let role_ok = |v: &str| {
+                (1..=64).contains(&v.len())
+                    && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
+            };
+            let mut params = serde_json::json!({ "credential": "sso.acme" });
+            if let Some(v) = &account_id {
+                params["account_id"] = v.as_str().into();
+            }
+            if let Some(v) = &role_name {
+                params["role_name"] = v.as_str().into();
+            }
+            let parsed = Request {
+                jsonrpc: Version::V2,
+                id: Id::from(1),
+                method: METHOD_CREDENTIAL_GET.into(),
+                params: params.as_object().cloned(),
+            }
+            .params_as::<GetParams>();
+
+            let bad = [
+                ("account_id", account_id.as_deref().filter(|v| !account_ok(v))),
+                ("role_name", role_name.as_deref().filter(|v| !role_ok(v))),
+            ]
+            .into_iter()
+            .find_map(|(field, value)| value.map(|v| (field, v)));
+            match bad {
+                None => {
+                    let parsed = parsed.map_err(|e| e.message.clone());
+                    proptest::prop_assert!(parsed.is_ok(), "{:?}", parsed.err());
+                    let parsed = parsed.expect("checked");
+                    proptest::prop_assert_eq!(parsed.account_id.as_deref(), account_id.as_deref());
+                    proptest::prop_assert_eq!(parsed.role_name.as_deref(), role_name.as_deref());
+                }
+                Some((field, value)) => {
+                    let err = parsed.expect_err("a malformed part must not parse");
+                    proptest::prop_assert_eq!(err.code, CODE_INVALID_PARAMS);
+                    proptest::prop_assert!(err.message.contains(field), "{}", err.message);
+                    if value.chars().count() >= 8 {
+                        proptest::prop_assert!(!err.message.contains(value), "{}", err.message);
+                    }
+                }
+            }
+        }
+    }
+
     /// A raw RPC `aws_idc_sso` payload without `sso_region` is refused at parse time, before any
     /// approval challenge, the same as `aws_web_identity`.
     #[test]
     fn aws_idc_sso_rpc_without_sso_region_fails_to_parse() {
         let value = serde_json::json!({
-            "environment": "dev",
+            "credential": "dev",
             "provider": {
                 "type": "aws_idc_sso",
                 "start_url": "https://example.awsapps.com/start"
@@ -1485,11 +1741,54 @@ mod tests {
         );
     }
 
+    /// A bootstrap's pair is checked by the rules `credential/get`'s pair is, so the two cannot
+    /// disagree about which pairs exist. An empty `account_id` used to reach the gate as a value
+    /// the challenge rendered as nothing and the sign-in then resolved interactively, installing a
+    /// pair the approver never saw; `"123"` used to be stored as a pair `credential/get`'s own
+    /// validator can never match.
+    #[test]
+    fn an_sso_bootstrap_refuses_a_malformed_role_pair() {
+        let parse = |account_id: &str, role_name: &str| {
+            let params = serde_json::json!({
+                "credential": "sso.acme",
+                "provider": {
+                    "type": "aws_idc_sso",
+                    "start_url": "https://example.awsapps.com/start",
+                    "sso_region": "us-east-1",
+                    "account_id": account_id,
+                    "role_name": role_name,
+                }
+            });
+            Request {
+                jsonrpc: Version::V2,
+                id: Id::from(1),
+                method: METHOD_CREDENTIAL_BOOTSTRAP.into(),
+                params: params.as_object().cloned(),
+            }
+            .params_as::<ProfileBootstrapParams>()
+        };
+
+        parse("111111111111", "Developer").expect("a well-formed pair parses");
+        for (account_id, role_name, field) in [
+            ("", "Developer", "account_id"),
+            ("123", "Developer", "account_id"),
+            ("1111111111111", "Developer", "account_id"),
+            ("11111111111a", "Developer", "account_id"),
+            ("111111111111", "", "role_name"),
+            ("111111111111", "Dev\u{1b}[2J", "role_name"),
+        ] {
+            let err = parse(account_id, role_name).expect_err("a malformed pair must not parse");
+            assert_eq!(err.code, CODE_INVALID_PARAMS, "{err:?}");
+            assert!(err.message.contains(field), "{}", err.message);
+            assert!(!err.message.contains('\u{1b}'), "{}", err.message);
+        }
+    }
+
     #[test]
     fn aws_web_identity_endpoints_must_be_https_without_userinfo() {
         let params = |endpoint: &str| {
             serde_json::json!({
-                "environment": "dev",
+                "credential": "dev",
                 "provider": {
                     "type": "aws_web_identity",
                     "authorization_endpoint": "https://idp.example/authorize",
@@ -1679,6 +1978,7 @@ mod tests {
                 account_id: "111111111111".into(),
                 role_name: "Admin".into(),
                 identity_type: Default::default(),
+                allowed_roles: Vec::new(),
             }),
             CredentialSource::AwsIamUser(IamUserConfig {
                 region: "us-east-1".into(),
@@ -1776,8 +2076,10 @@ mod tests {
 
     fn atomic_params(profile: &str) -> GetParams {
         GetParams {
-            environment: profile.into(),
+            environment: Some(profile.into()),
             credential: None,
+            account_id: None,
+            role_name: None,
             scope: None,
             claim: None,
             request_id: None,
@@ -1799,14 +2101,14 @@ mod tests {
     #[test]
     fn method_names_are_singular_and_do_not_collide_with_mcp() {
         assert_eq!(METHOD_CREDENTIAL_GET, "credential/get");
-        assert_eq!(METHOD_CREDENTIAL_GET_BATCH, "credential/get_batch");
+        assert_eq!(METHOD_ENVIRONMENT_CREDENTIALS, "environment/credentials");
         assert_eq!(METHOD_CREDENTIAL_LIST, "credential/list");
         assert_eq!(METHOD_PROFILE_DESCRIBE, "environment/describe");
         assert_eq!(METHOD_SYSTEM_HEALTH, "system/health");
         for reserved in ["initialize", "tools/list", "tools/call"] {
             assert!(![
                 METHOD_CREDENTIAL_GET,
-                METHOD_CREDENTIAL_GET_BATCH,
+                METHOD_ENVIRONMENT_CREDENTIALS,
                 METHOD_CREDENTIAL_LIST,
                 METHOD_PROFILE_DESCRIBE,
                 METHOD_SYSTEM_HEALTH,
@@ -1886,12 +2188,13 @@ mod tests {
     }
 
     #[test]
-    fn get_params_require_a_profile() {
-        let request = Request::new(Id::from(1), METHOD_CREDENTIAL_GET);
-        let err = request
-            .params_as::<GetParams>()
-            .expect_err("profile is required");
-        assert_eq!(err.code, CODE_INVALID_PARAMS);
+    /// Both names are optional on the wire; the daemon refuses a request that names neither as
+    /// invalid params (Requirement 10 AC 8), which the dispatch tests cover.
+    fn get_params_may_name_a_credential_alone() {
+        let params: GetParams =
+            serde_json::from_str("{\"credential\":\"login\"}").expect("must deserialize");
+        assert_eq!(params.environment, None);
+        assert_eq!(params.credential.as_deref(), Some("login"));
     }
 
     #[test]
@@ -1984,7 +2287,7 @@ mod tests {
             let json = format!("{{\"environment\":\"{name}\",\"credential\":\"{name}\"}}");
             let params: GetParams =
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
-            assert_eq!(params.environment, name);
+            assert_eq!(params.environment.as_deref(), Some(name));
             serde_json::from_str::<GetBatchParams>(&format!("{{\"environment\":\"{name}\"}}"))
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             serde_json::from_str::<ListParams>(&format!("{{\"environment\":\"{name}\"}}"))
@@ -2054,7 +2357,7 @@ mod tests {
 
     #[test]
     fn a_batch_requires_a_profile() {
-        let request = Request::new(Id::from(1), METHOD_CREDENTIAL_GET_BATCH);
+        let request = Request::new(Id::from(1), METHOD_ENVIRONMENT_CREDENTIALS);
         let err = request
             .params_as::<GetBatchParams>()
             .expect_err("profile is required");
@@ -2094,6 +2397,37 @@ mod tests {
             serde_json::to_string(&ListParams::default()).expect("serialize"),
             "{}"
         );
+    }
+
+    /// The tag filter travels as an object: a string value requires that pair, `null` requires
+    /// only the key. It round-trips unchanged, so a client and the daemon agree on what was asked.
+    #[test]
+    fn list_params_carry_a_tag_filter() {
+        let wire = serde_json::json!({ "tags": { "team": "payments", "stage": null } });
+        let params: ListParams =
+            serde_json::from_value(wire.clone()).expect("a tag filter is a known field");
+        assert_eq!(serde_json::to_value(&params).expect("serialize"), wire);
+    }
+
+    /// A filter value that is neither a string nor `null` is refused at parse, not read as
+    /// key-only.
+    #[test]
+    fn list_params_refuse_a_non_string_tag_value() {
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!(["x"]),
+            serde_json::json!({}),
+        ] {
+            let wire = serde_json::json!({ "tags": { "team": bad } });
+            let err = serde_json::from_value::<ListParams>(wire)
+                .expect_err("non-string tag value accepted")
+                .to_string();
+            assert!(
+                !err.contains("unknown field"),
+                "refused for the wrong reason: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2140,31 +2474,136 @@ mod tests {
         }
     }
 
+    /// The published contract names every field a list row carries, so a client generated from it
+    /// knows them all and a strict one does not reject the row.
     #[test]
-    fn enumeration_omits_the_two_fields_the_manifest_adds() {
-        let result = ListResult {
+    fn the_contract_names_every_list_row_field() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../docs/api/openrpc.json"))
+                .expect("the contract parses");
+        // `credential/list` refuses an environment, so a row it returns never carries one.
+        let row = serde_json::to_value(CredentialSummary {
+            environment: None,
+            credential: "login".into(),
+            kind: CredentialType::SessionCredentials,
+            source: CredentialSourceType::AwsIdcSso,
+            status: SessionStatus::Active,
+            tags: Default::default(),
+        })
+        .expect("serialize");
+        let schema = &doc["components"]["schemas"]["CredentialSummary"]["properties"];
+        let documented = schema.as_object().expect("properties");
+        for field in row.as_object().expect("object").keys() {
+            assert!(
+                documented.contains_key(field),
+                "{field} is missing from the contract"
+            );
+        }
+    }
+
+    /// The contract's `CredentialSourceType` lists every value a row can carry, `unsupported`
+    /// included: `credential/list` emits it for a source this build has no provider for.
+    #[test]
+    fn the_contract_names_every_source_type() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../docs/api/openrpc.json"))
+                .expect("the contract parses");
+        let documented = doc["components"]["schemas"]["CredentialSourceType"]["enum"]
+            .as_array()
+            .expect("enum");
+        use CredentialSourceType as T;
+        let all = [
+            T::AwsIdcSso,
+            T::AwsIamUser,
+            T::AwsRolesAnywhere,
+            T::AwsWebIdentity,
+            T::AwsLogin,
+            T::Jwt,
+            T::Oauth,
+            T::JwtBearer,
+            T::StaticSecret,
+            T::Unsupported,
+        ];
+        // A new variant fails to compile here until it is added to `all` above.
+        for source in all {
+            match source {
+                T::AwsIdcSso
+                | T::AwsIamUser
+                | T::AwsRolesAnywhere
+                | T::AwsWebIdentity
+                | T::AwsLogin
+                | T::Jwt
+                | T::Oauth
+                | T::JwtBearer
+                | T::StaticSecret
+                | T::Unsupported => {}
+            }
+            let wire = serde_json::to_value(source).expect("serialize");
+            assert!(
+                documented.contains(&wire),
+                "{wire} is missing from the contract"
+            );
+        }
+    }
+
+    /// A row from a daemon that predates `source` and `tags` still decodes, so a newer client
+    /// lists rather than failing on a daemon that has not restarted yet.
+    #[test]
+    fn a_row_without_source_or_tags_still_decodes() {
+        let row: CredentialSummary = serde_json::from_value(serde_json::json!({
+            "credential": "login",
+            "kind": "session_credentials",
+            "status": "active",
+        }))
+        .expect("a row from an older daemon decodes");
+        assert_eq!(row.source, CredentialSourceType::Unsupported);
+        assert!(row.tags.is_empty());
+    }
+
+    #[test]
+    fn enumeration_carries_only_name_kind_source_status_and_tags() {
+        let unfiltered = ListResult {
             credentials: vec![CredentialSummary {
-                environment: "dev".into(),
+                environment: None,
                 credential: "login".into(),
                 kind: CredentialType::SessionCredentials,
+                source: CredentialSourceType::AwsIdcSso,
                 status: SessionStatus::Active,
+                tags: Default::default(),
             }],
         };
-        let encoded = serde_json::to_value(&result).expect("serialize");
+        let encoded = serde_json::to_value(&unfiltered).expect("serialize");
         let summary = encoded["credentials"][0].as_object().expect("object");
         let mut keys: Vec<&str> = summary.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["credential", "environment", "kind", "status"]);
+        // An unfiltered row names no environment: a credential is listed once whether or not one
+        // composes it (credential-retrieval-api Requirement 16 AC 4).
+        // `tags` is always present, `{}` when the credential has none, so a row's shape does not
+        // depend on its content.
+        assert_eq!(keys, ["credential", "kind", "source", "status", "tags"]);
 
-        // Requirement 13 AC 4 caps this method at name, kind, and status. These are
-        // the two fields the manifest carries and enumeration must not, and the
-        // model-facing carrier is why: a field added here is permanent.
-        for manifest_only in ["source", "default", "projection", "region"] {
+        // Requirement 13 AC 4 caps this method at name, kind, source type, status, and tags. These
+        // are the fields the manifest carries and enumeration must not.
+        for manifest_only in ["default", "projection", "region", "env_var"] {
             assert!(
                 !summary.contains_key(manifest_only),
                 "{manifest_only} must not reach the enumeration"
             );
         }
+    }
+
+    /// A row's tags survive the wire exactly, so a client can show what it filtered on.
+    #[test]
+    fn a_list_row_carries_its_tags() {
+        let wire = serde_json::json!({
+            "credential": "login",
+            "kind": "session_credentials",
+            "source": "aws_idc_sso",
+            "status": "active",
+            "tags": { "stage": "prod", "team": "payments" },
+        });
+        let row: CredentialSummary = serde_json::from_value(wire.clone()).expect("parse");
+        assert_eq!(serde_json::to_value(&row).expect("serialize"), wire);
     }
 
     #[test]
@@ -2410,14 +2849,19 @@ mod tests {
             assert!(rendered.contains("redacted"), "{rendered}");
             assert!(rendered.contains("work"), "{rendered}");
         }
-        // The whole batch round-trips, dry_run defaults to false, and the params Debug (which
-        // delegates to the redacting ImportProfile Debug) does not leak the secret.
+        // One credential's fields round-trip flat, dry_run defaults to false, and the params
+        // Debug (which delegates to the redacting ImportProfile Debug) does not leak the secret.
         let json = format!(
-            "{{\"profiles\":[{{\"name\":\"work\",\"access_key_id\":\"a\",\"secret_access_key\":\"{SECRET}\",\"region\":\"us-east-1\"}}]}}"
+            "{{\"credential\":\"work\",\"access_key_id\":\"a\",\"secret_access_key\":\"{SECRET}\",\"region\":\"us-east-1\"}}"
         );
         let params: ImportParams = serde_json::from_str(&json).expect("decode");
         assert!(!params.dry_run);
-        assert_eq!(params.profiles[0].name, "work");
+        assert_eq!(params.profile.name, "work");
+        // The array form is gone: a batch of profiles is not a credential.
+        assert!(serde_json::from_str::<ImportParams>(
+            "{\"profiles\":[{\"credential\":\"work\",\"access_key_id\":\"a\",\"secret_access_key\":\"s\",\"region\":\"r\"}]}"
+        )
+        .is_err());
         assert!(
             !format!("{params:?}").contains(SECRET),
             "params Debug leaked secret"
@@ -2451,6 +2895,8 @@ mod tests {
     fn with_params_builds_an_object_and_round_trips_through_params_as() {
         let params = GetParams {
             credential: Some("login".into()),
+            account_id: None,
+            role_name: None,
             claim: Some(Claim::Agentic),
             request_id: Some("corr-1".into()),
             ..atomic_params("dev")
