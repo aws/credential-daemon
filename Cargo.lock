@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "creds"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "credsd-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "credsd-core",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "credsd-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "credsd-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
