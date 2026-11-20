@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 285121f23efb965adfcd73beed959896136fc698e1005a000dd7bcba89026811 # shrinks to token = "n+EMrWo_=6Gkyl==G_LMu+0__h.qG==3=Uu=J==XeCRp_DUl=dp==+++2y+a=2_/ue=/=9=+=.5Fe94+Ds.C+_X=_+_+R=gx=Y=g", (code, status) = (Some("UnauthorizedException"), 401)
+cc 1cae8363a4a8089afa8b0611e5c5f250f277d2d421c149e61cdf9223a1848131 # shrinks to new_token = "a", refresh_token = "A", (refresh_status, refresh_code) = (200, None), (logout_status, logout_code) = (200, None)

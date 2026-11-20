@@ -200,8 +200,8 @@ sudo credsd install --storage-backend file   # also bakes --insecure-backend; us
 ### From source
 
 Build with the `tpm` feature, which links the system tpm2-tss libraries (headers and
-`pkg-config` needed at build time). Without it the `tpm` backend cannot be selected at all,
-and `install` errors unless a backend is named.
+`pkg-config` needed at build time). Without it, `tpm` is never selected, even when `/dev/tpmrm0`
+exists: auto-detect fails, and naming `tpm` is refused as not compiled into the build.
 
 Two invocations, not one: a single workspace build resolves one `credsd-core` for every
 member, which would hand `creds` the tpm-linked rlib. The client must never link tpm2-tss,
@@ -218,10 +218,16 @@ sudo credsd install
 
 `install` creates the `credsd` system user (`useradd --system`, shell `/usr/sbin/nologin`)
 if absent, chowns the data directory to it and restricts it to 0700, writes `credsd.service`
-and `credsd.socket`, and runs `systemctl enable --now credsd.socket`. The service unit declares
-`RuntimeDirectory=`, `StateDirectory=` and `LogsDirectory=` for the paths below, so systemd
-keeps their ownership and mode. When the backend resolves to `tpm` and a `tss` group exists,
-the unit gets `SupplementaryGroups=tss` so the service account can open `/dev/tpmrm0`.
+and `credsd.socket`, and runs `systemctl enable --now credsd.socket`. `install` creates and
+restricts the data and log directories below itself — the service unit does not name them,
+and `/run/credsd` belongs to `credsd.socket` as the parent of its `ListenStream=`.
+
+The units use only directives present in systemd 219, the oldest version credsd supports
+(Amazon Linux 2). systemd ignores a directive it does not recognize instead of refusing the
+unit, so a newer directive would leave an old host quietly misconfigured.
+
+When the backend resolves to `tpm` and a `tss` group exists, the unit gets
+`SupplementaryGroups=tss` so the service account can open `/dev/tpmrm0`.
 
 | Item | Path |
 |---|---|
@@ -263,11 +269,12 @@ build.
 
 `credsd serve` runs the daemon in the foreground as your own uid. This is an unsupported,
 deliberate mode for development. It refuses to run as root, binds the socket under your user
-data directory (where `creds` finds it), and needs a data directory you can write:
+data directory (where `creds` finds it), and needs a data directory you can write. It also needs
+the backend named, and a key already created by `credsd init --storage-backend <name>`:
 
 ```bash
-CREDSD_DATA_DIR="$HOME/.local/share/credsd" credsd serve                    # Linux
-CREDSD_DATA_DIR="$HOME/Library/Application Support/credsd" credsd serve     # macOS
+CREDSD_DATA_DIR="$HOME/.local/share/credsd" credsd serve --storage-backend <name>                # Linux
+CREDSD_DATA_DIR="$HOME/Library/Application Support/credsd" credsd serve --storage-backend <name>  # macOS
 ```
 
 What it gives up: the master key and every sealed credential sit under your uid, so any
@@ -296,5 +303,4 @@ credsd uninstall --user       # macOS user-scoped install
 ```
 
 Uninstall removes the service definition and leaves configuration and credentials in place.
-To remove your credentials too, run `creds remove --environment <name>` for each environment,
-then `creds remove --credential <name>` for each credential. Each removal needs approval.
+To remove your credentials too, run `creds remove --credential <name>` for each credential. Each removal needs approval.

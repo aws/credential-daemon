@@ -69,7 +69,7 @@ fn decode<T: DeserializeOwned>(line: &[u8]) -> std::result::Result<T, RpcError> 
     // that and JSON-RPC's per-element semantics are what it must not get.
     if value.is_array() {
         return Err(RpcError::invalid_params(
-            "JSON-RPC batches are not supported; use credential/get_batch",
+            "JSON-RPC batches are not supported; use environment/credentials",
         ));
     }
     serde_json::from_value(value).map_err(|e| RpcError::invalid_request(e.to_string()))
@@ -88,7 +88,7 @@ mod tests {
         CredentialType, DomainCode, GetBatchParams, GetBatchResult, GetParams, HealthResult, Id,
         ListResult, Material, Outcome, ProfileManifest, Projection, Provenance, Scope,
         SessionStatus, Version, CODE_INVALID_PARAMS, CODE_PARSE_ERROR, METHOD_CREDENTIAL_GET,
-        METHOD_CREDENTIAL_GET_BATCH,
+        METHOD_ENVIRONMENT_CREDENTIALS,
     };
     use chrono::{DateTime, Utc};
     use proptest::prelude::*;
@@ -103,8 +103,10 @@ mod tests {
 
     fn atomic_params(environment: &str) -> GetParams {
         GetParams {
-            environment: environment.into(),
+            environment: Some(environment.into()),
             credential: None,
+            account_id: None,
+            role_name: None,
             scope: None,
             claim: None,
             request_id: None,
@@ -165,7 +167,7 @@ mod tests {
                 "a batch is refused before any domain operation is identified: {batch}"
             );
             assert!(
-                err.message.contains("credential/get_batch"),
+                err.message.contains("environment/credentials"),
                 "{}",
                 err.message
             );
@@ -337,13 +339,13 @@ mod tests {
 
         #[test]
         fn get_params_round_trip(
-            environment in name_strategy(),
+            environment in proptest::option::of(name_strategy()),
             credential in proptest::option::of(name_strategy()),
             scope in proptest::option::of(any::<String>().prop_map(|s| Scope(Value::String(s)))),
             claim in proptest::option::of(Just(Claim::Agentic)),
             request_id in proptest::option::of(any::<String>()),
         ) {
-            let params = GetParams { environment, credential, scope, claim, request_id };
+            let params = GetParams { environment, credential, account_id: None, role_name: None, scope, claim, request_id };
             let request = Request::with_params(Id::from(1), METHOD_CREDENTIAL_GET, &params)
                 .expect("object params");
             let line = encode_request(&request).expect("encode");
@@ -359,7 +361,7 @@ mod tests {
                 claim: Some(Claim::Agentic),
                 request_id: None,
             };
-            let request = Request::with_params(Id::from(1), METHOD_CREDENTIAL_GET_BATCH, &params)
+            let request = Request::with_params(Id::from(1), METHOD_ENVIRONMENT_CREDENTIALS, &params)
                 .expect("object params");
             let line = encode_request(&request).expect("encode");
             let decoded = decode_request(&line).expect("decode");
@@ -400,10 +402,12 @@ mod tests {
         fn enumerations_round_trip(environment in name_strategy(), credential in name_strategy()) {
             let result = ListResult {
                 credentials: vec![CredentialSummary {
-                    environment,
+                    environment: Some(environment),
                     credential,
                     kind: CredentialType::AccessToken,
+                    source: crate::rpc::CredentialSourceType::StaticSecret,
                     status: SessionStatus::Expiring,
+                    tags: crate::tags::Tags::from([("team".into(), "payments".into())]),
                 }],
             };
             let response = Response::success(Id::from(1), result);

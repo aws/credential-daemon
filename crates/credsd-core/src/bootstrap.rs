@@ -1,42 +1,11 @@
 //! Small credential-setup helpers shared across the crate.
 //!
 //! The interactive bootstrap flows live on the daemon (`credsd-daemon`'s `server/bootstrap.rs`),
-//! which owns the keystore and the per-uid tree. What remains here is what is still called
-//! directly: the env credential-list append the daemon reuses when writing `config.toml`, and the
-//! two secret readers the client uses before handing material to `environment/bootstrap` — one
-//! line-oriented and interactive ([`read_secret`]), one whole-content from a file or a pipe
-//! ([`read_secret_text`]).
+//! which owns the keystore and the per-uid tree. What remains here is the two secret readers the
+//! client uses before handing material to `credential/bootstrap` — one line-oriented and
+//! interactive ([`read_secret`]), one whole-content from a file or a pipe ([`read_secret_text`]).
 
-use crate::config::EnvConfig;
 use crate::error::{DaemonError, Result};
-
-/// APPEND `credential` to a bootstrap-targeted env's credential list (idempotent), so
-/// `bootstrap --env prod --credential x` grows an existing `prod` instead of clobbering its
-/// composition. Any legacy singular `credential` is folded into the canonical `credentials`
-/// list first.
-///
-/// The `credentials` line is ALWAYS written explicitly — even the 1:1 case — so a bootstrapped
-/// env is self-describing rather than relying on the env-name fallback. Re-bootstrap is
-/// additive:
-///   - `credsd bootstrap --env foo`                 → `[environments.foo]` `credentials = ["foo"]`
-///   - `credsd bootstrap --env foo --credential bar` → `credentials = ["foo", "bar"]`
-///
-/// (`EnvConfig::credential_list` keeps its fallback-to-env-name for reading legacy or
-/// hand-written configs that omit the line.)
-///
-/// `pub` so the daemon-side bootstrap handler can reuse the same logic without duplicating it.
-pub fn append_env_credential(env_config: &mut EnvConfig, credential: &str) {
-    let mut creds = std::mem::take(&mut env_config.credentials);
-    if let Some(legacy) = env_config.credential.take() {
-        if !creds.contains(&legacy) {
-            creds.push(legacy);
-        }
-    }
-    if !creds.iter().any(|c| c == credential) {
-        creds.push(credential.to_string());
-    }
-    env_config.credentials = creds;
-}
 
 /// Read a secret (the long-term secret access key) without echoing it, never from argv.
 ///
@@ -174,44 +143,5 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("/nonexistent/credsd-secret-test"), "{text}");
         assert!(text.contains("cannot read secret"), "{text}");
-    }
-
-    fn env_with(credentials: Vec<&str>, legacy: Option<&str>) -> EnvConfig {
-        EnvConfig {
-            credentials: credentials.into_iter().map(String::from).collect(),
-            credential: legacy.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn append_grows_an_existing_env_without_clobbering() {
-        let mut env = env_with(vec!["ra-main", "sso-admin"], None);
-        append_env_credential(&mut env, "iam-broker");
-        assert_eq!(env.credentials, ["ra-main", "sso-admin", "iam-broker"]);
-    }
-
-    #[test]
-    fn append_is_idempotent() {
-        let mut env = env_with(vec!["ra-main", "sso-admin"], None);
-        append_env_credential(&mut env, "ra-main");
-        assert_eq!(env.credentials, ["ra-main", "sso-admin"]);
-    }
-
-    #[test]
-    fn append_folds_legacy_singular_credential() {
-        let mut env = env_with(vec![], Some("ra-main"));
-        append_env_credential(&mut env, "sso-admin");
-        assert_eq!(env.credentials, ["ra-main", "sso-admin"]);
-        assert!(env.credential.is_none(), "legacy field cleared");
-    }
-
-    #[test]
-    fn one_to_one_writes_the_credential_explicitly() {
-        // The 1:1 case is written explicitly (no reliance on the env-name fallback), so the
-        // bootstrapped env is self-describing.
-        let mut env = env_with(vec![], None);
-        append_env_credential(&mut env, "dev");
-        assert_eq!(env.credentials, ["dev"]);
     }
 }

@@ -75,7 +75,7 @@ the CLI.
      obtain the result over the UDS RPC instead, or SHALL report a clear
      "daemon required / not reachable" error when the daemon is unavailable.
 
-### Requirement 2: Import through the daemon (`environment/import`)
+### Requirement 2: Import through the daemon (`credential/import`)
 
 **User story:** As a user migrating existing `~/.aws/credentials` profiles into
 credsd, I want import to seal my keys where the daemon serves them, without the
@@ -92,28 +92,29 @@ CLI opening the keychain.
      remain client-side (existing `import::discover_*` logic), including its
      zeroization of secret material.
 
-2.2. The client SHALL send the discovered profiles to the daemon in a single
-     `environment/import` RPC carrying, per profile: name, access key id, secret
-     access key, region, and identity type. The RPC SHALL NOT be a streaming
-     method (it is non-interactive).
+2.2. The client SHALL send each discovered profile to the daemon in its own
+     `credential/import` RPC carrying one credential: its name (`credential`),
+     access key id, secret access key, region, and identity type. The RPC SHALL
+     NOT accept an array of profiles, and SHALL NOT be a streaming method (it is
+     non-interactive).
 
 2.3. The daemon SHALL, for each profile, in `callers/<uid>/`:
      seal the key pair (`iam_user::persist_key_pair`), write the `iam-user`
-     credential source to `credentials.toml`, and wrap it in a same-named
-     one-to-one env in `config.toml` — the same effect as an `iam-user`
-     `environment/bootstrap`, but for N profiles under **one** per-uid write lock and
-     with a **single** caller-cache eviction after all writes.
+     credential source to `credentials.toml`. It SHALL NOT write an environment
+     (credential-retrieval-api Requirement 16). This is the same effect as an `iam-user`
+     `credential/bootstrap`, for one credential per call.
 
 2.4. The daemon SHALL skip a profile WHEN its name fails `validate_name`, OR no
      region resolves for it (empty region), OR a credential of that name already
      exists in the caller's `credentials.toml` (import is additive, never a
-     clobber). Skips SHALL NOT abort the batch.
+     clobber). A skip is an outcome, not an error, so the client continues with the
+     next profile.
 
 2.5. WHEN the request sets `dry_run`, the daemon SHALL evaluate 2.4 against the
      caller's real per-uid tree and return the would-import / would-skip
-     decision per profile, and SHALL write nothing.
+     decision for the credential, and SHALL write nothing.
 
-2.6. The `environment/import` result SHALL report a per-profile outcome
+2.6. The `credential/import` result SHALL report the credential's outcome
      (imported / skipped-with-reason) so the client can print the summary. The
      daemon SHALL NOT write to the client's stdout/stderr; the client binary
      prints outcomes.
@@ -121,7 +122,7 @@ CLI opening the keychain.
 2.7. WHEN the calling uid has no provisioned caller root directory
      (`Denied(NoRoot)` — no `callers/<uid>/` root, i.e. a first-time caller; not
      the root *user*), the daemon SHALL auto-provision `callers/<uid>/owner`
-     before writing, matching `environment/bootstrap` behavior. All other deny
+     before writing, matching `credential/bootstrap` behavior. All other deny
      reasons SHALL be refused as not-found.
 
 2.8. WHEN the client finds no importable profiles, it SHALL report that and send
@@ -161,7 +162,7 @@ keychain and writes the wrong (flat) config tree.
 
 4.2. Removal SHALL be verified to break no build target and no test. `credsd
      login` / `credsd bootstrap` (no provider) re-auth SHALL continue to work
-     via their existing daemon RPCs (`environment/login`), which do not depend on
+     via their existing daemon RPCs (`credential/login`), which do not depend on
      `reauth::login`.
 
 ### Requirement 5: `--storage-backend` is not supported by the client
@@ -181,13 +182,13 @@ from the backend the daemon actually booted with.
 ### Requirement 6: Security
 
 **User story:** As a security reviewer, I want import's bulk secret material
-handled no more exposed than a single-credential `environment/bootstrap` already
+handled no more exposed than a single-credential `credential/bootstrap` already
 is — the same in-memory zeroization, log/`Debug` redaction, and local-socket-only
 path.
 
 #### Acceptance Criteria
 
-6.1. Secret access keys carried by `environment/import` SHALL reuse the existing
+6.1. Secret access keys carried by `credential/import` SHALL reuse the existing
      zeroizing wire type conventions (as `ProviderParamsIamUser` already does:
      `Zeroize` with the secret field zeroized and redacted from `Debug`).
 
@@ -196,14 +197,14 @@ path.
      (Req 6.1), and the daemon's typed material zeroizes after sealing. The
      serialized transport buffers — the JSON `Vec<u8>` written to the socket and
      any intermediate `serde_json::Value` — are NOT scrubbed and hold the secret
-     in plaintext until dropped; this matches the existing `environment/bootstrap`
+     in plaintext until dropped; this matches the existing `credential/bootstrap`
      path and is tracked as a separate hardening follow-up rather than promised
      here.
 
 6.3. No secret value SHALL be logged on either side. Per-profile audit/log lines
      SHALL name the credential and outcome only.
 
-6.4. The UDS authorization model SHALL be unchanged: `environment/import` SHALL be
+6.4. The UDS authorization model SHALL be unchanged: `credential/import` SHALL be
      subject to the same peer-uid authorization (with the bootstrap-style
      first-time auto-provision of 2.7) as other mutating methods.
 
@@ -212,8 +213,9 @@ path.
 - **Migrating existing flat-tree data** into the per-uid tree. Users who
   imported under the old client path have data the daemon never read; a separate
   migration (or a re-import) is out of scope here.
-- **Changing the retrieval methods** (`get`, `get_batch`, `list`, `describe`) or
-  the streaming `environment/bootstrap` / `environment/login` handlers.
+- **Changing the retrieval methods** (`get`, `list`; `environment/credentials` and `describe`
+  are not dispatched, per `credential-only-addressing` Requirement 4.1) or
+  the streaming `credential/bootstrap` / `credential/login` handlers.
 - **Changing which backend the daemon selects** or how it selects it.
 - **A Windows/named-pipe client transport.** This feature follows the existing
   `#[cfg(unix)]` UDS surface; non-unix client commands remain stubbed as they are

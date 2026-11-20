@@ -117,7 +117,8 @@ impl Renewer for ClientCredentialsProvider {
                 .map_err(|e| {
                     DaemonError::provider(format!(
                         "oauth credential '{}': no client secret or key — run bootstrap: {}",
-                        self.credential_name, e
+                        self.credential_name,
+                        e.detail()
                     ))
                 })?;
             token::ClientCredentialsAuth::PrivateKeyJwt { pkcs8 }

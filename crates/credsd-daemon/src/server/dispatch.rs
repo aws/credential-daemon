@@ -8,10 +8,14 @@
 //!
 //! Every domain failure is re-expressed from the Phase-2 HTTP surface without weakening it:
 //! an unauthorized caller (deny-by-absence, `Unresolved`, or peerless) is refused *before*
-//! any store lookup and receives `ENVIRONMENT_NOT_FOUND`, indistinguishable from an absent
-//! subject (Requirement 8 AC 3-4). The distinct deny reasons survive only in the audit
-//! record, exactly as they did over HTTP.
+//! any store lookup and receives `CREDENTIAL_NOT_FOUND` with one message, indistinguishable from
+//! a name it does not hold (Requirement 8 AC 3-4, 7). That holds for every credential-addressed
+//! method: `credential/get`, `credential/logout`, `credential/remove`, `credential/login`,
+//! `credential/bootstrap`, and `credential/import` (Requirement 15 AC 10).
+//! `credential/bootstrap/respond` is a notification with no answer. The distinct deny reasons
+//! survive only in the audit record, logged when the connection is accepted.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -40,18 +44,22 @@ use credsd_core::presence::{
     METHOD_PRESENCE_ENROLL, METHOD_PRESENCE_REVOKE, METHOD_PRESENCE_STATUS, METHOD_REQUEST_APPROVE,
     METHOD_REQUEST_GET, METHOD_REQUEST_LIST, METHOD_REQUEST_WITHDRAW,
 };
+use credsd_core::providers::sso::LogoutEnded;
 use credsd_core::providers::ReauthInput;
 use credsd_core::rpc::{
     Claim, ConfigGetParams, ConfigGetResult, ConfigSetParams, ConfigUnsetParams, CredentialEntry,
-    CredentialRemoveParams, CredentialResult, CredentialSourceType, CredentialSummary,
-    CredentialType, DescribeParams, DomainCode, EnvRemoveParams, GetBatchParams, GetBatchResult,
-    GetParams, HealthResult, ListParams, ListResult, Material, OkResult, ProfileManifest,
-    Projection, Provenance, Request, Response, RpcError, SessionStatus, METHOD_CONFIG_GET,
-    METHOD_CONFIG_SET, METHOD_CONFIG_UNSET, METHOD_CREDENTIAL_GET, METHOD_CREDENTIAL_GET_BATCH,
-    METHOD_CREDENTIAL_LIST, METHOD_CREDENTIAL_REMOVE, METHOD_ENV_REMOVE, METHOD_FILE_REVALIDATE,
-    METHOD_PROFILE_BOOTSTRAP, METHOD_PROFILE_DESCRIBE, METHOD_PROFILE_IMPORT, METHOD_PROFILE_LOGIN,
-    METHOD_SYSTEM_HEALTH,
+    CredentialLogoutParams, CredentialRemoveParams, CredentialResult, CredentialSourceType,
+    CredentialSummary, CredentialTagParams, CredentialType, DescribeParams, DomainCode,
+    EnvRemoveParams, GetBatchParams, GetBatchResult, GetParams, HealthResult, ListParams,
+    ListResult, LogoutResult, Material, OkResult, ProfileManifest, Projection, Provenance,
+    ProviderLogout, Request, Response, RpcError, SessionStatus, METHOD_CONFIG_GET,
+    METHOD_CONFIG_SET, METHOD_CONFIG_UNSET, METHOD_CREDENTIAL_BOOTSTRAP, METHOD_CREDENTIAL_GET,
+    METHOD_CREDENTIAL_IMPORT, METHOD_CREDENTIAL_LIST, METHOD_CREDENTIAL_LOGIN,
+    METHOD_CREDENTIAL_LOGOUT, METHOD_CREDENTIAL_REMOVE, METHOD_CREDENTIAL_TAG,
+    METHOD_ENVIRONMENT_CREDENTIALS, METHOD_ENV_REMOVE, METHOD_FILE_REVALIDATE,
+    METHOD_PROFILE_DESCRIBE, METHOD_SYSTEM_HEALTH,
 };
+use credsd_core::tags::Tags;
 
 /// The kind every configured source resolves to today. All shipped sources (SSO, IAM user,
 /// Roles Anywhere) mint session credentials; no source produces a bare access token as its
@@ -64,6 +72,8 @@ pub struct CallerState {
     pub config: Arc<DaemonConfig>,
     pub store: Arc<CredentialStore>,
     pub credentials: Arc<CredentialSources>,
+    /// Each credential's tags, by name. A credential with none has no entry.
+    pub tags: Arc<HashMap<String, Tags>>,
     /// Modification times of the two files this state was built from, sampled at load. A
     /// later request compares them against the files on disk and reloads on a mismatch, so
     /// an edit made by anything other than the daemon is not served stale for the process
@@ -85,6 +95,10 @@ pub struct CallerState {
     /// Drift status of `credentials.toml`, sampled the same way. Every served credential's
     /// source is in this file, so nothing is served while it is not valid (Requirement 3.2).
     pub credentials_drift: DriftStatus,
+    /// Why the caller's files parsed but did not validate, or `None`. While set, `config` and
+    /// `credentials` are empty and every caller read refuses with this reason
+    /// (`credential-tags` Requirement 1.5), rather than reading as a caller with nothing.
+    pub config_invalid: Option<String>,
 }
 
 impl Drop for CallerState {
@@ -275,7 +289,7 @@ impl Daemon {
         // Drift is checked on the parse that is served, before validation: a file that parses but
         // does not validate is not drift, and reading it as drift would point the owner at a
         // revalidation that finds nothing to reseal.
-        let parsed = DaemonConfig::parse_from(&caller_root);
+        let parsed = DaemonConfig::parse_entries_from(&caller_root);
         let (config_drift, credentials_drift) = match (&parsed, self.integrity.read(uid)) {
             (_, Err(_)) => (DriftStatus::Unverifiable, DriftStatus::Unverifiable),
             (Ok((config, credentials)), Ok(record)) => (
@@ -288,18 +302,33 @@ impl Daemon {
             ),
             (Err(_), Ok(_)) => (DriftStatus::Drifted, DriftStatus::Drifted),
         };
-        let (config, credentials) = match parsed {
-            Ok((config, credentials)) => match config.validate(&credentials) {
-                Ok(()) => (config, credentials),
-                Err(errors) => {
-                    tracing::warn!(
-                        uid,
-                        errors = %errors.join("; "),
-                        "caller config does not validate; serving nothing until it is fixed"
-                    );
-                    Default::default()
+        let mut config_invalid = None;
+        let (config, credentials, tags) = match parsed {
+            Ok((config, mut entries)) => {
+                let checked = credsd_core::config::credentials::check_tags(&mut entries)
+                    .map_err(|e| vec![e.detail()]);
+                let mut credentials = CredentialSources::new();
+                let mut tags = HashMap::new();
+                for (name, entry) in entries {
+                    if !entry.tags.is_empty() {
+                        tags.insert(name.clone(), entry.tags);
+                    }
+                    credentials.insert(name, entry.source);
                 }
-            },
+                match checked.and_then(|()| config.validate(&credentials)) {
+                    Ok(()) => (config, credentials, tags),
+                    Err(errors) => {
+                        let errors = errors.join("; ");
+                        tracing::warn!(
+                            uid,
+                            errors = %errors,
+                            "caller config does not validate; serving nothing until it is fixed"
+                        );
+                        config_invalid = Some(errors);
+                        Default::default()
+                    }
+                }
+            }
             Err(_) => Default::default(),
         };
         if config.envs.is_empty() {
@@ -320,7 +349,6 @@ impl Daemon {
         };
         let store = Arc::new(CredentialStore::new(
             uid,
-            &config,
             &credentials,
             self.encryption.clone(),
             self.bootstrap_lock(uid),
@@ -337,10 +365,12 @@ impl Daemon {
             config: Arc::new(config),
             store,
             credentials: Arc::new(credentials),
+            tags: Arc::new(tags),
             sources,
             refresh,
             config_drift,
             credentials_drift,
+            config_invalid,
         });
         // Replaces any entry a concurrent caller inserted. The displaced state's refresh task
         // is aborted by its `Drop` once the last in-flight request holding it finishes, so a
@@ -405,6 +435,7 @@ impl Daemon {
             config: Arc::new(config),
             store,
             credentials: Arc::new(credentials),
+            tags: Default::default(),
             // Stamp from the daemon's own caller root so the injected state reads as fresh.
             // It must be the root this daemon serves: stamping a globally resolved path would
             // pin the daemon to whatever tree a concurrent case had left in `CREDSD_DATA_DIR`,
@@ -414,6 +445,7 @@ impl Daemon {
             refresh: None,
             config_drift: DriftStatus::Valid { hash: [0u8; 32] },
             credentials_drift: DriftStatus::Valid { hash: [0u8; 32] },
+            config_invalid: None,
         });
         crate::server::lock(&daemon.registry).insert(uid, state);
         daemon
@@ -460,6 +492,8 @@ pub(crate) enum Method {
     ConfigGet,
     ConfigUnset,
     CredentialRemove,
+    CredentialLogout,
+    CredentialTag,
     EnvRemove,
     FileRevalidate,
     /// Handled by `serve_connection` via `bootstrap::handle_profile_bootstrap`; this
@@ -483,7 +517,7 @@ impl Method {
     fn parse(name: &str) -> Option<Self> {
         match name {
             METHOD_CREDENTIAL_GET => Some(Self::Get),
-            METHOD_CREDENTIAL_GET_BATCH => Some(Self::GetBatch),
+            METHOD_ENVIRONMENT_CREDENTIALS => Some(Self::GetBatch),
             METHOD_CREDENTIAL_LIST => Some(Self::List),
             METHOD_PROFILE_DESCRIBE => Some(Self::Describe),
             METHOD_SYSTEM_HEALTH => Some(Self::Health),
@@ -491,11 +525,13 @@ impl Method {
             METHOD_CONFIG_GET => Some(Self::ConfigGet),
             METHOD_CONFIG_UNSET => Some(Self::ConfigUnset),
             METHOD_CREDENTIAL_REMOVE => Some(Self::CredentialRemove),
+            METHOD_CREDENTIAL_LOGOUT => Some(Self::CredentialLogout),
+            METHOD_CREDENTIAL_TAG => Some(Self::CredentialTag),
             METHOD_ENV_REMOVE => Some(Self::EnvRemove),
             METHOD_FILE_REVALIDATE => Some(Self::FileRevalidate),
-            METHOD_PROFILE_BOOTSTRAP => Some(Self::ProfileBootstrap),
-            METHOD_PROFILE_LOGIN => Some(Self::ProfileLogin),
-            METHOD_PROFILE_IMPORT => Some(Self::ProfileImport),
+            METHOD_CREDENTIAL_BOOTSTRAP => Some(Self::ProfileBootstrap),
+            METHOD_CREDENTIAL_LOGIN => Some(Self::ProfileLogin),
+            METHOD_CREDENTIAL_IMPORT => Some(Self::ProfileImport),
             METHOD_REQUEST_APPROVE => Some(Self::RequestApprove),
             METHOD_REQUEST_GET => Some(Self::RequestGet),
             METHOD_REQUEST_LIST => Some(Self::RequestList),
@@ -528,7 +564,9 @@ impl Method {
             Self::ConfigSet => Self::ConfigGet,
             Self::ConfigGet => Self::ConfigUnset,
             Self::ConfigUnset => Self::CredentialRemove,
-            Self::CredentialRemove => Self::EnvRemove,
+            Self::CredentialRemove => Self::CredentialLogout,
+            Self::CredentialLogout => Self::CredentialTag,
+            Self::CredentialTag => Self::EnvRemove,
             Self::EnvRemove => Self::FileRevalidate,
             Self::FileRevalidate => Self::ProfileBootstrap,
             Self::ProfileBootstrap => Self::ProfileLogin,
@@ -553,6 +591,8 @@ impl Method {
             Self::ConfigSet
             | Self::ConfigUnset
             | Self::CredentialRemove
+            | Self::CredentialLogout
+            | Self::CredentialTag
             | Self::EnvRemove
             | Self::FileRevalidate
             | Self::ProfileBootstrap
@@ -577,32 +617,36 @@ impl Method {
 }
 
 /// The exposure matrix of Requirement 13 AC 2, as one exhaustive table.
-fn exposed(method: Method, carrier: Carrier) -> bool {
+pub(crate) fn exposed(method: Method, carrier: Carrier) -> bool {
     match (method, carrier) {
         // Material — Unix socket only, never a model-facing carrier.
         (Method::Get, Carrier::Uds) => true,
         (Method::Get, Carrier::Stdio) => false,
-        (Method::GetBatch, Carrier::Uds) => true,
+        (Method::GetBatch, Carrier::Uds) => false,
         (Method::GetBatch, Carrier::Stdio) => false,
         // Enumeration — no material; the one retrieval-adjacent method a model may reach.
         (Method::List, Carrier::Uds) => true,
         (Method::List, Carrier::Stdio) => true,
         // Manifest — no material, but carries projection inputs a model has no use for.
-        (Method::Describe, Carrier::Uds) => true,
+        (Method::Describe, Carrier::Uds) => false,
         (Method::Describe, Carrier::Stdio) => false,
         // Liveness — no material, no config.
         (Method::Health, Carrier::Uds) => true,
         (Method::Health, Carrier::Stdio) => true,
         // Mutation — UDS only; a model has no need to write config.
-        (Method::ConfigSet, Carrier::Uds) => true,
+        (Method::ConfigSet, Carrier::Uds) => false,
         (Method::ConfigSet, Carrier::Stdio) => false,
-        (Method::ConfigGet, Carrier::Uds) => true,
+        (Method::ConfigGet, Carrier::Uds) => false,
         (Method::ConfigGet, Carrier::Stdio) => false,
-        (Method::ConfigUnset, Carrier::Uds) => true,
+        (Method::ConfigUnset, Carrier::Uds) => false,
         (Method::ConfigUnset, Carrier::Stdio) => false,
         (Method::CredentialRemove, Carrier::Uds) => true,
         (Method::CredentialRemove, Carrier::Stdio) => false,
-        (Method::EnvRemove, Carrier::Uds) => true,
+        (Method::CredentialLogout, Carrier::Uds) => true,
+        (Method::CredentialLogout, Carrier::Stdio) => false,
+        (Method::CredentialTag, Carrier::Uds) => true,
+        (Method::CredentialTag, Carrier::Stdio) => false,
+        (Method::EnvRemove, Carrier::Uds) => false,
         (Method::EnvRemove, Carrier::Stdio) => false,
         (Method::FileRevalidate, Carrier::Uds) => true,
         (Method::FileRevalidate, Carrier::Stdio) => false,
@@ -650,6 +694,17 @@ pub async fn dispatch(
     if !exposed(method, carrier) {
         return Response::failure(id, RpcError::method_not_found(&request.method));
     }
+    if matches!(method, Method::Get | Method::List)
+        && request
+            .params
+            .as_ref()
+            .is_some_and(|params| params.contains_key("environment"))
+    {
+        return Response::failure(
+            id,
+            RpcError::invalid_params("`environment` is not supported; name a `credential`"),
+        );
+    }
     match handle(method, request, peer, daemon).await {
         Ok(value) => Response::success(id, value),
         Err(error) => Response::failure(id, error),
@@ -665,13 +720,15 @@ async fn handle(
     match method {
         Method::Health => to_value(HealthResult::default()),
         Method::Get => get(request, peer, daemon).await,
-        Method::GetBatch => get_batch(request, peer, daemon).await,
+        Method::GetBatch => environment_credentials(request, peer, daemon).await,
         Method::List => list(request, peer, daemon),
         Method::Describe => describe(request, peer, daemon),
         Method::ConfigSet => config_set(request, peer, daemon).await,
         Method::ConfigGet => config_get(request, peer),
         Method::ConfigUnset => config_unset(request, peer, daemon).await,
         Method::CredentialRemove => credential_remove(request, peer, daemon).await,
+        Method::CredentialLogout => credential_logout(request, peer, daemon).await,
+        Method::CredentialTag => credential_tag(request, peer, daemon).await,
         Method::EnvRemove => env_remove(request, peer, daemon).await,
         Method::FileRevalidate => crate::server::revalidate::handle(request, peer, daemon).await,
         // Non-streaming batch seal, routed here directly (unlike bootstrap/login).
@@ -717,72 +774,189 @@ async fn handle(
 
 async fn get(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value, RpcError> {
     let params: GetParams = request.params_as()?;
-    let uid = authorized_uid(peer)?;
+    // The form of the request decides the miss code, never what the caller's config holds, so
+    // the code discloses nothing the caller did not already know (Requirement 8 AC 7).
+    let credential_addressed = params.environment.is_none();
+    if params.credential.is_none() {
+        return Err(RpcError::invalid_params(
+            "credential/get needs a credential",
+        ));
+    }
+    if params.account_id.is_some() != params.role_name.is_some() {
+        return Err(RpcError::invalid_params(
+            "credential/get needs both account_id and role_name, or neither",
+        ));
+    }
+    let miss = if credential_addressed {
+        credential_not_found
+    } else {
+        not_found
+    };
+    let uid = if credential_addressed {
+        credential_access(peer)?
+    } else {
+        authorized_uid(peer)?
+    };
     let caller = daemon.caller_state(uid);
-    assess_config(&caller.config, peer, &params.environment, params.claim);
-    if let Some(refusal) = serve_refusal(daemon, uid, &caller, &params.environment) {
+    let (environment, credential) = (params.environment.as_deref(), params.credential.as_deref());
+    // Audit and drift run before anything can miss (Requirement 10 AC 10).
+    assess_config(&caller.config, peer, environment, credential, params.claim);
+    if let Some(refusal) = serve_refusal(daemon, uid, &caller, environment, credential) {
         return Err(refusal);
     }
 
-    let env = caller
-        .config
-        .envs
-        .get(&params.environment)
-        .ok_or_else(not_found)?;
-    // Absent `credential` is the profile's default; the store resolves that via `get`. A named
-    // `credential` is honored only when the profile actually reaches it — anything else fails as
-    // not-found, indistinguishable from absent (Requirement 8 AC 4). This is the Open Decision 1
-    // guard: while boundary application is deferred, the daemon must not honor an arbitrary
-    // credential unrestricted.
-    let (credential, lookup) = match params.credential.as_deref() {
-        None => {
-            let name = env.default_credential(&params.environment);
-            (name, caller.store.get(uid, &params.environment).await)
+    // Credential-addressed: served from the credential alone, whatever environments compose it.
+    // Environment-addressed: the environment must compose the credential, and only narrows, since
+    // the material comes from the same per-credential lookup (Requirement 10 AC 6-8).
+    let credential = match (params.environment.as_deref(), params.credential) {
+        (Some(environment), credential) => {
+            let members = caller
+                .config
+                .envs
+                .get(environment)
+                .ok_or_else(not_found)?
+                .credential_list();
+            match credential {
+                Some(c) if members.contains(&c) => c,
+                Some(_) => return Err(not_found()),
+                None => members.into_iter().next().ok_or_else(not_found)?,
+            }
         }
-        Some(c)
-            if env
-                .credential_list(&params.environment)
-                .iter()
-                .any(|m| m == c) =>
-        {
-            (c.to_owned(), caller.store.get_credential(uid, c).await)
-        }
-        Some(_) => return Err(not_found()),
+        (None, Some(c)) if caller.credentials.contains_key(&c) => c,
+        (None, _) => return Err(miss()),
     };
-    to_value(lookup_to_result(credential, lookup, &params.environment)?)
+    // A pair is read only once the credential resolves, so it never changes a miss, and the
+    // stored pair folds into the request without one (Requirement 17 AC 3-4).
+    let pair = match (params.account_id.as_deref(), params.role_name.as_deref()) {
+        (Some(account_id), Some(role_name)) => match caller.credentials.get(&credential) {
+            Some(CredentialSource::AwsIdcSso(sso))
+                if sso.account_id == account_id && sso.role_name == role_name =>
+            {
+                None
+            }
+            Some(CredentialSource::AwsIdcSso(sso))
+                if sso
+                    .allowed_roles
+                    .iter()
+                    .any(|p| p.account_id == account_id && p.role_name == role_name) =>
+            {
+                Some((account_id, role_name))
+            }
+            // Any other pair the sign-in may hold still needs the presence-gated approval that
+            // adding it to the list takes (`presence-gated-operations` Req 1.7). Audited like a
+            // served pair, so a caller probing the list leaves a record.
+            Some(CredentialSource::AwsIdcSso(_)) => {
+                tracing::warn!(
+                    event = "credential.role_selected",
+                    uid,
+                    credential = %credential,
+                    account_id,
+                    role_name,
+                    outcome = "refused",
+                    "credential requested for an account and role it does not allow"
+                );
+                return Err(RpcError::domain(
+                    DomainCode::RoleNotAllowed,
+                    format!(
+                        "credential '{credential}' does not allow account {account_id}, role \
+                         {role_name}; re-bootstrap it with --allow-role to add it"
+                    ),
+                ));
+            }
+            Some(_) => {
+                return Err(RpcError::domain(
+                    DomainCode::RoleSelectionUnsupported,
+                    "account_id and role_name apply only to an aws-idc-sso credential",
+                ))
+            }
+            None => return Err(miss()),
+        },
+        _ => None,
+    };
+    let lookup = match pair {
+        Some((account_id, role_name)) => {
+            tracing::info!(
+                event = "credential.role_selected",
+                uid,
+                credential = %credential,
+                account_id,
+                role_name,
+                outcome = "allowed",
+                "credential requested for a selected account and role"
+            );
+            caller
+                .store
+                .get_role_credential(uid, &credential, account_id, role_name)
+                .await
+        }
+        None => caller.store.get_credential(uid, &credential).await,
+    };
+    let subject = match params.environment.as_deref() {
+        Some(environment) => Subject::Environment(environment),
+        None => Subject::Credential,
+    };
+    to_value(lookup_to_result(credential, lookup, subject)?)
 }
 
-async fn get_batch(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value, RpcError> {
+/// What a request was addressed to, which decides the wording and code of its failures.
+#[derive(Clone, Copy)]
+enum Subject<'a> {
+    Credential,
+    Environment(&'a str),
+}
+
+async fn environment_credentials(
+    request: &Request,
+    peer: &PeerInfo,
+    daemon: &Daemon,
+) -> Result<Value, RpcError> {
     let params: GetBatchParams = request.params_as()?;
     let uid = authorized_uid(peer)?;
     let caller = daemon.caller_state(uid);
-    assess_config(&caller.config, peer, &params.environment, params.claim);
-    if let Some(refusal) = serve_refusal(daemon, uid, &caller, &params.environment) {
+    assess_config(
+        &caller.config,
+        peer,
+        Some(&params.environment),
+        None,
+        params.claim,
+    );
+    if let Some(refusal) = serve_refusal(daemon, uid, &caller, Some(&params.environment), None) {
         return Err(refusal);
     }
 
-    let env = caller
+    let members = caller
         .config
         .envs
         .get(&params.environment)
-        .ok_or_else(not_found)?;
-    let members = env.credential_list(&params.environment);
+        .ok_or_else(not_found)?
+        .credential_list();
     // All-or-none: any member failure returns one error and no material. `?` drops every
     // `CredentialResult` collected so far, and each zeroizes its material on drop.
     let mut credentials = Vec::with_capacity(members.len());
     for credential in members {
         let lookup = caller.store.get_credential(uid, &credential).await;
-        credentials.push(lookup_to_result(credential, lookup, &params.environment)?);
+        credentials.push(lookup_to_result(
+            credential,
+            lookup,
+            Subject::Environment(&params.environment),
+        )?);
     }
     to_value(GetBatchResult { credentials })
 }
 
 fn list(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value, RpcError> {
     let params: ListParams = request.params_as()?;
+    let bad = |e: credsd_core::error::DaemonError| RpcError::invalid_params(e.detail());
+    let filter = credsd_core::tags::fold(params.tags.unwrap_or_default()).map_err(bad)?;
+    credsd_core::tags::validate_filter(&filter).map_err(bad)?;
     let Some(uid) = enumerating_uid(peer)? else {
         // A caller with nothing provisioned has an empty list, not an error. Whether
         // `callers/<uid>/` exists is the daemon's business, and a first run should print
-        // "no envs configured" rather than a failure the user has to interpret.
+        // "no envs configured" rather than a failure the user has to interpret. Such a caller
+        // has no environments, so a filter names none and is the same miss as below.
+        if params.environment.is_some() {
+            return Err(not_found());
+        }
         return to_value(ListResult {
             credentials: Vec::new(),
         });
@@ -791,33 +965,53 @@ fn list(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value, Rp
     assess_config(
         &caller.config,
         peer,
-        params.environment.as_deref().unwrap_or("*"),
+        params.environment.as_deref(),
+        None,
         None,
     );
+    invalid_refusal(&caller)?;
 
-    let mut credentials = Vec::new();
-    for (profile, env) in &caller.config.envs {
-        if params
-            .environment
-            .as_deref()
-            .is_some_and(|filter| filter != profile)
-        {
-            continue;
+    // Every credential the caller holds, once, whether or not an environment composes it
+    // (Requirement 16 AC 4); with a filter, that environment's credentials in its order. A
+    // filter naming no environment is the same miss `credential/get` reports for it.
+    let (names, environment): (Vec<String>, Option<&String>) = match params.environment.as_ref() {
+        Some(filter) => (
+            caller
+                .config
+                .envs
+                .get(filter)
+                .map(credsd_core::config::EnvConfig::credential_list)
+                .ok_or_else(not_found)?,
+            Some(filter),
+        ),
+        None => {
+            let mut names: Vec<String> = caller.credentials.keys().cloned().collect();
+            names.sort_unstable();
+            (names, None)
         }
-        for credential in env.credential_list(profile) {
-            credentials.push(CredentialSummary {
-                environment: profile.clone(),
-                kind: SHIPPED_KIND,
-                status: status_of(
-                    uid,
-                    &daemon.encryption,
-                    &credential,
-                    caller.credentials.get(&credential),
-                ),
+    };
+    let credentials = names
+        .into_iter()
+        .filter_map(|credential| {
+            let tags = caller.tags.get(&credential).cloned().unwrap_or_default();
+            if !credsd_core::tags::matches(&tags, &filter) {
+                return None;
+            }
+            let source = caller.credentials.get(&credential);
+            Some(CredentialSummary {
+                environment: environment.cloned(),
+                kind: source
+                    .map(CredentialSource::served_kind)
+                    .unwrap_or(SHIPPED_KIND),
+                source: source
+                    .map(CredentialSource::source_type)
+                    .unwrap_or(CredentialSourceType::Unsupported),
+                status: status_of(uid, &daemon.encryption, &credential, source),
+                tags,
                 credential,
-            });
-        }
-    }
+            })
+        })
+        .collect();
     to_value(ListResult { credentials })
 }
 
@@ -825,16 +1019,17 @@ fn describe(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value
     let params: DescribeParams = request.params_as()?;
     let uid = authorized_uid(peer)?;
     let caller = daemon.caller_state(uid);
-    assess_config(&caller.config, peer, &params.environment, None);
+    assess_config(&caller.config, peer, Some(&params.environment), None, None);
+    invalid_refusal(&caller)?;
 
     let env = caller
         .config
         .envs
         .get(&params.environment)
         .ok_or_else(not_found)?;
-    let default = env.default_credential(&params.environment);
+    let default = env.default_credential();
     let credentials = env
-        .credential_list(&params.environment)
+        .credential_list()
         .into_iter()
         .map(|credential| {
             // A credential an env references but `credentials.toml` does not define reports as
@@ -842,7 +1037,7 @@ fn describe(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value
             // client's materialization refuses that entry with a message naming it.
             let source = caller.credentials.get(&credential);
             CredentialEntry {
-                default: credential == default,
+                default: default.as_deref() == Some(credential.as_str()),
                 // Kind and env_var come from the full source, not the discriminant: a token
                 // source resolves to an access token and names the variable it projects as, and
                 // the client materializes from this manifest without reading `credentials.toml`.
@@ -885,7 +1080,7 @@ fn describe(request: &Request, peer: &PeerInfo, daemon: &Daemon) -> Result<Value
 fn lookup_to_result(
     credential: String,
     lookup: Lookup,
-    environment: &str,
+    subject: Subject<'_>,
 ) -> Result<CredentialResult, RpcError> {
     match lookup {
         Lookup::Ready(creds) => {
@@ -937,23 +1132,47 @@ fn lookup_to_result(
                 ReauthInput::Code { label } => format!("enter your {label}"),
                 _ => "re-authentication required".to_owned(),
             };
-            Err(RpcError::reauth_required(
-                environment,
-                format!("env '{environment}' requires re-authentication ({detail})"),
-                format!("credsd login --environment {environment}"),
-            ))
+            // Login is credential-addressed, so the remediation names the credential whichever
+            // way the request was addressed (Requirement 10 AC 12).
+            let remediation = format!("creds login --credential {credential}");
+            Err(match subject {
+                Subject::Credential => RpcError::reauth_required_for_credential(
+                    &credential,
+                    format!("credential '{credential}' requires re-authentication ({detail})"),
+                    remediation,
+                ),
+                Subject::Environment(environment) => RpcError::reauth_required(
+                    environment,
+                    format!("env '{environment}' requires re-authentication ({detail})"),
+                    remediation,
+                ),
+            })
         }
         Lookup::Unavailable(cause) => Err(RpcError::domain(
             DomainCode::ProviderUnavailable,
-            format!("env '{environment}' credential unavailable: {cause}"),
+            match subject {
+                Subject::Credential => format!("credential '{credential}' unavailable: {cause}"),
+                Subject::Environment(environment) => {
+                    format!("env '{environment}' credential unavailable: {cause}")
+                }
+            },
         )),
-        Lookup::Unknown => Err(not_found()),
+        Lookup::Unknown => Err(match subject {
+            Subject::Credential => credential_not_found(),
+            Subject::Environment(_) => not_found(),
+        }),
     }
 }
 
 /// Emit the caller-assessment audit record, exactly as the HTTP `assess` did — before the
 /// authorization gate, so a denied caller and a miss both leave a full audit line.
-fn assess_config(config: &DaemonConfig, peer: &PeerInfo, env: &str, claim: Option<Claim>) {
+fn assess_config(
+    config: &DaemonConfig,
+    peer: &PeerInfo,
+    env: Option<&str>,
+    credential: Option<&str>,
+    claim: Option<Claim>,
+) {
     let pid = peer.pid.and_then(|p| u32::try_from(p).ok());
     let claimed = match claim {
         Some(Claim::Agentic) => ClaimedIdentity::Agentic,
@@ -964,6 +1183,7 @@ fn assess_config(config: &DaemonConfig, peer: &PeerInfo, env: &str, claim: Optio
         peer.uid,
         "uds",
         env,
+        credential,
         claimed,
         config.auth.agent_binaries(),
     )
@@ -1024,10 +1244,19 @@ fn status_of(
 }
 
 fn not_found() -> RpcError {
-    RpcError::domain(
-        DomainCode::EnvironmentNotFound,
-        "profile or credential not found",
-    )
+    credential_not_found()
+}
+
+/// The one failure every credential-addressed miss returns, whatever its cause (Requirement 8
+/// AC 7): one code and one message, so a miss discloses nothing.
+pub(crate) fn credential_not_found() -> RpcError {
+    RpcError::domain(DomainCode::CredentialNotFound, "credential not found")
+}
+
+/// The one access check every credential-addressed method passes: a caller that fails it misses
+/// as a name it does not hold (Requirement 8 AC 7). Claim and tier checks are not part of it.
+fn credential_access(peer: &PeerInfo) -> Result<u32, RpcError> {
+    authorized_uid(peer).map_err(|_| credential_not_found())
 }
 
 /// Why nothing may be served from `caller` (Requirements 3.1, 3.2, 10.6), naming the file that
@@ -1042,42 +1271,69 @@ fn serve_refusal(
     daemon: &Daemon,
     uid: u32,
     caller: &CallerState,
-    environment: &str,
+    environment: Option<&str>,
+    credential: Option<&str>,
 ) -> Option<RpcError> {
     if let Err(reason) = daemon.integrity.verify_custody() {
         return Some(custody_broken(&reason));
     }
-    let (name, status) = [
+    let Some((name, status)) = [
         (CONFIG, &caller.config_drift),
         (CREDENTIALS, &caller.credentials_drift),
     ]
     .into_iter()
-    .find(|(_, status)| !status.is_valid())?;
+    .find(|(_, status)| !status.is_valid()) else {
+        return invalid_refusal(caller).err();
+    };
     tracing::info!(
         event = "drift.refused",
         uid,
         environment,
+        credential,
         file = name,
         drift = ?status,
         "credential refused: a load-bearing file is not verified"
     );
+    let subject = match environment {
+        Some(environment) => format!("environment '{environment}'"),
+        None => format!("credential '{}'", credential.unwrap_or_default()),
+    };
     Some(match status {
         DriftStatus::Unverifiable => unverifiable("see the daemon log"),
         _ if name == CONFIG => RpcError::domain(
             DomainCode::ConfigDrifted,
             format!(
-                "environment '{environment}' configuration has drifted from its sealed snapshot; \
+                "{subject} configuration has drifted from its sealed snapshot; \
                  run: creds revalidate"
             ),
         ),
         _ => RpcError::domain(
             DomainCode::ConfigDrifted,
             format!(
-                "environment '{environment}' credential sources (credentials.toml) have drifted \
+                "{subject} credential sources (credentials.toml) have drifted \
                  from their sealed snapshot; run: creds revalidate"
             ),
         ),
     })
+}
+
+/// The refusal every caller read returns while `caller`'s files parse but do not validate. It
+/// carries the validation errors, which name the credential and key and never a tag value
+/// (`credential-tags` Requirement 1.5).
+fn invalid_refusal(caller: &CallerState) -> Result<(), RpcError> {
+    caller
+        .config_invalid
+        .as_deref()
+        .map_or(Ok(()), |errors| Err(config_invalid(errors)))
+}
+
+fn config_invalid(errors: &str) -> RpcError {
+    RpcError::domain(
+        DomainCode::ConfigInvalid,
+        format!(
+            "caller configuration does not validate: {errors}; fix it, then run: creds revalidate"
+        ),
+    )
 }
 
 pub(crate) fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
@@ -1208,7 +1464,8 @@ fn validated_config(edited: &str, files: &TomlFiles) -> Result<DaemonConfig, Rpc
         credsd_core::config::credentials::from_text(checked_text(&files.credentials)?)
             .map_err(|e| internal(e.to_string()))?;
     if let Err(errors) = config.validate(&credentials) {
-        return Err(internal(errors.join("\n")));
+        let error = credsd_core::error::DaemonError::config(errors.join("\n"));
+        return Err(internal(error.to_string()));
     }
     Ok(config)
 }
@@ -1349,8 +1606,8 @@ fn current_base(op: &Op, owner: u32, files: &TomlFiles) -> std::io::Result<Optio
         Op::Bootstrap { credential, .. } | Op::RemoveCredential { credential, .. } => {
             Some(records_base_of(owner, files, &[credential.as_str()])?)
         }
-        Op::Import { environments, .. } => {
-            let names: Vec<&str> = environments.iter().map(String::as_str).collect();
+        Op::Import { credentials, .. } => {
+            let names: Vec<&str> = credentials.iter().map(String::as_str).collect();
             Some(records_base_of(owner, files, &names)?)
         }
         Op::RemoveEnvironment { .. } | Op::Revalidate { .. } => {
@@ -1384,16 +1641,11 @@ fn apply(
             let fingerprint = daemon.presence.install_key(owner, public_key, peer)?;
             format!("presence key {fingerprint} enrolled for uid {owner}")
         }
-        Op::Bootstrap {
-            environment,
-            credential,
-            ..
-        } => {
+        Op::Bootstrap { credential, .. } => {
             daemon.presence.authorize(pending);
             format!(
-                "authorized a bootstrap of credential '{credential}' (environment \
-                 '{environment}') for uid {owner}; re-run the same bootstrap within 5 minutes \
-                 to apply it"
+                "authorized a bootstrap of credential '{credential}' for uid {owner}; re-run the \
+                 same bootstrap within 5 minutes to apply it"
             )
         }
         Op::ConfigUnset {
@@ -1402,12 +1654,12 @@ fn apply(
             apply_config_unset(held, owner, environment, key, files, daemon)?;
             format!("unset {key} on environment '{environment}' for uid {owner}")
         }
-        Op::Import { environments, .. } => {
+        Op::Import { credentials, .. } => {
             daemon.presence.authorize(pending);
             format!(
-                "authorized an import binding {} for uid {owner}; re-run the same import within \
-                 5 minutes to apply it",
-                environments.join(", ")
+                "authorized an import replacing {} for uid {owner}; re-run the same import \
+                 within 5 minutes to apply it",
+                credentials.join(", ")
             )
         }
         Op::RemoveCredential { credential, .. } => {
@@ -1557,7 +1809,7 @@ async fn credential_remove(
     peer: &PeerInfo,
     daemon: &Daemon,
 ) -> Result<Value, RpcError> {
-    let uid = authorized_uid(peer)?;
+    let uid = credential_access(peer)?;
     let _guard = daemon.bootstrap_lock(uid).lock_owned().await;
     let params: CredentialRemoveParams = request.params_as()?;
     let root = platform::caller_root(uid);
@@ -1569,7 +1821,7 @@ async fn credential_remove(
     let sealed = root.join("credentials").join(&params.credential).exists()
         || !replaced_asides_of(uid, &params.credential)?.is_empty();
     if !sealed && !credentials.contains_key(&params.credential) {
-        return Err(not_found());
+        return Err(credential_not_found());
     }
     // Refuse over drift rather than reseal it: the reseal would trust a same-uid hand edit as a
     // side effect of this removal. A deleted credentials.toml the record names is drift too, not
@@ -1615,6 +1867,323 @@ async fn credential_remove(
     );
     let remediation = format!("sudo creds request approve {}", challenge.id);
     Err(RpcError::approval_required(&challenge, remediation))
+}
+
+/// Sign a credential out (credential-retrieval-api Requirement 15 AC 12-19): delete the sealed
+/// session of a credential whose source signs in, keep its entry, and leave the next
+/// `credential/login` to restore it. Ungated: login already replaces this material ungated, and a
+/// logout only ends the session (presence-gated-operations Requirement 1.7).
+async fn credential_logout(
+    request: &Request,
+    peer: &PeerInfo,
+    daemon: &Daemon,
+) -> Result<Value, RpcError> {
+    let uid = credential_access(peer)?;
+    let params: CredentialLogoutParams = request.params_as()?;
+    crate::server::write_lock::under(
+        &daemon.bootstrap_lock(uid),
+        uid,
+        LOGOUT_LOCK_BUDGET,
+        async |held| logout_under_lock(held, uid, &params, peer, daemon).await,
+    )
+    .await
+    .map_err(|expired| {
+        // Either expiry lands before any deletion: the wait before the body starts, the hold at
+        // its one await, the bounded SSO call. Other errors may leave the logout partly done;
+        // retrying the same logout is safe and finishes it.
+        internal(format!(
+            "{} {}s, so '{}' was not signed out; nothing was deleted, retry",
+            match expired {
+                crate::server::write_lock::Expired::Wait =>
+                    "another operation held this user's write lock for longer than",
+                crate::server::write_lock::Expired::Hold => "the logout did not finish within",
+            },
+            expired.limit(LOGOUT_LOCK_BUDGET).as_secs(),
+            params.credential
+        ))
+    })?
+}
+
+/// A logout's claim on the caller's write lock. The wait matches login's and renewal's. The hold
+/// is a backstop: the SSO refresh and `Logout` calls share the bound [`SSO_LOGOUT_LIMIT`], so an
+/// SSO endpoint that never answers fails those calls rather than the logout, and the session is
+/// still deleted here (AC 18).
+#[cfg(not(test))]
+const LOGOUT_LOCK_BUDGET: crate::server::write_lock::Budget = crate::server::write_lock::Budget {
+    wait: std::time::Duration::from_secs(10),
+    hold: std::time::Duration::from_secs(60),
+};
+/// Shorter under test so both bounds are reachable quickly. Same code path.
+#[cfg(test)]
+const LOGOUT_LOCK_BUDGET: crate::server::write_lock::Budget = crate::server::write_lock::Budget {
+    wait: std::time::Duration::from_millis(50),
+    hold: std::time::Duration::from_secs(1),
+};
+
+/// How long a logout waits on the SSO refresh and `Logout` calls together, covering connect, send,
+/// and response with any retries counted inside it (AC 18). Half of [`LOGOUT_LOCK_BUDGET`]'s
+/// 60-second hold, so the calls plus the local deletion end inside that hold. Writers queued
+/// behind the logout are not promised the lock within their own wait (`drift-detection` 5.9).
+#[cfg(not(test))]
+const SSO_LOGOUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Half the test hold, the same ratio. Same code path.
+#[cfg(test)]
+const SSO_LOGOUT_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+async fn logout_under_lock(
+    held: Held<'_>,
+    uid: u32,
+    params: &CredentialLogoutParams,
+    peer: &PeerInfo,
+    daemon: &Daemon,
+) -> Result<Value, RpcError> {
+    // The drift check comes before the entry is read: a hand-edited source type must not widen
+    // what a logout deletes, and a drifted caller must not learn which names exist from a miss.
+    let files = TomlFiles::read(uid).map_err(|e| internal(e.to_string()))?;
+    // Run under the lock; nothing is sealed, so the token it yields is not kept.
+    verify_for_write(daemon, &held, uid, &files, &[CONFIG, CREDENTIALS]).map(drop)?;
+    let credentials =
+        credsd_core::config::credentials::parse_sources(checked_text(&files.credentials)?)
+            .map_err(|e| internal(e.to_string()))?;
+    let source = match credentials.get(&params.credential) {
+        None => return Err(credential_not_found()),
+        Some(
+            source @ (CredentialSource::AwsLogin(_)
+            | CredentialSource::AwsIdcSso(_)
+            | CredentialSource::AwsWebIdentity(_)),
+        ) => source,
+        Some(source) => {
+            return Err(RpcError::domain(
+                DomainCode::LogoutUnsupportedSource,
+                format!(
+                    "credential '{}' is a {} source: it has no sign-in to log out of; remove it \
+                     with credential/remove (creds remove --credential {})",
+                    params.credential,
+                    source.type_name(),
+                    params.credential
+                ),
+            ))
+        }
+    };
+    let data_dir = platform::caller_root(uid)
+        .join("credentials")
+        .join(&params.credential);
+    // End the sign-in at SSO while its token is still sealed here. The local deletion below
+    // happens either way, so nothing is left behind, and the logout succeeds once it does; a
+    // failed call is reported as the provider outcome, since the session stays live at SSO
+    // until it expires.
+    let mut provider_logout = None;
+    if let CredentialSource::AwsIdcSso(sso) = source {
+        let provider = credsd_core::providers::sso::SsoProvider::new(
+            params.credential.clone(),
+            sso.clone(),
+            daemon.encryption.clone(),
+            data_dir.clone(),
+        );
+        #[cfg(test)]
+        let provider = match tests::SSO_ENDPOINT.with(|url| url.borrow().clone()) {
+            Some(url) => provider.with_endpoint(url),
+            None => provider,
+        };
+        provider_logout = match provider.logout(SSO_LOGOUT_LIMIT).await {
+            Ok(Some(LogoutEnded::Accepted)) => Some(ProviderLogout::Ended),
+            Ok(Some(LogoutEnded::TokenRejected)) => Some(ProviderLogout::TokenRejected),
+            Ok(None) => None,
+            Err(failed) => {
+                tracing::warn!(
+                    event = "credential.sso_logout_failed",
+                    uid,
+                    credential = %params.credential,
+                    error = %credsd_core::log::escape_log(&failed.error),
+                    "SSO Logout failed; the local session is deleted, the token stays valid at SSO until it expires"
+                );
+                Some(ProviderLogout::Failed {
+                    start_url: sso.start_url.clone(),
+                    access_token_expires_at: failed.expires_at,
+                })
+            }
+        };
+    }
+    delete_session(
+        uid,
+        &params.credential,
+        &data_dir,
+        provider_logout,
+        peer,
+        daemon,
+    )
+}
+
+/// The logout's local deletion, from the first file removed to the result. Synchronous on
+/// purpose: the write lock's hold bound cancels the logout only at an await, so with none here a
+/// hold expiry always lands before anything is deleted and the logout can report that nothing
+/// was (credential-retrieval-api Requirement 15 AC 18). Keep it a plain `fn`; the compiler then
+/// refuses any `.await` added to it.
+fn delete_session(
+    uid: u32,
+    credential: &str,
+    data_dir: &std::path::Path,
+    provider_logout: Option<ProviderLogout>,
+    peer: &PeerInfo,
+    daemon: &Daemon,
+) -> Result<Value, RpcError> {
+    let mut asides = Vec::new();
+    for aside in replaced_asides_of(uid, credential)? {
+        if holds_only_sign_in_output(&aside)? {
+            asides.push(aside);
+        }
+    }
+    let had_session = clear_session(data_dir)?;
+    sweep_replaced_asides(&asides)?;
+    // Drops the cached session too, so nothing held is served once this returns.
+    daemon.evict_caller(uid);
+    let signed_out = had_session || !asides.is_empty();
+    if signed_out {
+        crate::server::bootstrap::record_mutation(peer, uid, METHOD_CREDENTIAL_LOGOUT, credential);
+    }
+    to_value(LogoutResult::from(provider_logout.unwrap_or(
+        if signed_out {
+            ProviderLogout::LocalOnly
+        } else {
+            ProviderLogout::None
+        },
+    )))
+}
+
+// Fails to compile if `delete_session` becomes `async`: its return type would then be a future.
+type DeleteSession = fn(
+    u32,
+    &str,
+    &std::path::Path,
+    Option<ProviderLogout>,
+    &PeerInfo,
+    &Daemon,
+) -> Result<Value, RpcError>;
+const _: DeleteSession = delete_session;
+
+/// The one file a logout keeps: the record of who signed in, which the next sign-in compares
+/// against.
+const KEPT_ON_LOGOUT: &str = credsd_core::providers::aws_login::IDENTITY_FILE;
+
+/// The files a sign-in writes to a data directory for `aws-login`, `aws-idc-sso`, and
+/// `aws-web-identity` (AC 13), plus [`KEPT_ON_LOGOUT`].
+const SIGN_IN_OUTPUT: [&str; 5] = [
+    "aws_login_token.enc",
+    "dpop_key.enc",
+    "sso_token.enc",
+    "oauth_token.enc",
+    KEPT_ON_LOGOUT,
+];
+
+/// True when every entry of the archive `aside` is a non-directory named in [`SIGN_IN_OUTPUT`]
+/// (a symlink is removed, never followed, by the sweep). Nothing records
+/// an archive's source once its entry is replaced, so the files decide (AC 12): an archive holding
+/// anything else, such as an IAM key from before a re-bootstrap, is left for the gated remove.
+fn holds_only_sign_in_output(aside: &std::path::Path) -> Result<bool, RpcError> {
+    for entry in std::fs::read_dir(aside).map_err(|e| internal(e.to_string()))? {
+        let entry = entry.map_err(|e| internal(e.to_string()))?;
+        let is_dir = entry
+            .file_type()
+            .map_err(|e| internal(e.to_string()))?
+            .is_dir();
+        if is_dir || !SIGN_IN_OUTPUT.iter().any(|f| entry.file_name() == *f) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Delete everything in a credential's data directory except [`KEPT_ON_LOGOUT`], and the directory
+/// itself once empty. `true` when anything was deleted, the directory included, so a retry after a
+/// failed directory removal still reports and audits the sign-out it finishes.
+fn clear_session(data_dir: &std::path::Path) -> Result<bool, RpcError> {
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(internal(e.to_string())),
+    };
+    let mut deleted = false;
+    let mut kept = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| internal(e.to_string()))?;
+        if entry.file_name() == KEPT_ON_LOGOUT {
+            kept = true;
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry
+            .file_type()
+            .map_err(|e| internal(e.to_string()))?
+            .is_dir()
+        {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| internal(e.to_string()))?;
+        deleted = true;
+    }
+    if !kept {
+        std::fs::remove_dir(data_dir).map_err(|e| internal(e.to_string()))?;
+    }
+    Ok(deleted || !kept)
+}
+/// `credential/tag`: replace a credential's tags. No presence gate: tags carry no authority
+/// (credential-tags Requirement 5.1), but the write goes through the same drift check and seal as
+/// every other edit to `credentials.toml`.
+async fn credential_tag(
+    request: &Request,
+    peer: &PeerInfo,
+    daemon: &Daemon,
+) -> Result<Value, RpcError> {
+    let uid = credential_access(peer)?;
+    let mut params: CredentialTagParams = request.params_as()?;
+    let name = params.credential.clone();
+    let bad = |e: credsd_core::error::DaemonError| {
+        RpcError::invalid_params(format!("credential '{name}': {}", e.detail()))
+    };
+    // Folded and refused before any read, so a bad edit names its key without revealing whether
+    // the credential exists, and `Env` in `set` conflicts with `env` in `unset`.
+    params.set = credsd_core::tags::fold(std::mem::take(&mut params.set)).map_err(bad)?;
+    params.unset = credsd_core::tags::fold_keys(std::mem::take(&mut params.unset)).map_err(bad)?;
+    params
+        .unset
+        .iter()
+        .try_for_each(|k| credsd_core::tags::validate_key(k))
+        .map_err(bad)?;
+    credsd_core::tags::apply(&Tags::new(), &params.set, &params.unset).map_err(bad)?;
+    let guard = daemon.write_guard(uid).await;
+    let files = TomlFiles::read(uid).map_err(|e| internal(e.to_string()))?;
+    let mut verified = verify_for_write(daemon, &guard.held(), uid, &files, &[CREDENTIALS])?;
+    let checked = checked_text(&files.credentials)?;
+    let mut entries = credsd_core::config::credentials::parse_tagged(checked)
+        .map_err(|e| internal(e.detail()))?;
+    credsd_core::config::credentials::check_tags(&mut entries)
+        .map_err(|e| config_invalid(&e.detail()))?;
+    let old = &entries.get(&params.credential).ok_or_else(not_found)?.tags;
+    let tags = credsd_core::tags::apply(old, &params.set, &params.unset).map_err(bad)?;
+    if &tags == old {
+        return to_value(OkResult {});
+    }
+    let enc = &daemon.encryption;
+    let written = credsd_core::config::credentials::set_tags_from(
+        &caller_credentials_path(uid),
+        checked,
+        &params.credential,
+        &tags,
+        |text| seal_credentials_text(&verified, enc, text),
+    );
+    daemon.evict_caller(uid);
+    let text = written
+        .map_err(|e| internal(e.to_string()))?
+        .ok_or_else(not_found)?;
+    verified.pin_sealed(
+        CREDENTIALS,
+        &canonical_credentials_text(uid, &text).map_err(|e| internal(e.to_string()))?,
+    );
+    daemon.integrity.write(verified)?;
+    crate::server::bootstrap::record_mutation(peer, uid, METHOD_CREDENTIAL_TAG, &params.credential);
+    to_value(OkResult {})
 }
 
 /// The removal `credential/remove` describes, performed once approved.
@@ -1742,11 +2311,11 @@ fn seal_credentials_text(
 
 /// The canonical form of `text` as the snapshot records it, so a verify and a seal agree.
 fn canonical_credentials_text(uid: u32, text: &str) -> credsd_core::error::Result<Vec<u8>> {
-    let sources = credsd_core::config::credentials::parse_sources(text)?;
+    let entries = credsd_core::config::credentials::parse_tagged(text)?;
     let rel = std::path::Path::new("callers")
         .join(uid.to_string())
         .join("credentials.toml");
-    credsd_core::config::snapshot::canonical_credentials(uid, &rel, &sources)
+    credsd_core::config::snapshot::canonical_credentials(uid, &rel, &entries)
 }
 
 pub(crate) fn internal(message: String) -> RpcError {
@@ -1794,7 +2363,7 @@ async fn env_remove(
     let description = format!(
         "remove environment '{}' (credentials kept: {})",
         params.environment,
-        env.credential_list(&params.environment).join(", ")
+        env.credential_list().join(", ")
     );
     let challenge = daemon.presence.raise(
         peer,
@@ -1912,7 +2481,13 @@ mod tests {
 
         let mut config = DaemonConfig::default();
         for name in ["dev", "default", "token-only", "needs-reauth"] {
-            config.envs.insert(name.to_string(), EnvConfig::default());
+            config.envs.insert(
+                name.to_string(),
+                EnvConfig {
+                    credentials: vec![name.to_string()],
+                    ..EnvConfig::default()
+                },
+            );
         }
 
         let mut sources = CredentialSources::default();
@@ -1925,13 +2500,20 @@ mod tests {
                     account_id: "111111111111".into(),
                     role_name: "Developer".into(),
                     identity_type: Default::default(),
+                    allowed_roles: Vec::new(),
                 }),
             );
         }
+        sources.insert(
+            "token-only".to_owned(),
+            CredentialSource::Jwt(credsd_core::config::JwtConfig {
+                env_var: None,
+                identity_type: Default::default(),
+            }),
+        );
 
         let store = Arc::new(CredentialStore::new(
             TEST_UID,
-            &config,
             &sources,
             encryption.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
@@ -1966,8 +2548,10 @@ mod tests {
             Id::from(1),
             METHOD_CREDENTIAL_GET,
             &GetParams {
-                environment: profile.into(),
-                credential: credential.map(String::from),
+                environment: None,
+                credential: Some(credential.unwrap_or(profile).to_owned()),
+                account_id: None,
+                role_name: None,
                 scope: None,
                 claim: None,
                 request_id: None,
@@ -2005,10 +2589,7 @@ mod tests {
     #[tokio::test]
     async fn get_unknown_profile_is_profile_not_found() {
         let response = dispatch_uds(&get_request("nonexistent", None), &peer(authorized())).await;
-        assert_eq!(
-            domain_code(&response),
-            Some(DomainCode::EnvironmentNotFound)
-        );
+        assert_eq!(domain_code(&response), Some(DomainCode::CredentialNotFound));
     }
 
     /// A bearer-token credential is material this method serves, tagged with its own kind — the
@@ -2041,11 +2622,10 @@ mod tests {
             panic!("expected an error");
         };
         let data = e.data.expect("reauth data");
-        assert_eq!(data["environment"], "needs-reauth");
-        assert!(data["remediation"]
-            .as_str()
-            .unwrap()
-            .contains("credsd login"));
+        assert_eq!(data["credential"], "needs-reauth");
+        // Login is credential-addressed, so the remediation names the credential the
+        // environment served, with the client command that exists.
+        assert_eq!(data["remediation"], "creds login --credential needs-reauth");
     }
 
     #[tokio::test]
@@ -2057,10 +2637,7 @@ mod tests {
             &peer(authorized()),
         )
         .await;
-        assert_eq!(
-            domain_code(&response),
-            Some(DomainCode::EnvironmentNotFound)
-        );
+        assert_eq!(domain_code(&response), Some(DomainCode::CredentialNotFound));
     }
 
     #[tokio::test]
@@ -2075,17 +2652,604 @@ mod tests {
             let response = dispatch_uds(&get_request("dev", None), &peer(auth)).await;
             assert_eq!(
                 domain_code(&response),
-                Some(DomainCode::EnvironmentNotFound),
+                Some(DomainCode::CredentialNotFound),
                 "an unauthorized caller must not distinguish a real env from an absent one"
             );
         }
     }
 
+    /// `credential/remove` is credential-addressed: an unauthorized caller is refused as
+    /// `CREDENTIAL_NOT_FOUND` before any file is read (`credential-only-addressing` Req 4.5).
     #[tokio::test]
-    async fn get_batch_returns_every_credential_the_profile_names() {
+    async fn credential_remove_denies_by_absence_as_credential_not_found() {
         let request = Request::with_params(
             Id::from(1),
-            METHOD_CREDENTIAL_GET_BATCH,
+            METHOD_CREDENTIAL_REMOVE,
+            &serde_json::json!({ "credential": "dev" }),
+        )
+        .unwrap();
+        for auth in [
+            CallerAuth::Denied(DenyReason::NoRoot),
+            CallerAuth::Denied(DenyReason::NoPeerCred),
+            CallerAuth::Denied(DenyReason::OwnerMismatch),
+            CallerAuth::Denied(DenyReason::UnknownUid),
+            CallerAuth::Unresolved,
+        ] {
+            let response = dispatch_uds(&request, &peer(auth)).await;
+            assert_eq!(domain_code(&response), Some(DomainCode::CredentialNotFound));
+        }
+    }
+
+    fn name_only_request(credential: &str) -> Request {
+        Request::with_params(
+            Id::from(1),
+            METHOD_CREDENTIAL_GET,
+            &serde_json::json!({ "credential": credential }),
+        )
+        .expect("object params")
+    }
+
+    /// A daemon holding `credentials` as SSO sources, composed by `envs`. Those in `ready` have
+    /// session material cached; the rest need re-authentication.
+    fn daemon_with_credentials(
+        envs: &[(&str, &[&str])],
+        credentials: &[&str],
+        ready: &[&str],
+    ) -> Daemon {
+        let key = credsd_core::encryption::generate_key().unwrap();
+        let encryption = Arc::new(credsd_core::encryption::EncryptionService::new(key).unwrap());
+        let mut config = DaemonConfig::default();
+        for (env, members) in envs {
+            config.envs.insert(
+                env.to_string(),
+                EnvConfig {
+                    credentials: members.iter().map(|c| c.to_string()).collect(),
+                    ..EnvConfig::default()
+                },
+            );
+        }
+        let mut sources = CredentialSources::default();
+        for credential in credentials {
+            sources.insert(
+                credential.to_string(),
+                CredentialSource::AwsIdcSso(SsoConfig {
+                    start_url: "https://example.awsapps.com/start".into(),
+                    sso_region: "us-east-1".into(),
+                    account_id: "111111111111".into(),
+                    role_name: "Developer".into(),
+                    identity_type: Default::default(),
+                    allowed_roles: Vec::new(),
+                }),
+            );
+        }
+        let store = Arc::new(CredentialStore::new(
+            TEST_UID,
+            &sources,
+            encryption.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            crate::credential_store::records_verified(),
+        ));
+        for credential in ready {
+            store.inject_for_test(TEST_UID, credential, session_creds());
+        }
+        Daemon::with_caller(
+            TEST_UID,
+            config,
+            sources,
+            store,
+            encryption,
+            unbacked_root(),
+        )
+    }
+
+    /// Swap the caller's state for one whose `credentials.toml` has drifted from its snapshot.
+    fn drift_credentials(daemon: &Daemon) {
+        drift(daemon, CREDENTIALS);
+    }
+
+    /// Mark `file` (`CONFIG` or `CREDENTIALS`) drifted in the cached caller state.
+    fn drift(daemon: &Daemon, file: &str) {
+        let mut registry = crate::server::lock(&daemon.registry);
+        let state = registry.get(&TEST_UID).expect("caller state").clone();
+        let status = |name: &str, current: &DriftStatus| {
+            if name == file {
+                DriftStatus::Drifted
+            } else {
+                current.clone()
+            }
+        };
+        let drifted = CallerState {
+            config: state.config.clone(),
+            store: state.store.clone(),
+            credentials: state.credentials.clone(),
+            tags: state.tags.clone(),
+            sources: SourceStamps::sample(&daemon.caller_root(TEST_UID)),
+            refresh: None,
+            config_drift: status(CONFIG, &state.config_drift),
+            credentials_drift: status(CREDENTIALS, &state.credentials_drift),
+            config_invalid: None,
+        };
+        registry.insert(TEST_UID, Arc::new(drifted));
+    }
+
+    fn credential_addressed(response: &Response<Value>) -> Value {
+        serde_json::to_value(&response.outcome).unwrap()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// A config that fails validation reaches the client as the Internal error it shows
+        /// as is, so the relayed message must carry exactly one category, however many
+        /// problems the config has and whatever its environment names are.
+        #[test]
+        fn a_relayed_config_validation_error_names_one_category(
+            envs in proptest::collection::btree_map(
+                "[a-zA-Z0-9 ._-]{0,12}",
+                proptest::collection::vec("[a-z][a-z0-9-]{0,8}", 1..3),
+                1..4,
+            ),
+        ) {
+            let text: String = envs
+                .iter()
+                .map(|(name, credentials)| {
+                    format!("[environments.\"{name}\"]\ncredentials = {credentials:?}\n")
+                })
+                .collect();
+            let Err(e) = validated_config(&text, &TomlFiles::default()) else {
+                panic!("an env composing an undefined credential must not validate: {text}");
+            };
+            proptest::prop_assert_eq!(
+                credsd_core::error::prefixes(&e.message), 1, "{}", e.message
+            );
+        }
+
+        /// A credential is reachable by name however many environments compose it, none
+        /// included, and every environment that composes it serves exactly what the
+        /// credential-addressed request serves (Requirement 10 AC 6-8).
+        #[test]
+        fn a_credential_is_served_by_name_however_many_environments_compose_it(
+            credential in "[a-z][a-z0-9._-]{0,15}",
+            composing in 0usize..4,
+            ready in proptest::bool::ANY,
+        ) {
+            let envs: Vec<String> = (0..composing).map(|i| format!("env-{i}")).collect();
+            let member = [credential.as_str()];
+            let members: Vec<(&str, &[&str])> =
+                envs.iter().map(|e| (e.as_str(), &member[..])).collect();
+            let ready_list: &[&str] = if ready { &[credential.as_str()] } else { &[] };
+            let daemon = daemon_with_credentials(&members, &[credential.as_str()], ready_list);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let by_name = rt.block_on(dispatch(
+                &name_only_request(&credential),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            ));
+            match &by_name.outcome {
+                Outcome::Result(value) => proptest::prop_assert_eq!(&value["credential"], &credential),
+                Outcome::Error(e) => {
+                    proptest::prop_assert!(!ready, "a ready credential must be served by name: {e:?}");
+                    proptest::prop_assert_eq!(e.domain_code(), Some(DomainCode::ReauthRequired));
+                }
+            }
+            for env in &envs {
+                let by_env = rt.block_on(dispatch(
+                    &get_request(env, Some(&credential)),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                ));
+                if ready {
+                    proptest::prop_assert_eq!(
+                        credential_addressed(&by_env),
+                        credential_addressed(&by_name)
+                    );
+                } else {
+                    proptest::prop_assert_eq!(domain_code(&by_env), Some(DomainCode::ReauthRequired));
+                }
+            }
+        }
+
+        /// An environment parameter is refused, while the same named credential is served.
+        #[test]
+        fn an_environment_never_serves_more_than_the_credential_addressed_request(
+            credential in "[a-z][a-z0-9._-]{0,15}",
+            other in "[a-z][a-z0-9._-]{0,15}",
+        ) {
+            proptest::prop_assume!(credential != other);
+            let daemon = daemon_with_credentials(
+                &[("narrow", &[other.as_str()])],
+                &[credential.as_str(), other.as_str()],
+                &[credential.as_str(), other.as_str()],
+            );
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let by_env = rt.block_on(dispatch(
+                &Request::with_params(
+                    Id::from(1),
+                    METHOD_CREDENTIAL_GET,
+                    &serde_json::json!({"environment": "narrow", "credential": credential}),
+                ).expect("object params"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            ));
+            let Outcome::Error(error) = by_env.outcome else {
+                return Err(proptest::test_runner::TestCaseError::fail("environment was served"));
+            };
+            proptest::prop_assert_eq!(error.code, credsd_core::rpc::CODE_INVALID_PARAMS);
+            let by_name = rt.block_on(dispatch(
+                &name_only_request(&credential),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            ));
+            proptest::prop_assert!(matches!(by_name.outcome, Outcome::Result(_)));
+        }
+
+        /// Every credential-addressed miss is one code and one message, whatever the cause:
+        /// an unknown name and an unauthorized caller are indistinguishable (Requirement 8 AC 7).
+        #[test]
+        fn every_credential_addressed_miss_is_one_code_and_one_message(
+            missing in "[a-z][a-z0-9._-]{0,15}",
+        ) {
+            proptest::prop_assume!(missing != "held");
+            let daemon = daemon_with_credentials(&[], &["held"], &["held"]);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let unknown = rt.block_on(dispatch(
+                &name_only_request(&missing),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            ));
+            let unauthorized = rt.block_on(dispatch(
+                &name_only_request("held"),
+                Carrier::Uds,
+                &peer(CallerAuth::Unresolved),
+                &daemon,
+            ));
+            proptest::prop_assert_eq!(domain_code(&unknown), Some(DomainCode::CredentialNotFound));
+            proptest::prop_assert_eq!(credential_addressed(&unknown), credential_addressed(&unauthorized));
+        }
+    }
+
+    fn role_request(
+        addressing: (&str, &str),
+        account_id: Option<&str>,
+        role_name: Option<&str>,
+    ) -> Request {
+        let mut params = serde_json::json!({ addressing.0: addressing.1 });
+        if let Some(account_id) = account_id {
+            params["account_id"] = account_id.into();
+        }
+        if let Some(role_name) = role_name {
+            params["role_name"] = role_name.into();
+        }
+        Request::with_params(Id::from(1), METHOD_CREDENTIAL_GET, &params).expect("object params")
+    }
+
+    /// The `sso.acme` daemon of the role tests, its credential allowing `allowed` besides its
+    /// stored pair `111111111111`/`Developer`.
+    fn sso_daemon_allowing(allowed: &[credsd_core::config::RolePair]) -> Daemon {
+        let daemon =
+            daemon_with_credentials(&[("sso", &["sso.acme"])], &["sso.acme"], &["sso.acme"]);
+        let state = daemon.caller_state(TEST_UID);
+        let mut sources = state.credentials.as_ref().clone();
+        let Some(CredentialSource::AwsIdcSso(sso)) = sources.get_mut("sso.acme") else {
+            panic!("daemon_with_credentials holds SSO sources")
+        };
+        sso.allowed_roles = allowed.to_vec();
+        Daemon::with_caller(
+            TEST_UID,
+            state.config.as_ref().clone(),
+            sources,
+            state.store.clone(),
+            daemon.encryption.clone(),
+            unbacked_root(),
+        )
+    }
+
+    fn role_pair(account_id: &str, role_name: &str) -> credsd_core::config::RolePair {
+        credsd_core::config::RolePair {
+            account_id: account_id.into(),
+            role_name: role_name.into(),
+        }
+    }
+
+    /// Records each event as one `field=value` line, so a test reads what an operator's log would
+    /// carry. Spans are ignored.
+    #[derive(Clone, Default)]
+    struct EventCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    line.push_str(&format!("{field}={value:?} "));
+                },
+            );
+            self.0.lock().expect("capture lock").push(line);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// One half of a pair is malformed whoever asks and however the request is addressed,
+        /// since that is decidable from the request alone (Requirement 17 AC 1).
+        #[test]
+        fn half_a_role_pair_is_invalid_params_before_anything_is_read(
+            account_half in proptest::bool::ANY,
+            by_environment in proptest::bool::ANY,
+            authorized_caller in proptest::bool::ANY,
+            name in "[a-z][a-z0-9._-]{0,15}",
+        ) {
+            let daemon = daemon_with_credentials(&[("sso", &["sso.acme"])], &["sso.acme"], &["sso.acme"]);
+            drift_credentials(&daemon);
+            let addressing = if by_environment { ("environment", name.as_str()) } else { ("credential", name.as_str()) };
+            let request = if account_half {
+                role_request(addressing, Some("222222222222"), None)
+            } else {
+                role_request(addressing, None, Some("ReadOnly"))
+            };
+            let auth = if authorized_caller { authorized() } else { CallerAuth::Unresolved };
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let response = rt.block_on(dispatch(&request, Carrier::Uds, &peer(auth), &daemon));
+            let Outcome::Error(e) = response.outcome else {
+                return Err(proptest::test_runner::TestCaseError::fail("half a pair was served"));
+            };
+            proptest::prop_assert_eq!(e.code, credsd_core::rpc::CODE_INVALID_PARAMS);
+        }
+
+        /// A pair selects that account and role of the sign-in, never the stored pair's cached
+        /// material; the stored pair is the same request as none; and a selected pair with no
+        /// sign-in asks for the credential's own login (Requirement 17 AC 4-6).
+        #[test]
+        fn a_selected_role_is_served_from_the_sign_in_not_the_stored_role(
+            account_id in proptest::prop_oneof!["111111111111", "[0-9]{12}"],
+            role_name in proptest::prop_oneof!["Developer", "[A-Za-z0-9+=,.@_-]{1,64}"],
+        ) {
+            let daemon = sso_daemon_allowing(&[role_pair(&account_id, &role_name)]);
+            let addressing = ("credential", "sso.acme");
+            let request = role_request(addressing, Some(&account_id), Some(&role_name));
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let response = rt.block_on(dispatch(&request, Carrier::Uds, &peer(authorized()), &daemon));
+            if account_id == "111111111111" && role_name == "Developer" {
+                let Outcome::Result(value) = response.outcome else {
+                    return Err(proptest::test_runner::TestCaseError::fail("the stored pair was not served"));
+                };
+                proptest::prop_assert_eq!(&value["material"]["access_key_id"], "AKIAIOSFODNN7EXAMPLE");
+            } else {
+                let Outcome::Error(e) = response.outcome else {
+                    return Err(proptest::test_runner::TestCaseError::fail("a selected pair was served the stored pair's material"));
+                };
+                proptest::prop_assert_eq!(e.domain_code(), Some(DomainCode::ReauthRequired));
+                let data = e.data.expect("reauth data");
+                proptest::prop_assert_eq!(&data["remediation"], "creds login --credential sso.acme");
+                proptest::prop_assert_eq!(&data["credential"], "sso.acme");
+            }
+        }
+
+        /// A pair is served only when it is the stored pair or one the credential allows; any
+        /// other is a domain refusal naming the credential, never a sign-in, and an empty list
+        /// allows only the stored pair (Requirement 17 AC 8; `presence-gated-operations` Req 1.7).
+        #[test]
+        fn only_the_stored_pair_or_an_allowed_one_is_served(
+            allowed in proptest::collection::vec(("[0-9]{12}", "[A-Za-z0-9+=,.@_-]{1,64}"), 0..6),
+            pick in 0usize..5,
+            index in proptest::prelude::any::<proptest::sample::Index>(),
+            other in ("[0-9]{12}", "[A-Za-z0-9+=,.@_-]{1,64}"),
+        ) {
+            let allowed: Vec<_> = allowed.iter().map(|(a, r)| role_pair(a, r)).collect();
+            let stored = role_pair("111111111111", "Developer");
+            let asked = match pick {
+                0 => stored.clone(),
+                1 if !allowed.is_empty() => allowed[index.index(allowed.len())].clone(),
+                // Half of an allowed pair is not an allowed pair.
+                2 if !allowed.is_empty() => role_pair(&allowed[index.index(allowed.len())].account_id, &other.1),
+                3 if !allowed.is_empty() => role_pair(&other.0, &allowed[index.index(allowed.len())].role_name),
+                _ => role_pair(&other.0, &other.1),
+            };
+            let permitted = asked == stored || allowed.contains(&asked);
+            let daemon = sso_daemon_allowing(&allowed);
+            let addressing = ("credential", "sso.acme");
+            let request = role_request(addressing, Some(&asked.account_id), Some(&asked.role_name));
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let capture = EventCapture::default();
+            let response = rt.block_on(tracing::instrument::WithSubscriber::with_subscriber(
+                dispatch(&request, Carrier::Uds, &peer(authorized()), &daemon),
+                capture.clone(),
+            ));
+            // The allowed list is a boundary a caller can probe, so every pair but the stored one
+            // leaves one audit line naming it and its outcome, refused or not (AC 8).
+            let audited: Vec<String> = capture.0.lock().expect("capture lock").iter()
+                .filter(|line| line.contains("\"credential.role_selected\"")).cloned().collect();
+            if asked == stored {
+                proptest::prop_assert!(audited.is_empty(), "{audited:?}");
+            } else {
+                proptest::prop_assert_eq!(audited.len(), 1, "{:?}", audited);
+                let outcome = if permitted { "\"allowed\"" } else { "\"refused\"" };
+                for wanted in [
+                    format!("account_id={:?}", asked.account_id),
+                    format!("role_name={:?}", asked.role_name),
+                    format!("outcome={outcome}"),
+                ] {
+                    proptest::prop_assert!(audited[0].contains(&wanted), "{wanted} in {}", audited[0]);
+                }
+            }
+            match (&response.outcome, permitted) {
+                (Outcome::Result(_), true) => proptest::prop_assert_eq!(&asked, &stored),
+                // An allowed pair with no cached material goes to the sign-in, not a refusal.
+                (Outcome::Error(e), true) => proptest::prop_assert_eq!(e.domain_code(), Some(DomainCode::ReauthRequired)),
+                (Outcome::Error(e), false) => {
+                    proptest::prop_assert_eq!(e.domain_code(), Some(DomainCode::RoleNotAllowed));
+                    proptest::prop_assert!(e.message.contains("'sso.acme'"), "names the credential: {}", e.message);
+                }
+                (Outcome::Result(_), false) => {
+                    return Err(proptest::test_runner::TestCaseError::fail("a pair outside the list was served"));
+                }
+            }
+        }
+    }
+
+    /// A pair is accepted only for `aws-idc-sso`, and only once the credential resolves, so a
+    /// miss, an unauthorized caller, and a drifted caller answer exactly as they do without one
+    /// (Requirement 17 AC 3, 7).
+    #[tokio::test]
+    async fn a_role_pair_is_refused_for_any_other_source_and_never_changes_a_miss() {
+        let mut daemon = daemon_with_credentials(&[], &["sso.acme"], &["sso.acme"]);
+        let mut sources = daemon.caller_state(TEST_UID).credentials.as_ref().clone();
+        sources.insert(
+            "keys".into(),
+            CredentialSource::AwsIamUser(credsd_core::config::IamUserConfig {
+                region: "us-east-1".into(),
+                duration_seconds: None,
+                mfa_serial: None,
+                identity_type: Default::default(),
+            }),
+        );
+        let store = daemon.caller_state(TEST_UID).store.clone();
+        daemon = Daemon::with_caller(
+            TEST_UID,
+            daemon.caller_state(TEST_UID).config.as_ref().clone(),
+            sources,
+            store,
+            daemon.encryption.clone(),
+            unbacked_root(),
+        );
+        let pair = |credential| {
+            role_request(
+                ("credential", credential),
+                Some("222222222222"),
+                Some("ReadOnly"),
+            )
+        };
+
+        let other = dispatch(&pair("keys"), Carrier::Uds, &peer(authorized()), &daemon).await;
+        let Outcome::Error(e) = other.outcome else {
+            panic!("a pair on a non-SSO source was served");
+        };
+        // Decided from resolved config, so a domain refusal, never an envelope code (Req 8 AC 1),
+        // and its own code: `WRONG_CREDENTIAL_TYPE` already means unusable material (AC 5).
+        assert_eq!(e.domain_code(), Some(DomainCode::RoleSelectionUnsupported));
+
+        for (credential, auth) in [
+            ("missing", authorized()),
+            ("keys", CallerAuth::Unresolved),
+            ("sso.acme", CallerAuth::Unresolved),
+        ] {
+            let with = dispatch(
+                &pair(credential),
+                Carrier::Uds,
+                &peer(auth.clone()),
+                &daemon,
+            )
+            .await;
+            let without = dispatch(
+                &name_only_request(credential),
+                Carrier::Uds,
+                &peer(auth),
+                &daemon,
+            )
+            .await;
+            assert_eq!(
+                domain_code(&with),
+                Some(DomainCode::CredentialNotFound),
+                "{credential}"
+            );
+            assert_eq!(
+                credential_addressed(&with),
+                credential_addressed(&without),
+                "{credential}"
+            );
+        }
+
+        drift_credentials(&daemon);
+        let drifted = dispatch(
+            &pair("sso.acme"),
+            Carrier::Uds,
+            &peer(authorized()),
+            &daemon,
+        )
+        .await;
+        assert_eq!(domain_code(&drifted), Some(DomainCode::ConfigDrifted));
+    }
+
+    /// A drifted caller gets the drift refusal, never a miss, on the credential-addressed path:
+    /// a miss reported over drifted records would be an existence oracle (Requirement 10 AC 10).
+    #[tokio::test]
+    async fn a_drifted_caller_is_refused_before_a_credential_addressed_miss() {
+        let daemon = daemon_with_credentials(&[], &["held"], &["held"]);
+        drift_credentials(&daemon);
+        for credential in ["held", "missing"] {
+            let response = dispatch(
+                &name_only_request(credential),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert_eq!(
+                domain_code(&response),
+                Some(DomainCode::ConfigDrifted),
+                "{credential}"
+            );
+        }
+    }
+
+    /// A credential-addressed re-authentication names the credential, not an environment, and
+    /// remediates with the real client command (Requirement 10 AC 12).
+    #[tokio::test]
+    async fn a_credential_addressed_reauth_names_the_credential_and_the_login_command() {
+        let daemon = daemon_with_credentials(&[], &["solo"], &[]);
+        let response = dispatch(
+            &name_only_request("solo"),
+            Carrier::Uds,
+            &peer(authorized()),
+            &daemon,
+        )
+        .await;
+        let Outcome::Error(e) = response.outcome else {
+            panic!("expected re-authentication");
+        };
+        let data = e.data.expect("reauth data");
+        assert_eq!(data["credential"], "solo");
+        assert!(data.get("environment").is_none(), "{data:?}");
+        assert_eq!(data["remediation"], "creds login --credential solo");
+    }
+
+    #[tokio::test]
+    async fn get_with_neither_environment_nor_credential_is_invalid_params() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "credential": "" }),
+        ] {
+            let request = Request::with_params(Id::from(1), METHOD_CREDENTIAL_GET, &params)
+                .expect("object params");
+            let response = dispatch_uds(&request, &peer(authorized())).await;
+            let Outcome::Error(e) = response.outcome else {
+                panic!("{params}: expected an error");
+            };
+            assert_eq!(e.code, credsd_core::rpc::CODE_INVALID_PARAMS, "{params}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_batch_is_unavailable() {
+        let request = Request::with_params(
+            Id::from(1),
+            METHOD_ENVIRONMENT_CREDENTIALS,
             &GetBatchParams {
                 environment: "dev".into(),
                 scope: None,
@@ -2095,14 +3259,10 @@ mod tests {
         )
         .expect("object params");
         let response = dispatch_uds(&request, &peer(authorized())).await;
-        let Outcome::Result(value) = response.outcome else {
-            panic!("expected a result");
+        let Outcome::Error(error) = response.outcome else {
+            panic!("expected method-not-found");
         };
-        assert_eq!(value["credentials"][0]["credential"], "dev");
-        assert_eq!(
-            value["credentials"][0]["material"]["access_key_id"],
-            "AKIAIOSFODNN7EXAMPLE"
-        );
+        assert_eq!(error.code, credsd_core::rpc::CODE_METHOD_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2119,22 +3279,328 @@ mod tests {
             .map(|c| c["credential"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"dev"));
-        // No entry carries material.
+        // No entry carries material, and an unfiltered list names no environment.
         for entry in value["credentials"].as_array().unwrap() {
             assert!(entry.get("material").is_none());
+            assert!(entry.get("environment").is_none(), "{entry}");
             assert!(
-                entry.get("source").is_none(),
+                entry.get("default").is_none(),
                 "list is capped at name/kind/status"
             );
         }
     }
 
+    /// Requirement 13 AC 4 caps an enumeration row at name, kind, source type, status, and tags,
+    /// because agent tools may show the list to a model. Any other key on an unfiltered row
+    /// breaks the cap.
     #[tokio::test]
-    async fn describe_returns_a_manifest_with_projection_and_no_material() {
+    async fn list_rows_carry_only_name_kind_source_status_and_tags() {
+        let request = Request::new(Id::from(1), METHOD_CREDENTIAL_LIST);
+        let response = dispatch_uds(&request, &peer(authorized())).await;
+        let Outcome::Result(value) = response.outcome else {
+            panic!("expected a result");
+        };
+        let rows = value["credentials"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["credential", "kind", "source", "status", "tags"],
+                "{row}"
+            );
+            assert_eq!(row["tags"], serde_json::json!({}), "{row}");
+        }
+    }
+
+    /// A tag filter value that breaks the tag grammar is a bad request, and the refusal does not
+    /// echo the value back.
+    #[tokio::test]
+    async fn a_bad_list_tag_filter_is_invalid_params_without_its_value() {
+        let request = Request::with_params(
+            Id::from(1),
+            METHOD_CREDENTIAL_LIST,
+            &serde_json::json!({ "tags": { "team": "sk-planted\u{7}" } }),
+        )
+        .expect("object params");
+        let response = dispatch_uds(&request, &peer(authorized())).await;
+        let Outcome::Error(e) = response.outcome else {
+            panic!("a bad filter value was accepted");
+        };
+        assert_eq!(e.code, credsd_core::rpc::CODE_INVALID_PARAMS);
+        assert!(
+            !e.message.contains("unknown field"),
+            "refused as an unknown field, not a bad tag: {}",
+            e.message
+        );
+        assert!(!e.message.contains("sk-planted"), "{}", e.message);
+    }
+
+    fn tag_request(params: Value) -> Request {
+        Request::with_params(Id::from(1), "credential/tag", &params).expect("object params")
+    }
+
+    /// Requirement 15 AC 2 for `credential/tag`: served on the local socket, method-not-found on
+    /// stdio, like every other mutation method.
+    #[tokio::test]
+    async fn credential_tag_is_local_socket_only() {
+        let request = tag_request(serde_json::json!({ "credential": "dev", "unset": ["team"] }));
+        let uds = dispatch_uds(&request, &peer(authorized())).await;
+        if let Outcome::Error(e) = &uds.outcome {
+            assert_ne!(
+                e.code,
+                credsd_core::rpc::CODE_METHOD_NOT_FOUND,
+                "credential/tag is not served on the socket"
+            );
+        }
+        let stdio = dispatch(
+            &request,
+            Carrier::Stdio,
+            &peer(authorized()),
+            &test_daemon(),
+        )
+        .await;
+        let Outcome::Error(e) = stdio.outcome else {
+            panic!("credential/tag must not be exposed over stdio");
+        };
+        assert_eq!(e.code, credsd_core::rpc::CODE_METHOD_NOT_FOUND);
+        assert_eq!(e.domain_code(), None);
+    }
+
+    /// A key in both `set` and `unset` is a bad request, refused before anything is read.
+    #[tokio::test]
+    async fn a_tag_edit_naming_a_key_twice_is_invalid_params() {
+        let request = tag_request(serde_json::json!({
+            "credential": "dev",
+            "set": { "team": "payments" },
+            "unset": ["team"],
+        }));
+        let response = dispatch_uds(&request, &peer(authorized())).await;
+        let Outcome::Error(e) = response.outcome else {
+            panic!("an overlapping edit was accepted");
+        };
+        assert_eq!(
+            e.code,
+            credsd_core::rpc::CODE_INVALID_PARAMS,
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("\"team\""), "{}", e.message);
+    }
+
+    /// Item: `config.toml` stays load-bearing for a credential-addressed get. It decides whether
+    /// `credentials.toml` validates at all, and it supplies the audit's agent allowlist, so its
+    /// drift refuses the credential path exactly as `credentials.toml` drift does.
+    #[tokio::test]
+    async fn a_credential_addressed_get_is_refused_over_drift_in_either_file() {
+        for file in [CONFIG, CREDENTIALS] {
+            let daemon = daemon_with_credentials(&[], &["held"], &["held"]);
+            drift(&daemon, file);
+            let response = dispatch(
+                &name_only_request("held"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert_eq!(
+                domain_code(&response),
+                Some(DomainCode::ConfigDrifted),
+                "{file}"
+            );
+            let Outcome::Error(e) = response.outcome else {
+                panic!("expected a drift refusal");
+            };
+            assert!(
+                e.message.contains("credential 'held'") && !e.message.contains("environment"),
+                "a credential-addressed refusal names the credential: {}",
+                e.message
+            );
+        }
+    }
+
+    fn list_request(environment: &str) -> Request {
+        Request::with_params(
+            Id::from(1),
+            METHOD_CREDENTIAL_LIST,
+            &serde_json::json!({ "environment": environment }),
+        )
+        .expect("object params")
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// A filter naming no environment is ENVIRONMENT_NOT_FOUND, the code credential/get
+        /// returns for the same miss; a filter naming an environment that composes nothing is
+        /// an empty list.
+        #[test]
+        #[ignore = "environment API is unavailable"]
+        fn list_filtered_to_an_unknown_environment_is_environment_not_found(
+            name in "[a-z][a-z0-9-]{0,15}",
+        ) {
+            proptest::prop_assume!(name != "dev" && name != "empty");
+            let daemon = daemon_with_credentials(
+                &[("dev", &["held"]), ("empty", &[])],
+                &["held"],
+                &["held"],
+            );
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let call = |env: &str| rt.block_on(dispatch(&list_request(env), Carrier::Uds, &peer(authorized()), &daemon));
+
+            let unknown = call(&name);
+            proptest::prop_assert_eq!(domain_code(&unknown), Some(DomainCode::EnvironmentNotFound));
+            let get = rt.block_on(dispatch(
+                &Request::with_params(
+                    Id::from(1),
+                    METHOD_CREDENTIAL_GET,
+                    &serde_json::json!({ "environment": name }),
+                ).unwrap(),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            ));
+            proptest::prop_assert_eq!(domain_code(&unknown), domain_code(&get));
+            // A caller with nothing provisioned has no environments, so the same filter is the
+            // same miss for it, not the empty list an unfiltered call returns.
+            let unprovisioned = rt.block_on(dispatch(
+                &list_request(&name),
+                Carrier::Uds,
+                &peer(CallerAuth::Denied(DenyReason::NoRoot)),
+                &daemon,
+            ));
+            proptest::prop_assert_eq!(domain_code(&unprovisioned), domain_code(&unknown));
+
+            let Outcome::Result(empty) = call("empty").outcome else {
+                return Err(proptest::test_runner::TestCaseError::fail("an empty environment lists"));
+            };
+            proptest::prop_assert_eq!(&empty["credentials"], &serde_json::json!([]));
+            let Outcome::Result(dev) = call("dev").outcome else {
+                return Err(proptest::test_runner::TestCaseError::fail("a known environment lists"));
+            };
+            proptest::prop_assert_eq!(dev["credentials"].as_array().map(Vec::len), Some(1));
+        }
+    }
+
+    /// The `caller assessment` audit lines `f` emits, as JSON field maps.
+    async fn audit_lines<F: std::future::Future>(f: F) -> Vec<serde_json::Map<String, Value>> {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("log buffer poisoned"))?
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        drop(guard);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|v| v["fields"].as_object().cloned())
+            .filter(|f| {
+                f.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.starts_with("caller assessment"))
+            })
+            .collect()
+    }
+
+    /// The audit names a credential-addressed request's credential in its own field and leaves
+    /// `env` absent (`credential-only-addressing` Requirement 4.4).
+    ///
+    /// Runs in a child process holding only this test. tracing caches each callsite's
+    /// interest process-wide: a test thread that first registers the audit callsite with no
+    /// subscriber can store `never` after this thread's subscriber was installed, and the
+    /// event is then skipped. Alone in its process, nothing else can register it.
+    #[test]
+    fn the_audit_records_the_credential_apart_from_the_environment() {
+        const CHILD: &str = "CREDSD_TEST_AUDIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "server::dispatch::tests::the_audit_records_the_credential_apart_from_the_environment";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(audit_records_the_credential_apart_from_the_environment());
+    }
+
+    async fn audit_records_the_credential_apart_from_the_environment() {
+        let daemon = daemon_with_credentials(&[("dev", &["held"])], &["held"], &["held"]);
+        let request = |params: Value| {
+            Request::with_params(Id::from(1), METHOD_CREDENTIAL_GET, &params).unwrap()
+        };
+        for (params, env, credential) in [(
+            serde_json::json!({ "credential": "held" }),
+            None,
+            Some("held"),
+        )] {
+            let lines = audit_lines(dispatch(
+                &request(params.clone()),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            ))
+            .await;
+            assert_eq!(lines.len(), 1, "{params}");
+            let line = &lines[0];
+            assert_eq!(line.get("env").and_then(Value::as_str), env, "{params}");
+            assert_eq!(
+                line.get("credential").and_then(Value::as_str),
+                credential,
+                "{params}"
+            );
+            let evidence: Value = serde_json::from_str(line["evidence"].as_str().unwrap()).unwrap();
+            assert_eq!(evidence.get("env").and_then(Value::as_str), env, "{params}");
+            assert_eq!(
+                evidence.get("credential").and_then(Value::as_str),
+                credential,
+                "{params}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_is_unavailable() {
         let mut config = DaemonConfig::default();
         config.envs.insert(
             "dev".to_string(),
             EnvConfig {
+                credentials: vec!["dev".into()],
                 region: Some("eu-central-1".into()),
                 ..Default::default()
             },
@@ -2148,13 +3614,13 @@ mod tests {
                 account_id: "111111111111".into(),
                 role_name: "Developer".into(),
                 identity_type: Default::default(),
+                allowed_roles: Vec::new(),
             }),
         );
         let key = credsd_core::encryption::generate_key().unwrap();
         let encryption = Arc::new(credsd_core::encryption::EncryptionService::new(key).unwrap());
         let store = Arc::new(CredentialStore::new(
             TEST_UID,
-            &config,
             &sources,
             encryption.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
@@ -2179,16 +3645,10 @@ mod tests {
         )
         .expect("object params");
         let response = dispatch(&request, Carrier::Uds, &peer(authorized()), &daemon).await;
-        let Outcome::Result(value) = response.outcome else {
-            panic!("expected a result");
+        let Outcome::Error(error) = response.outcome else {
+            panic!("expected method-not-found");
         };
-        assert_eq!(value["environment"], "dev");
-        assert_eq!(value["projection"]["region"], "eu-central-1");
-        let entry = &value["credentials"][0];
-        assert_eq!(entry["credential"], "dev");
-        assert_eq!(entry["source"], "aws_idc_sso");
-        assert_eq!(entry["default"], true);
-        assert!(entry.get("material").is_none());
+        assert_eq!(error.code, credsd_core::rpc::CODE_METHOD_NOT_FOUND);
     }
 
     /// A first run has nothing provisioned, and `creds list` must still work: an empty list is
@@ -2219,7 +3679,7 @@ mod tests {
             let response = dispatch_uds(&request, &peer(auth.clone())).await;
             assert_eq!(
                 domain_code(&response),
-                Some(DomainCode::EnvironmentNotFound),
+                Some(DomainCode::CredentialNotFound),
                 "{auth:?} is an anomaly, not an empty state"
             );
         }
@@ -2261,6 +3721,61 @@ mod tests {
             panic!("expected an error");
         };
         assert_eq!(e.code, credsd_core::rpc::CODE_METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn withdrawn_methods_are_unavailable_on_every_carrier() {
+        let daemon = test_daemon();
+        for method in [
+            "environment/credentials",
+            "environment/describe",
+            "environment/remove",
+            "config/set",
+            "config/get",
+            "config/unset",
+        ] {
+            for carrier in [Carrier::Uds, Carrier::Stdio] {
+                let response = dispatch(
+                    &Request::new(Id::from(1), method),
+                    carrier,
+                    &peer(authorized()),
+                    &daemon,
+                )
+                .await;
+                let Outcome::Error(error) = response.outcome else {
+                    panic!("{method} was exposed on {carrier:?}");
+                };
+                assert_eq!(error.code, credsd_core::rpc::CODE_METHOD_NOT_FOUND);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_methods_reject_any_environment_member_before_caller_loading() {
+        let daemon = test_daemon();
+        for method in [METHOD_CREDENTIAL_GET, METHOD_CREDENTIAL_LIST] {
+            for value in [serde_json::Value::Null, serde_json::json!("secret-name")] {
+                let request = Request::with_params(
+                    Id::from(1),
+                    method,
+                    &serde_json::json!({"environment": value, "credential": "dev"}),
+                )
+                .unwrap();
+                let response = dispatch(
+                    &request,
+                    Carrier::Uds,
+                    &peer(CallerAuth::Unresolved),
+                    &daemon,
+                )
+                .await;
+                let Outcome::Error(error) = response.outcome else {
+                    panic!("{method} accepted environment");
+                };
+                assert_eq!(error.code, credsd_core::rpc::CODE_INVALID_PARAMS);
+                assert!(error.message.contains("environment"));
+                assert!(!error.message.contains("secret-name"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -2530,6 +4045,7 @@ mod tests {
                     account_id: "111111111111".into(),
                     role_name: "Developer".into(),
                     identity_type: credsd_core::config::IdentityType::Human,
+                    allowed_roles: Vec::new(),
                 }),
             )
             .expect("seed credential entry");
@@ -2620,6 +4136,7 @@ mod tests {
                     account_id: "111111111111".into(),
                     role_name: "Developer".into(),
                     identity_type: Default::default(),
+                    allowed_roles: Vec::new(),
                 }),
             )
             .expect("seed credential entry");
@@ -2683,6 +4200,7 @@ mod tests {
     /// without actually removing the entry — the case above alone would stay green against such
     /// a regression, since it never exercises a `Some(_)` result from `remove_env_from`.
     #[tokio::test]
+    #[ignore = "environment files are invalid until environment operations return"]
     async fn apply_env_remove_removes_an_environment_that_still_exists() {
         with_empty_data_dir(|| {
             let daemon = test_daemon();
@@ -2815,6 +4333,7 @@ mod tests {
     /// composing a Human credential violates the privilege lattice. The operation must be refused
     /// with `config.toml` left as it was, not written and then reported as drift.
     #[tokio::test]
+    #[ignore = "environment files are invalid until environment operations return"]
     async fn config_set_refuses_a_privilege_lattice_violation_without_writing() {
         with_empty_data_dir(|| {
             let daemon = test_daemon();
@@ -2890,6 +4409,393 @@ mod tests {
             .expect("pin");
     }
 
+    fn logout_request(credential: &str) -> Request {
+        Request::with_params(
+            Id::from(1),
+            METHOD_CREDENTIAL_LOGOUT,
+            &CredentialLogoutParams {
+                credential: credential.into(),
+            },
+        )
+        .expect("object params")
+    }
+
+    /// Not `sso_token.enc`: a logout opens that to end the sign-in at SSO, and these cases test the
+    /// local deletion alone.
+    const STAND_IN_SESSION: &str = "session.enc";
+
+    /// Seal a stand-in session file in `name`'s data directory, as a sign-in would have.
+    fn seed_session(daemon: &Daemon, name: &str) -> std::path::PathBuf {
+        let dir = platform::caller_root(TEST_UID)
+            .join("credentials")
+            .join(name);
+        daemon
+            .encryption
+            .seal_to_file(&dir.join(STAND_IN_SESSION), b"not a real session")
+            .expect("seal session");
+        dir
+    }
+
+    /// Captures every `tracing` event emitted on this thread while it is held.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("capture lock")).into_owned()
+        }
+    }
+
+    /// Run `f` with a fresh data dir and a log capture, for async cases that need both.
+    async fn with_logout_fixture<F, Fut>(f: F)
+    where
+        F: FnOnce(Daemon, Captured) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _lock = crate::server::e2e::DATA_DIR_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _env = crate::server::e2e::EnvVarGuard::set("CREDSD_DATA_DIR", dir.path());
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _log = tracing::subscriber::set_default(subscriber);
+        // Backed by the temp data dir, unlike `test_daemon`, so a get after the logout reloads
+        // what is on disk.
+        let callers = platform::callers_dir();
+        let daemon = Daemon::new(
+            Arc::new(
+                credsd_core::encryption::EncryptionService::new(
+                    credsd_core::encryption::generate_key().expect("key"),
+                )
+                .expect("encryption"),
+            ),
+            callers.clone(),
+            RegistryCustody::beside(&callers),
+            IntegrityCustody::beside(&callers),
+        );
+        f(daemon, captured).await;
+    }
+
+    /// Requirement 15 AC 12 and 16: a logout deletes the session and its archives, keeps the
+    /// entry, leaves the records valid, audits the deletion, and the next get must sign in again.
+    #[tokio::test]
+    async fn logout_signs_a_credential_out_and_keeps_its_entry() {
+        with_logout_fixture(|daemon, log| async move {
+            seed_human_credential("work");
+            let session = seed_session(&daemon, "work");
+            let archive = platform::caller_root(TEST_UID)
+                .join("credentials")
+                .join(".replaced-work.0123456789abcdef");
+            std::fs::create_dir_all(&archive).expect("seed archive");
+            pin_on_disk(&daemon);
+            let before = TomlFiles::read(TEST_UID).expect("read before");
+
+            let logged_out = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            // No sealed SSO token, so nothing was sent to SSO: only the local session ended.
+            logged_out_with(&logged_out, "local_only");
+
+            assert!(!session.exists(), "the sealed session must be gone");
+            assert!(
+                !archive.exists(),
+                "a replaced archive must not survive a logout"
+            );
+            assert!(
+                TomlFiles::read(TEST_UID).expect("read after") == before,
+                "a logout must not change either load-bearing file"
+            );
+            assert!(
+                log.text().contains("operation=\"credential/logout\"")
+                    && log.text().contains("credential=\"work\""),
+                "a logout that deleted material must be audited: {}",
+                log.text()
+            );
+            let after = dispatch(
+                &Request::with_params(
+                    Id::from(2),
+                    METHOD_CREDENTIAL_GET,
+                    &GetParams {
+                        environment: None,
+                        credential: Some("work".into()),
+                        account_id: None,
+                        role_name: None,
+                        scope: None,
+                        claim: None,
+                        request_id: None,
+                    },
+                )
+                .expect("object params"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert_eq!(
+                domain_code(&after),
+                Some(DomainCode::ReauthRequired),
+                "{after:?}"
+            );
+        })
+        .await;
+    }
+
+    /// What a sign-in writes to a data directory (design: the data-directory table), plus the
+    /// identity record, then files only other sources write.
+    const SIGN_IN_FILES: [&str; 5] = [
+        "aws_login_token.enc",
+        "dpop_key.enc",
+        "sso_token.enc",
+        "oauth_token.enc",
+        "identity.enc",
+    ];
+    const OTHER_FILES: [&str; 5] = [
+        "iam_user.enc",
+        "iam_session.enc",
+        "static_secret.enc",
+        "ra_key.enc",
+        "jwt.enc",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// AC 12: a logout deletes exactly the archives holding nothing but sign-in output, and
+        /// leaves any other, such as one with an IAM key from before a re-bootstrap, intact for
+        /// the gated remove. Deleting no archive and no session is `none`.
+        #[test]
+        fn logout_sweeps_only_archives_of_sign_in_output(
+            archives in proptest::collection::vec(
+                proptest::collection::vec(
+                    proptest::sample::select([SIGN_IN_FILES, OTHER_FILES].concat()),
+                    0..4,
+                ),
+                0..4,
+            ),
+        ) {
+            block_on(with_logout_fixture(|daemon, _log| async move {
+                seed_human_credential("work");
+                pin_on_disk(&daemon);
+                let credentials = platform::caller_root(TEST_UID).join("credentials");
+                let seeded: Vec<_> = archives
+                    .iter()
+                    .enumerate()
+                    .map(|(i, files)| {
+                        let dir = credentials.join(replaced_aside_name("work", &format!("{i:016x}")));
+                        std::fs::create_dir_all(&dir).expect("seed archive");
+                        for file in files {
+                            std::fs::write(dir.join(file), b"sealed").expect("seed file");
+                        }
+                        let sign_in_only = files.iter().all(|f| SIGN_IN_FILES.contains(f));
+                        (dir, sign_in_only)
+                    })
+                    .collect();
+
+                let logged_out = dispatch(
+                    &logout_request("work"),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                )
+                .await;
+
+                let swept = seeded.iter().any(|(_, sign_in_only)| *sign_in_only);
+                logged_out_with(&logged_out, if swept { "local_only" } else { "none" });
+                for ((dir, sign_in_only), files) in seeded.iter().zip(&archives) {
+                    assert_eq!(dir.exists(), !sign_in_only, "{files:?}");
+                    if !sign_in_only {
+                        assert!(files.iter().all(|f| dir.join(f).exists()), "{files:?}");
+                    }
+                }
+            }));
+        }
+    }
+
+    /// AC 15: an unknown name is CREDENTIAL_NOT_FOUND, and a second logout of the same credential
+    /// succeeds, deletes nothing, and writes no second audit record.
+    #[tokio::test]
+    async fn logout_of_an_unknown_name_is_not_found_and_a_repeat_is_harmless() {
+        with_logout_fixture(|daemon, log| async move {
+            seed_human_credential("work");
+            seed_session(&daemon, "work");
+            pin_on_disk(&daemon);
+
+            let unknown = dispatch(
+                &logout_request("nope"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert_eq!(domain_code(&unknown), Some(DomainCode::CredentialNotFound));
+
+            // Only the first logout signs out; the repeat finds no session.
+            for expected in ["local_only", "none"] {
+                let again = dispatch(
+                    &logout_request("work"),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                )
+                .await;
+                logged_out_with(&again, expected);
+            }
+            assert_eq!(
+                log.text()
+                    .matches("operation=\"credential/logout\"")
+                    .count(),
+                1,
+                "only the logout that deleted something is audited"
+            );
+        })
+        .await;
+    }
+
+    /// A logout keeps the record of who signed in, so the next sign-in can compare against it.
+    #[tokio::test]
+    async fn logout_keeps_the_signed_in_identity_record() {
+        with_logout_fixture(|daemon, _log| async move {
+            seed_human_credential("work");
+            let dir = seed_session(&daemon, "work");
+            let identity = dir.join(KEPT_ON_LOGOUT);
+            std::fs::write(&identity, b"sealed identity").expect("seed identity record");
+            pin_on_disk(&daemon);
+
+            let logged_out = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert!(
+                matches!(logged_out.outcome, Outcome::Result(_)),
+                "{logged_out:?}"
+            );
+            assert!(
+                !dir.join(STAND_IN_SESSION).exists(),
+                "the session must be gone"
+            );
+            assert!(
+                identity.exists(),
+                "the identity record must survive a logout"
+            );
+        })
+        .await;
+    }
+
+    /// A logout touches only the credential it names.
+    #[tokio::test]
+    async fn logout_leaves_other_credentials_alone() {
+        with_logout_fixture(|daemon, _log| async move {
+            seed_human_credential("work");
+            seed_human_credential("home");
+            seed_session(&daemon, "work");
+            let other = seed_session(&daemon, "home");
+            pin_on_disk(&daemon);
+
+            let logged_out = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert!(
+                matches!(logged_out.outcome, Outcome::Result(_)),
+                "{logged_out:?}"
+            );
+            assert!(other.exists(), "another credential's session must survive");
+        })
+        .await;
+    }
+
+    /// AC 13: a source whose material no sign-in restores is refused, and nothing is deleted.
+    #[tokio::test]
+    async fn logout_refuses_a_credential_that_does_not_sign_in() {
+        with_logout_fixture(|daemon, _log| async move {
+            credsd_core::config::credentials::upsert_credential_at(
+                &caller_credentials_path(TEST_UID),
+                "keys",
+                &CredentialSource::AwsIamUser(credsd_core::config::IamUserConfig {
+                    region: "us-east-1".into(),
+                    duration_seconds: None,
+                    mfa_serial: None,
+                    identity_type: credsd_core::config::IdentityType::Human,
+                }),
+            )
+            .expect("seed iam user");
+            let key = seed_session(&daemon, "keys");
+            pin_on_disk(&daemon);
+
+            let refused = dispatch(
+                &logout_request("keys"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            let Outcome::Error(e) = refused.outcome else {
+                panic!("a logout of an IAM key must be refused");
+            };
+            assert_eq!(e.code, -32000);
+            assert_eq!(
+                e.data.as_ref().and_then(|data| data.get("code")),
+                Some(&Value::from("LOGOUT_UNSUPPORTED_SOURCE")),
+                "{e:?}"
+            );
+            assert!(e.message.contains("credential/remove"), "{}", e.message);
+            assert!(key.exists(), "a refused logout must delete nothing");
+        })
+        .await;
+    }
+
+    /// AC 14: over a drifted credentials.toml a logout is refused before the entry is read, so a
+    /// hand-edited source type cannot make it delete material a sign-in does not restore.
+    #[tokio::test]
+    async fn logout_refuses_over_drift_and_deletes_nothing() {
+        with_logout_fixture(|daemon, _log| async move {
+            seed_human_credential("work");
+            let session = seed_session(&daemon, "work");
+            pin_on_disk(&daemon);
+            let path = caller_credentials_path(TEST_UID);
+            let text = std::fs::read_to_string(&path).expect("read credentials");
+            std::fs::write(&path, text.replace("us-east-1", "us-west-2"))
+                .expect("drift credentials.toml");
+
+            let refused = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert_eq!(domain_code(&refused), Some(DomainCode::ConfigDrifted));
+            assert!(session.exists(), "a refused logout must delete nothing");
+        })
+        .await;
+    }
+
     /// A Human-tier credential in the caller's `credentials.toml`, for cases that need an env to
     /// reference something real.
     fn seed_human_credential(name: &str) {
@@ -2902,8 +4808,814 @@ mod tests {
                 account_id: "111111111111".into(),
                 role_name: "Developer".into(),
                 identity_type: credsd_core::config::IdentityType::Human,
+                allowed_roles: Vec::new(),
             }),
         )
         .expect("seed credential entry");
+    }
+
+    thread_local! {
+        /// The SSO portal a logout on this thread calls; `None` keeps the regional endpoint.
+        pub(super) static SSO_ENDPOINT: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Log out of an aws-idc-sso sign-in sealing `token`, against a mock portal that answers its
+    /// one `Logout` (which must bear `token`) with `status`, carrying `code` as the AWS error type
+    /// when there is one. Returns the response and whether the sealed session survived.
+    async fn logout_at_portal(
+        daemon: &Daemon,
+        token: &str,
+        status: usize,
+        code: Option<&str>,
+    ) -> (Response<Value>, bool) {
+        let mut server = mockito::Server::new_async().await;
+        let mut mock = server
+            .mock("POST", "/logout")
+            .match_header("x-amz-sso_bearer_token", token)
+            .with_status(status);
+        if let Some(code) = code {
+            mock = mock.with_header("x-amzn-errortype", code);
+        }
+        let logout = mock.expect(1).create_async().await;
+        SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(server.url()));
+        let session = seal_sso_session(daemon, &sso_session(token));
+
+        let logged_out = dispatch(
+            &logout_request("work"),
+            Carrier::Uds,
+            &peer(authorized()),
+            daemon,
+        )
+        .await;
+        SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+        logout.assert_async().await;
+        (logged_out, session.exists())
+    }
+
+    fn block_on(future: impl std::future::Future<Output = ()>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(future);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8))]
+
+        /// Requirement 15: a `credential/logout` of an aws-idc-sso sign-in ends it at SSO, with
+        /// exactly one `Logout` bearing the sealed access token, and still deletes it here.
+        #[test]
+        fn logout_ends_an_sso_sign_in_at_sso(token in "[A-Za-z0-9+/=._-]{1,256}") {
+            block_on(with_logout_fixture(|daemon, _log| async move {
+                let (logged_out, session_left) = logout_at_portal(&daemon, &token, 200, None).await;
+                logged_out_with(&logged_out, "ended");
+                assert!(!session_left, "the sealed session must be gone");
+            }));
+        }
+
+        /// AC 18: SSO refusing the access token as invalid or expired is `token_rejected`, not
+        /// `ended`, since the portal session may still be live; the session is still deleted here.
+        #[test]
+        fn a_logout_sso_refuses_as_unauthorized_reports_token_rejected(
+            token in "[A-Za-z0-9+/=._-]{1,256}",
+        ) {
+            block_on(with_logout_fixture(|daemon, _log| async move {
+                let (logged_out, session_left) =
+                    logout_at_portal(&daemon, &token, 401, Some("UnauthorizedException")).await;
+                logged_out_with(&logged_out, "token_rejected");
+                assert!(!session_left, "the sealed session must be gone");
+            }));
+        }
+
+        /// A `Logout` SSO refuses other than as an invalid token never reads as ended (these carry
+        /// no error code): the logout succeeds, since the session is
+        /// deleted here, and reports `failed` with where to end it at SSO and when the access token expires.
+        #[test]
+        fn a_refused_sso_logout_reports_failed_and_still_deletes_the_session(
+            token in "[A-Za-z0-9+/=._-]{1,256}",
+            status in proptest::sample::select(vec![400usize, 401, 403, 404]),
+        ) {
+            block_on(with_logout_fixture(|daemon, log| async move {
+                let (logged_out, session_left) = logout_at_portal(&daemon, &token, status, None).await;
+                assert_failed_at_sso(&logged_out, Some(ACCESS_TOKEN_EXPIRES_AT));
+                assert!(!session_left, "the sealed session must be gone");
+                assert!(
+                    log.text().contains("operation=\"credential/logout\""),
+                    "a refused Logout must still audit the deletion: {}",
+                    log.text()
+                );
+                assert_repeat_does_not_retry_logout(&daemon).await;
+            }));
+        }
+    }
+
+    /// AC 18: after a logout whose `Logout` failed, a repeat finds no sealed session, succeeds
+    /// with provider `none`, and sends SSO nothing.
+    async fn assert_repeat_does_not_retry_logout(daemon: &Daemon) {
+        let mut server = mockito::Server::new_async().await;
+        let logout = server
+            .mock("POST", "/logout")
+            .expect(0)
+            .create_async()
+            .await;
+        SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(server.url()));
+        let again = dispatch(
+            &logout_request("work"),
+            Carrier::Uds,
+            &peer(authorized()),
+            daemon,
+        )
+        .await;
+        SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+        logout.assert_async().await;
+        logged_out_with(&again, "none");
+    }
+
+    /// The `provider` outcome of a logout that must have succeeded. Only `none` is not signed out,
+    /// and only `failed` says where to end the session at SSO and when the access token expires.
+    fn logged_out_with<'a>(response: &'a Response<Value>, provider: &str) -> &'a Value {
+        let Outcome::Result(value) = &response.outcome else {
+            panic!("a logout that deleted something, or found nothing, must succeed: {response:?}");
+        };
+        assert_eq!(value["provider"], provider, "{value}");
+        assert_eq!(value["signed_out"], provider != "none", "{value}");
+        if provider != "failed" {
+            assert!(value.get("start_url").is_none(), "{value}");
+            assert!(value.get("access_token_expires_at").is_none(), "{value}");
+        }
+        value
+    }
+
+    /// A logout whose SSO `Logout` failed: signed out here, with the start URL to end the session
+    /// at SSO and, when the sealed token was readable, when that access token expires.
+    fn assert_failed_at_sso(response: &Response<Value>, expires: Option<&str>) {
+        let value = logged_out_with(response, "failed");
+        assert_eq!(
+            value["start_url"], "https://example.awsapps.com/start",
+            "{value}"
+        );
+        assert_eq!(
+            value.get("access_token_expires_at").and_then(Value::as_str),
+            expires,
+            "{value}"
+        );
+    }
+
+    const ACCESS_TOKEN_EXPIRES_AT: &str = "2999-01-01T00:00:00Z";
+
+    /// AC 17: an aws-login or aws-web-identity sign-in has no session at an identity provider to
+    /// end, so its logout deletes it here, sends nothing, and reports `local_only`.
+    #[tokio::test]
+    async fn a_sign_in_with_nothing_to_end_upstream_reports_local_only() {
+        for source in [
+            serde_json::json!({"type": "aws-login", "region": "us-east-1"}),
+            serde_json::json!({
+                "type": "aws-web-identity",
+                "role_arn": "arn:aws:iam::111111111111:role/Developer",
+                "region": "us-east-1",
+            }),
+        ] {
+            with_logout_fixture(|daemon, _log| async move {
+                credsd_core::config::credentials::upsert_credential_at(
+                    &caller_credentials_path(TEST_UID),
+                    "work",
+                    &serde_json::from_value(source).expect("source"),
+                )
+                .expect("seed credential entry");
+                let session = seed_session(&daemon, "work");
+                pin_on_disk(&daemon);
+                let logged_out = dispatch(
+                    &logout_request("work"),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                )
+                .await;
+                logged_out_with(&logged_out, "local_only");
+                assert!(!session.exists(), "the session must be gone");
+                assert_repeat_does_not_retry_logout(&daemon).await;
+            })
+            .await;
+        }
+    }
+
+    /// AC 18: an SSO endpoint that cannot be reached never keeps the user signed in here.
+    #[tokio::test]
+    async fn an_unreachable_sso_endpoint_still_signs_out_here() {
+        with_logout_fixture(|daemon, _log| async move {
+            // Bind and drop a listener, so the port is known to refuse connections.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind")
+                .local_addr()
+                .expect("addr")
+                .port();
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(format!("http://127.0.0.1:{port}")));
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+
+            let logged_out = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+            assert_failed_at_sso(&logged_out, Some(ACCESS_TOKEN_EXPIRES_AT));
+            assert!(!session.exists(), "the sealed session must be gone");
+        })
+        .await;
+    }
+
+    /// A `Logout` SSO never answers is cut off at its limit and reads as `failed`; the session
+    /// is still deleted here, the cached state evicted, and the deletion audited.
+    #[tokio::test]
+    async fn a_stalled_sso_logout_times_out_and_still_signs_out_here() {
+        with_logout_fixture(|daemon, log| async move {
+            // Bound but never accepted: the kernel completes the handshake, nothing answers.
+            let stalled = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}", stalled.local_addr().expect("addr"));
+            SSO_ENDPOINT.with(|endpoint| *endpoint.borrow_mut() = Some(url));
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+            let cached = daemon.caller_state(TEST_UID);
+
+            let logged_out = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            SSO_ENDPOINT.with(|endpoint| *endpoint.borrow_mut() = None);
+            assert_failed_at_sso(&logged_out, Some(ACCESS_TOKEN_EXPIRES_AT));
+            assert!(!session.exists(), "the sealed session must be gone");
+            assert!(
+                !Arc::ptr_eq(&daemon.caller_state(TEST_UID), &cached),
+                "the cached state must be evicted"
+            );
+            assert!(
+                log.text().contains("operation=\"credential/logout\""),
+                "a stalled Logout must still audit the deletion: {}",
+                log.text()
+            );
+        })
+        .await;
+    }
+
+    /// Seal `bytes` as `work`'s SSO session, as a sign-in would have, and return its path.
+    fn seal_sso_session(daemon: &Daemon, bytes: &[u8]) -> std::path::PathBuf {
+        seed_human_credential("work");
+        let session = platform::caller_root(TEST_UID)
+            .join("credentials")
+            .join("work")
+            .join("sso_token.enc");
+        daemon.encryption.seal_to_file(&session, bytes).unwrap();
+        pin_on_disk(daemon);
+        session
+    }
+
+    fn sso_session(token: &str) -> Vec<u8> {
+        serde_json::to_vec(&credsd_core::providers::sso::CachedSsoToken {
+            access_token: token.into(),
+            expires_at: ACCESS_TOKEN_EXPIRES_AT.into(),
+            refresh_token: None,
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            start_url: "https://example.awsapps.com/start".into(),
+            region: "us-east-1".into(),
+        })
+        .unwrap()
+    }
+
+    /// A logout queued behind another writer gives up on its wait budget instead of parking, and
+    /// deletes nothing, since it never ran.
+    #[tokio::test]
+    async fn a_logout_behind_a_held_write_lock_gives_up_and_deletes_nothing() {
+        with_logout_fixture(|daemon, _log| async move {
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+            let lock = daemon.bootstrap_lock(TEST_UID);
+            let held = lock.lock().await;
+            let logged_out = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dispatch(
+                    &logout_request("work"),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                ),
+            )
+            .await
+            .expect("a logout behind a held lock must give up, not park");
+            drop(held);
+            // An error, since nothing was deleted; a logout that deleted something succeeds.
+            assert_eq!(
+                domain_code(&logged_out),
+                Some(DomainCode::Internal),
+                "{logged_out:?}"
+            );
+            let Outcome::Error(error) = &logged_out.outcome else {
+                panic!("{logged_out:?}");
+            };
+            assert!(
+                error.message.contains("nothing was deleted"),
+                "{}",
+                error.message
+            );
+            assert!(session.exists(), "a logout that never ran deletes nothing");
+        })
+        .await;
+    }
+
+    /// A logout that fails after its deletion started errs, and a retry of the same logout
+    /// finishes it: the sealed token is gone, the cached state evicted, and the deletion audited,
+    /// with SSO called only once.
+    #[tokio::test]
+    async fn a_logout_that_fails_partway_is_finished_by_a_retry() {
+        with_logout_fixture(|daemon, log| async move {
+            let mut server = mockito::Server::new_async().await;
+            let sso = server
+                .mock("POST", "/logout")
+                .with_status(200)
+                .expect(1)
+                .create_async()
+                .await;
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(server.url()));
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+            let cached = daemon.caller_state(TEST_UID);
+            // The data directory behind a symlink: every file in it is deleted through the link,
+            // then removing the link as a directory fails, whatever user runs the test. A real
+            // empty directory in its place clears the fault for the retry.
+            let credentials = platform::caller_root(TEST_UID).join("credentials");
+            let data_dir = credentials.join("work");
+            let linked = platform::caller_root(TEST_UID).join("linked-work");
+            std::fs::rename(&data_dir, &linked).expect("move data dir");
+            std::os::unix::fs::symlink(&linked, &data_dir).expect("link data dir");
+            let failed = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            std::fs::remove_file(&data_dir).expect("drop link");
+            std::fs::create_dir(&data_dir).expect("empty data dir");
+            assert!(
+                matches!(failed.outcome, Outcome::Error(_)),
+                "a logout that could not finish must err: {failed:?}"
+            );
+            assert!(!session.exists(), "the deletion had started");
+
+            let retried = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+            sso.assert_async().await;
+            logged_out_with(&retried, "local_only");
+            assert!(!session.exists(), "the sealed token must be gone");
+            assert!(
+                !credentials.join("work").exists(),
+                "the data directory must be gone"
+            );
+            assert!(
+                !Arc::ptr_eq(&daemon.caller_state(TEST_UID), &cached),
+                "the cached state must be evicted"
+            );
+            assert!(
+                log.text().contains("operation=\"credential/logout\""),
+                "the retry must audit the deletion: {}",
+                log.text()
+            );
+        })
+        .await;
+    }
+
+    /// AC 18: a logout that fails after SSO accepted `Logout` but before it deleted the sealed
+    /// token leaves that token behind. The retry sends it again, SSO refuses it as invalid, and
+    /// the retry reports `token_rejected`, not `ended`, since nothing on disk records that the
+    /// first call succeeded.
+    #[tokio::test]
+    async fn a_retry_after_a_partial_logout_that_sso_refuses_reports_token_rejected() {
+        with_logout_fixture(|daemon, _log| async move {
+            let mut server = mockito::Server::new_async().await;
+            let accepted = server
+                .mock("POST", "/logout")
+                .with_status(200)
+                .expect(1)
+                .create_async()
+                .await;
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(server.url()));
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+            // An archive name that is a file, not a directory: reading it fails after `Logout`
+            // and before any deletion. Removing it clears the fault for the retry.
+            let archive = platform::caller_root(TEST_UID)
+                .join("credentials")
+                .join(replaced_aside_name("work", "0123456789abcdef"));
+            std::fs::write(&archive, b"not a directory").expect("seed archive file");
+            let failed = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            assert!(
+                matches!(failed.outcome, Outcome::Error(_)),
+                "a logout that could not finish must err: {failed:?}"
+            );
+            assert!(
+                session.exists(),
+                "the sealed token must survive the failure"
+            );
+            accepted.assert_async().await;
+            accepted.remove_async().await;
+            std::fs::remove_file(&archive).expect("clear fault");
+
+            let refused = server
+                .mock("POST", "/logout")
+                .with_status(401)
+                .with_header("x-amzn-errortype", "UnauthorizedException")
+                .with_body(r#"{"message":"Session token not found or invalid"}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let retried = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+            refused.assert_async().await;
+            logged_out_with(&retried, "token_rejected");
+            assert!(!session.exists(), "the retry must delete the sealed token");
+        })
+        .await;
+    }
+
+    /// A logout whose hold runs out reports that nothing was deleted, so that must be true: the
+    /// hold cancels the body only at an await, and the body's only awaits, the bounded SSO
+    /// refresh and `Logout`, come before the first deletion. Here SSO never answers, so that
+    /// await lasts its whole bound; any await added inside the deletion that outlasts the rest of
+    /// the hold would let the hold cancel a logout that had already deleted the session.
+    #[tokio::test(start_paused = true)]
+    async fn a_logout_hold_expiry_never_lands_after_deletion_started() {
+        with_logout_fixture(|daemon, _log| async move {
+            // Bound but never accepted: the kernel completes the handshake, nothing answers.
+            let stalled = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}", stalled.local_addr().expect("addr"));
+            SSO_ENDPOINT.with(|endpoint| *endpoint.borrow_mut() = Some(url));
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+            let logged_out = dispatch(
+                &logout_request("work"),
+                Carrier::Uds,
+                &peer(authorized()),
+                &daemon,
+            )
+            .await;
+            SSO_ENDPOINT.with(|endpoint| *endpoint.borrow_mut() = None);
+            match &logged_out.outcome {
+                Outcome::Error(error) => {
+                    assert!(
+                        error.message.contains("nothing was deleted"),
+                        "{}",
+                        error.message
+                    );
+                    assert!(
+                        session.exists(),
+                        "an error that says nothing was deleted: {}",
+                        error.message
+                    );
+                }
+                Outcome::Result(_) => {
+                    assert!(
+                        !session.exists(),
+                        "a logout that succeeds deletes the session"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    /// A login queued behind a logout whose SSO endpoint never answers is not promised the lock
+    /// within its wait (`drift-detection` 5.9): the logout's `Logout` is bounded by its own hold,
+    /// not by other operations' waits. The login's wait runs out before it starts, so it writes
+    /// nothing and may be retried, and the logout still signs out here.
+    #[tokio::test(start_paused = true)]
+    async fn a_login_queued_behind_a_stalled_sso_logout_fails_its_wait_before_starting() {
+        with_logout_fixture(|daemon, _log| async move {
+            // Bound but never accepted: the kernel completes the handshake, nothing answers.
+            let stalled = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}", stalled.local_addr().expect("addr"));
+            SSO_ENDPOINT.with(|endpoint| *endpoint.borrow_mut() = Some(url));
+            seal_sso_session(&daemon, &sso_session("token"));
+            let request = logout_request("work");
+            let caller = peer(authorized());
+            let lock = daemon.bootstrap_lock(TEST_UID);
+            let login = async {
+                assert!(
+                    lock.try_lock().is_err(),
+                    "the logout must hold the lock first"
+                );
+                crate::server::write_lock::under(
+                    &lock,
+                    TEST_UID,
+                    crate::server::bootstrap::LOGIN_LOCK_BUDGET,
+                    async |_| (),
+                )
+                .await
+            };
+            let (logged_out, login) =
+                tokio::join!(dispatch(&request, Carrier::Uds, &caller, &daemon), login);
+            SSO_ENDPOINT.with(|endpoint| *endpoint.borrow_mut() = None);
+            assert_eq!(
+                login,
+                Err(crate::server::write_lock::Expired::Wait),
+                "the login's wait must run out before the logout's SSO bound does"
+            );
+            assert_failed_at_sso(&logged_out, Some(ACCESS_TOKEN_EXPIRES_AT));
+        })
+        .await;
+    }
+
+    /// An SSO endpoint that accepts and never answers cannot hold the caller's write lock past
+    /// the logout's budget, and the logout still signs out here (AC 18).
+    #[tokio::test]
+    async fn a_silent_sso_endpoint_cannot_hold_the_write_lock() {
+        with_logout_fixture(|daemon, _log| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            // Accept every connection and never answer it.
+            let silent = tokio::spawn(async move {
+                let mut open = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    open.push(stream);
+                }
+            });
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(format!("http://127.0.0.1:{port}")));
+            let session = seal_sso_session(&daemon, &sso_session("token"));
+
+            let logged_out = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dispatch(
+                    &logout_request("work"),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                ),
+            )
+            .await;
+            SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+            silent.abort();
+            let logged_out = logged_out.expect("a silent SSO endpoint must not stall the logout");
+            assert_failed_at_sso(&logged_out, Some(ACCESS_TOKEN_EXPIRES_AT));
+            assert!(!session.exists(), "the sealed session must be gone");
+            assert!(
+                daemon.bootstrap_lock(TEST_UID).try_lock().is_ok(),
+                "the write lock must be free once the logout returns"
+            );
+        })
+        .await;
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+        /// A sealed session that cannot be read (corrupt, or sealed under a key since rotated) is
+        /// not "no session": SSO cannot be told to end it, so the logout reports `failed` as a
+        /// refused `Logout` does, with no expiry since none can be read, and still deletes it.
+        #[test]
+        fn an_unreadable_sso_session_reports_failed_and_is_still_deleted(
+            garbage in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            block_on(with_logout_fixture(|daemon, log| async move {
+                let mut server = mockito::Server::new_async().await;
+                let logout = server.mock("POST", "/logout").expect(0).create_async().await;
+                SSO_ENDPOINT.with(|url| *url.borrow_mut() = Some(server.url()));
+                let session = seal_sso_session(&daemon, b"placeholder");
+                // Overwrite the seal with bytes that open under no key.
+                std::fs::write(&session, &garbage).unwrap();
+
+                let logged_out = dispatch(
+                    &logout_request("work"),
+                    Carrier::Uds,
+                    &peer(authorized()),
+                    &daemon,
+                )
+                .await;
+                SSO_ENDPOINT.with(|url| *url.borrow_mut() = None);
+                logout.assert_async().await;
+                assert_failed_at_sso(&logged_out, None);
+                assert!(!session.exists(), "the unreadable session must still be deleted");
+                assert!(log.text().contains("operation=\"credential/logout\""), "{}", log.text());
+            }));
+        }
+    }
+
+    /// An unauthorized caller of the credential-addressed `credential/logout` gets the
+    /// credential-addressed miss, the same as a name it does not hold (Requirement 8 AC 7).
+    #[tokio::test]
+    async fn an_unauthorized_logout_misses_as_credential_not_found() {
+        for auth in [
+            CallerAuth::Denied(DenyReason::NoRoot),
+            CallerAuth::Denied(DenyReason::NoPeerCred),
+            CallerAuth::Denied(DenyReason::OwnerMismatch),
+            CallerAuth::Denied(DenyReason::UnknownUid),
+        ] {
+            let response = dispatch_uds(&logout_request("work"), &peer(auth)).await;
+            assert_eq!(
+                domain_code(&response),
+                Some(DomainCode::CredentialNotFound),
+                "{response:?}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+        /// `credential/remove` is credential-addressed: a name the caller does not hold and a
+        /// caller that fails the access check get the same answer, `CREDENTIAL_NOT_FOUND`, so a
+        /// removal cannot probe whether a credential exists, and nothing is removed (Requirement
+        /// 8 AC 7-8, Requirement 15 AC 4).
+        #[test]
+        fn every_credential_remove_miss_is_one_code_and_one_message(
+            missing in "[a-z][a-z0-9._-]{0,15}",
+        ) {
+            proptest::prop_assume!(missing != "work");
+            tokio::runtime::Runtime::new().unwrap().block_on(with_logout_fixture(
+                |daemon, _log| async move {
+                    seed_human_credential("work");
+                    let remove = |name: &str| {
+                        Request::with_params(
+                            Id::from(1),
+                            METHOD_CREDENTIAL_REMOVE,
+                            &CredentialRemoveParams { credential: name.into() },
+                        )
+                        .expect("object params")
+                    };
+                    let unknown =
+                        dispatch(&remove(&missing), Carrier::Uds, &peer(authorized()), &daemon)
+                            .await;
+                    assert_eq!(domain_code(&unknown), Some(DomainCode::CredentialNotFound));
+                    for auth in [
+                        CallerAuth::Denied(DenyReason::NoRoot),
+                        CallerAuth::Denied(DenyReason::NoPeerCred),
+                        CallerAuth::Denied(DenyReason::OwnerMismatch),
+                        CallerAuth::Denied(DenyReason::UnknownUid),
+                        CallerAuth::Unresolved,
+                    ] {
+                        let denied =
+                            dispatch(&remove("work"), Carrier::Uds, &peer(auth), &daemon).await;
+                        assert_eq!(credential_addressed(&denied), credential_addressed(&unknown));
+                    }
+                    let (_, credentials) =
+                        config::DaemonConfig::load_from(&platform::caller_root(TEST_UID))
+                            .expect("load");
+                    assert!(credentials.contains_key("work"), "a miss removed nothing");
+                },
+            ));
+        }
+    }
+
+    /// Why a credential-addressed call misses: a caller that fails the access check, or a
+    /// name the caller does not hold.
+    #[derive(Clone, Debug)]
+    enum Miss {
+        Denied(DenyReason),
+        Unresolved,
+        Peerless,
+        UnknownName,
+    }
+
+    /// Call a credential-addressed method the way `serve_connection` routes it: bootstrap and
+    /// login through their streaming handlers, every other method through `dispatch`.
+    async fn call_credential_addressed(
+        method: &str,
+        credential: &str,
+        peer: &PeerInfo,
+        daemon: &Daemon,
+    ) -> Response<Value> {
+        let request = Request::with_params(
+            Id::from(1),
+            method,
+            &serde_json::json!({ "credential": credential }),
+        )
+        .expect("object params");
+        let (notif_tx, _notif_rx) = tokio::sync::mpsc::channel(8);
+        let respond_slot = crate::server::bootstrap::RespondSlot::default();
+        let outcome = match method {
+            METHOD_CREDENTIAL_BOOTSTRAP => {
+                crate::server::bootstrap::handle_profile_bootstrap(
+                    &request,
+                    peer,
+                    daemon,
+                    notif_tx,
+                    respond_slot,
+                )
+                .await
+            }
+            METHOD_CREDENTIAL_LOGIN => {
+                crate::server::bootstrap::handle_profile_login(
+                    &request,
+                    peer,
+                    daemon,
+                    notif_tx,
+                    respond_slot,
+                )
+                .await
+            }
+            _ => return dispatch(&request, Carrier::Uds, peer, daemon).await,
+        };
+        match outcome {
+            Ok(value) => Response::success(Id::from(1), value),
+            Err(error) => Response::failure(Id::from(1), error),
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8))]
+
+        /// Every credential-addressed method answers every miss with the one response a name the
+        /// caller does not hold gets: `CREDENTIAL_NOT_FOUND`, one message, so no method
+        /// distinguishes an unauthorized caller from an absent credential (Requirement 8 AC 3-4,
+        /// 7; Requirement 15 AC 10). Bootstrap and import create the credential they name, so an
+        /// unknown name is not a miss for them, and a first-time caller (`NoRoot`) with a uid is
+        /// provisioned rather than refused (Requirement 2.7).
+        #[test]
+        fn every_credential_addressed_method_misses_with_one_response(
+            missing in "[a-z][a-z0-9._-]{0,15}",
+        ) {
+            proptest::prop_assume!(missing != "work");
+            tokio::runtime::Runtime::new().unwrap().block_on(with_logout_fixture(
+                |daemon, _log| async move {
+                    seed_human_credential("work");
+                    pin_on_disk(&daemon);
+                    let reference = credential_addressed(
+                        &dispatch(
+                            &name_only_request(&missing),
+                            Carrier::Uds,
+                            &peer(authorized()),
+                            &daemon,
+                        )
+                        .await,
+                    );
+                    let methods = [
+                        (METHOD_CREDENTIAL_GET, false),
+                        (METHOD_CREDENTIAL_LOGOUT, false),
+                        (METHOD_CREDENTIAL_REMOVE, false),
+                        (METHOD_CREDENTIAL_LOGIN, false),
+                        (METHOD_CREDENTIAL_BOOTSTRAP, true),
+                        (METHOD_CREDENTIAL_IMPORT, true),
+                    ];
+                    let misses = [
+                        Miss::Denied(DenyReason::NoRoot),
+                        Miss::Denied(DenyReason::NoPeerCred),
+                        Miss::Denied(DenyReason::OwnerMismatch),
+                        Miss::Denied(DenyReason::UnknownUid),
+                        Miss::Unresolved,
+                        Miss::Peerless,
+                        Miss::UnknownName,
+                    ];
+                    for (method, creates) in methods {
+                        for miss in misses.clone() {
+                            let (caller, name) = match miss {
+                                Miss::Denied(DenyReason::NoRoot) | Miss::UnknownName if creates => {
+                                    continue
+                                }
+                                Miss::Denied(ref reason) => (peer(CallerAuth::Denied(reason.clone())), "work"),
+                                Miss::Unresolved => (peer(CallerAuth::Unresolved), "work"),
+                                Miss::Peerless => (
+                                    PeerInfo {
+                                        uid: None,
+                                        pid: None,
+                                        auth: CallerAuth::Denied(DenyReason::NoPeerCred),
+                                        executable: None,
+                                        login_uid: None,
+                                    },
+                                    "work",
+                                ),
+                                Miss::UnknownName => (peer(authorized()), missing.as_str()),
+                            };
+                            let response =
+                                call_credential_addressed(method, name, &caller, &daemon).await;
+                            assert_eq!(
+                                credential_addressed(&response),
+                                reference,
+                                "{method} {miss:?}"
+                            );
+                        }
+                    }
+                },
+            ));
+        }
     }
 }

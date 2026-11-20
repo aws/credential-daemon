@@ -38,6 +38,31 @@ architectures therefore build with no libclang and no header generation; only th
 pkg-config `.pc` files and the shared libraries have to be present. `tss-esapi` 7.7.0 is
 pinned in `Cargo.lock`, so every build stays `--locked`.
 
+That last property is what makes a manylinux2014 build possible at all. The image has no
+working package manager — `vault.centos.org` serves 403 for CentOS 7 — so
+`scripts/manylinux-toolchain.sh` builds tpm2-tss 4.0.2 from a checksummed tarball into
+`/opt/tss` purely to satisfy the pkg-config probe and the link. None of it is shipped: the
+binary's `DT_NEEDED` names the four `libtss2` sonames and the host supplies them, which the
+`assert build-host independence` step checks by refusing any `RUNPATH`.
+
+Every input to that build is pinned by content, not by name: the two tarballs by `sha256sum
+-c`, which aborts the script, and the manylinux2014 images by digest rather than their
+floating `latest` tag. A `-tpm` row fetches and compiles its own tpm2-tss on every run, so
+without those pins the bytes the daemon links against could change under a build that looks
+identical.
+
+4.0.2 is the version AL2023 packages, so the link-time ABI is the one the pregenerated
+bindings were generated against. Dropping to the crate's 2.4.6 floor would widen the set of
+hosts whose tpm2-tss can satisfy the link, but it would put those fixed bindings two major
+versions from the headers they came from — a struct-layout mismatch, which fails at run time
+rather than at link time. Do not lower the pin without enabling `generate-bindings`.
+
+Building tpm2-tss ourselves also needs OpenSSL, and 1.1.1w rather than 3.x: OpenSSL 3's
+`Configure` requires the `IPC::Cmd` perl module, which the image lacks and yum cannot
+supply. It clears tpm2-tss's `libcrypto >= 1.1.0` floor and, like tpm2-tss itself, is
+never linked into a shipped binary — so its EOL status is a build-image reporting matter,
+not an exposure.
+
 ## Shape
 
 A TPM-enabled build is a **platform**, not a differently named binary. Every artifact path
@@ -45,10 +70,9 @@ in the release system is keyed by a platform segment — `builds/<commit>/<platf
 `develop/<platform>/`, `tested/<commit>/<platform>/`, one integration lane per platform —
 so a new platform needs no change to the key layout.
 
-A TPM platform is an existing platform name with a `-tpm` suffix: `al2023-x64-tpm`,
-`al2023-aarch64-tpm`, `ubuntu-x64-tpm`, `ubuntu-aarch64-tpm`. Each carries the same
-`{creds, credsd}` pair as every other platform: a `credsd` linked against tpm2-tss, and a
-`creds` that is not.
+A TPM platform is an existing platform name with a `-tpm` suffix: `linux-x64-tpm` and
+`linux-aarch64-tpm`. Each carries the same `{creds, credsd}` pair as every other
+platform: a `credsd` linked against tpm2-tss, and a `creds` that is not.
 
 `.github/workflows/release.yml` needs no knowledge of any of this. It derives the platform
 from the artifact directory name, loops the two binaries by name, and builds the manifest
@@ -68,7 +92,7 @@ under the same prefix. A third binary name breaks both. A fifth platform breaks 
 ### 2. The suffix marks the TPM build, not the absence of one
 
 The default Linux artifacts keep their names. Inverting it — shipping the TPM build as
-`al2023-x64` and a `-notpm` variant beside it — makes the obvious download the one that
+`linux-x64` and a `-notpm` variant beside it — makes the obvious download the one that
 fails to start on any host without tpm2-tss, and silently reassigns the meaning of a
 platform name that existing consumers already pull.
 
@@ -100,41 +124,60 @@ on `--as-needed` and on unused-object elimination, and may vary by toolchain and
 The separate invocations make the question moot; decision 7 makes the answer observable
 either way.
 
-### 4. Every distro and architecture the default matrix ships, except AL2
+### 4. One portable pair per architecture, not one pair per distro
 
-Ubuntu 24.04 ships tpm2-tss 4.0.1 as `libtss2-dev`, and AL2023 ships 4.0.2 as
-`tpm2-tss-devel`. Both clear the 2.4.6 floor with room, on both architectures, so the TPM
-rows mirror the default rows and the platform names stay predictable: a customer who pulls
-`al2023-aarch64` finds `al2023-aarch64-tpm` beside it.
+**Superseded the per-distro set.** This decision previously read "every distro and
+architecture the default matrix ships, except AL2", and the matrix carried `al2023-x64`,
+`al2023-aarch64`, `ubuntu-x64`, `ubuntu-aarch64` and a `-tpm` sibling for each. It now
+carries `linux-x64`, `linux-aarch64` and their two `-tpm` siblings, and nothing
+else on Linux at all.
+
+The per-distro set existed because a binary's glibc floor is whatever its build host
+happens to supply. Building on manylinux2014 sets that floor at 2.17 deliberately, which is
+below every distro the old rows targeted — below AL2's 2.26, and far below the 2.34 an
+AL2023 build linked. One binary therefore reaches every host the eight artifacts reached.
+
+The old rationale for mirroring was that "a platform name means the same thing with and
+without the suffix, and the `tpm` feature gets compiled under both toolchains rather than
+one." The first half still holds: `linux-aarch64-tpm` sits beside `linux-aarch64`.
+The second half is the cost of this change and is accepted — the `tpm` feature is now
+compiled under one toolchain, against a pinned tpm2-tss 4.0.2 built from source rather than
+against two distro packages. What the distro packages were really covering was runtime
+ABI compatibility, and the integration lanes still cover that: each lane installs its own
+distro's tpm2-tss and loads our binary against it.
 
 Every shipped platform has an integration lane, because a platform without one cannot be
 released at all. Promotion reads `tested/<commit>/<platform>/` for every platform in its
 list, and only a lane's graduation step writes that prefix — so an ungated platform either
 aborts the release or is left out of the list and never reaches a customer. The artifact set
-and the lane set are one decision.
+and the lane set are one decision. The lanes live in the separate distribution repository,
+which has since settled the naming as `linux-*`: each lane names the artifact platform it
+verifies, and the four distro-flavoured names are kept beside it as aliases for the
+duration of the cutover, so a commit under either naming runs its lanes. Two lanes now
+gate each portable platform, which is why graduation requires a witness per lane rather
+than the presence of the binaries. See "Implementation order".
 
-AL2 is not in the set. Its `tpm2-tss` is 1.3.0, below the floor. A conforming build exists
-there under the separate `tpm2-tss3` and `tpm2-tss3-devel` package names at 3.1.1, so an AL2
-variant is possible — but AL2 rows build inside a docker invocation the job makes itself,
-because the runner's JS actions need a glibc AL2 does not have, so the bootstrap and the
-package names would both have to be threaded through that inner shell. AL2 also has no
-integration lane to gate the result. The combination is not worth a platform nobody has
-asked for; AL2's reason to exist in the matrix is proving the glibc 2.26 floor, which the
-default rows already do.
+The AL2 rows are gone too. They never published an artifact; they existed to prove the
+glibc 2.26 floor, and the portable rows now prove a stricter one at 2.17 on every build.
+What goes with them is old-toolchain coverage — AL2 built under gcc 7.3.1 and a cmake3
+symlink, where manylinux2014 supplies gcc 10.2.1 and a current cmake — so nothing in CI
+now compiles the tree under a pre-2020 compiler. Accepted: no shipped artifact was built
+that way, and the floor those rows guarded is now asserted rather than inferred.
 
-A smaller set is defensible and was weighed: an AL2023 build links glibc 2.34 and therefore
-runs on an Ubuntu 24.04 host, so the AL2023 pair alone reaches every host the full set
-reaches, and the Ubuntu rows add build-toolchain coverage rather than host coverage. Mirroring
-the default matrix wins on two counts — a platform name means the same thing with and without
-the suffix, and the `tpm` feature gets compiled under both toolchains rather than one.
+Linux is therefore five rows down to four, and every one of them ships.
 
-### 5. `matrix.bootstrap` means "run these commands" and nothing else
+### 5. `matrix.bootstrap` runs inside the container; `matrix.host_bootstrap` runs on the runner
 
-A bootstrap string and a bare container image are independent facts. The toolchain
-install predicates on `matrix.container`, so a row on a GitHub-hosted runner can carry a
-bootstrap — `sudo apt-get install -y -qq libtss2-dev` — without the job also installing
-rustup over the runner's preinstalled toolchain. Container rows run as root and need no
-`sudo`; runner rows do.
+Every Linux row is now an `image` row — the job runs on the runner and invokes docker
+itself — because manylinux2014 is glibc 2.17 and the runner forces its JS actions onto a
+Node that needs 2.28. `matrix.bootstrap` is therefore always executed inside that docker
+invocation, as root, with no `sudo`, and `matrix.container` is gone along with the
+job-level `container:` key and the toolchain step that keyed on it.
+
+That leaves a gap the per-distro rows did not have. The assertion steps run on the runner,
+against the binary docker left in `target/release`, and a tpm-linked `credsd` will not
+start without libtss2 present there. `matrix.host_bootstrap` fills exactly that: it installs
+`libtss2-dev` on the runner for the two `-tpm` rows, and nothing else uses it.
 
 ### 6. The feature is compiled and linted on every pull request
 
@@ -170,6 +213,23 @@ This is the whole claim the separate artifact exists to make, and it is one `ldd
 being checkable, so nothing about it is left to inference. The assertion runs on the
 machine that produced the binary, beside the existing digest recording.
 
+### 8. The portable floor is asserted the same way
+
+A row carrying `matrix.glibc_floor` additionally fails unless both binaries stay at or below
+that floor and neither carries a `RUNPATH`. Both halves fail builds that otherwise look
+green, which is why neither is left to the build image's reputation:
+
+- A symbol picked up from a newer toolchain does not fail the build or the tests. It fails
+  on the oldest host a customer has, which no CI row is.
+- A `RUNPATH` left behind by `/opt/tss` or `/opt/ossl` sends the loader to a build-machine
+  path. On a host where that path is creatable, that is somewhere to plant a library the
+  daemon will load.
+
+Only non-weak symbols count toward the floor. Rust std references `statx`, `copy_file_range`,
+`getrandom`, `gettid` and `pidfd_spawnp` weakly and falls back to a syscall when the host
+lacks them, so a weak reference above the floor is not a floor — reading it as one would
+make every portable build fail its own assertion.
+
 ## Verifiable properties
 
 1. A push to `main` uploads `builds/<commit>/<platform>/{creds,credsd}` for every TPM
@@ -185,12 +245,18 @@ machine that produced the binary, beside the existing digest recording.
 |---|---|
 | `crates/credsd-daemon/Cargo.toml` | `tpm` passthrough to `credsd-core/tpm`, beside `secure-enclave` |
 | `crates/credsd-core/src/storage/tpm.rs` | The `esapi` module compiles and passes clippy against tss-esapi 7.x |
-| `.github/workflows/ci.yml` | `clippy (tpm)` on the Linux lint row, with `libtss2-dev` installed |
-| `.github/workflows/build.yml` | One `*-tpm` matrix row per TPM platform; toolchain install keyed on `container`; split build/test for TPM rows; `ldd` linkage assertion |
+| `.github/workflows/ci.yml` | `clippy (tpm)` on the Linux lint row, with `libtss2-dev` installed; `test (kkrs)` moved here from `build.yml` |
+| `.github/workflows/build.yml` | Four `linux-*` rows replacing the eight per-distro ones; `host_bootstrap`; tpm branch in the `image` step; `ldd` linkage and glibc-floor assertions |
+| `scripts/manylinux-toolchain.sh` | Builds OpenSSL 1.1.1w and tpm2-tss 4.0.2 from checksummed tarballs inside the container, for the `-tpm` rows |
 | `docs/key-security.md` | The `tpm` feature ships in a named Linux artifact; `credsd status` remains the only thing that settles a given install |
 | `docs/design/key-storage-backends.md` | The backend table's `tpm` row reflects a shipped device seam |
 
-`release.yml` and `tagged-release.yml` are unchanged.
+`release.yml` and `tagged-release.yml` are unchanged: `release.yml` derives its platform set
+from the artifact directory names, so renaming the Linux platforms needs no edit there.
+
+`test (kkrs)` moved because every Linux build row now runs in a container, and the backend's
+tests make keyring syscalls a container's seccomp profile can refuse. `ci.yml`'s Linux lint
+row is the only bare Linux runner left in CI.
 
 ## Platform considerations
 
@@ -254,14 +320,50 @@ Execution plan rather than durable record; it describes the sequence, not the sy
 
    Two limits on what that establishes. It ran on aarch64, so it exercised
    `tss-esapi-sys`'s `aarch64-unknown-linux-gnu` pregenerated bindings and not the x86_64
-   set — the `al2023-x64-tpm` row settles that. And machine binding depends on a real
+   set — the `linux-x64-tpm` row settles that. And machine binding depends on a real
    TPM's seed, so a simulator cannot assert it at all.
 
 2. **Passthrough plus `ci.yml`.** Smallest useful commit, and it installs the compile gate
    that keeps step 1 from rotting.
 
-3. **`build.yml`.** The `container` predicate change first, on its own, since it is
-   behaviour-preserving today and the matrix rows depend on it. Then the rows, the split
-   build, and the `ldd` assertions.
+3. **`build.yml`, per-distro rows.** Done: one `*-tpm` row per distro and arch, the
+   `container` predicate, the split build, and the `ldd` assertions.
 
-4. **Docs**, once the artifacts exist and the names are settled.
+4. **`build.yml`, portable rows.** Done: `scripts/manylinux-toolchain.sh`, the four
+   `linux-*` rows, `host_bootstrap`, the glibc-floor assertion, and the removal of the
+   eight per-distro rows and the two AL2 rows. Linux is now four rows, all of them shipped.
+   The rows published as `manylinux-*` when they first landed and were renamed once the
+   distribution repository settled the name; the toolchain script keeps the `manylinux`
+   name because it is named after the build image, not the artifact.
+
+   Verified on aarch64 before landing — the full suite passes from a manylinux2014 build on
+   manylinux2014, AL2023 and Ubuntu 24.04 for both variants, and both `-tpm` integration
+   lanes pass against real NitroTPM hardware with the daemon reporting `storage backends:
+   tpm, file`. x86_64 was verified in CI rather than locally: both x86_64 rows build and
+   test green, and the floor assertion reports 2.16 there — lower than aarch64's 2.17
+   because x86_64 glibc symbol versions begin at 2.2.5 while aarch64's begin at 2.17.
+   Runtime TPM verification on x86_64 hardware is still outstanding; both integration lanes
+   run so far were aarch64.
+
+5. **Integration lanes and the promotion list**, in the separate distribution repository.
+   Settled there as `linux-*`, which is the name this matrix now publishes. Each lane
+   names the artifact platform it verifies rather than deriving it from the lane's own
+   name, and the four distro-flavoured names are accepted beside it for the duration of
+   the cutover, so a commit under either naming fires its lanes and graduates.
+
+   The four Linux lanes are instance-backed and distro-flavoured on purpose — each launches
+   its own NitroTPM AMI — so the mapping is not one-to-one. One portable platform is gated
+   by two lanes, which is a change to promotion's list and not just a rename: presence of
+   the binaries under `tested/<commit>/<platform>/` no longer proves which lane wrote them,
+   so a passing lane also writes a witness object and the release gate requires one per
+   expected lane.
+
+   One condition outside this naming remains, in that repository's workflow inputs rather
+   than in the lanes: `release.yml` resolves its upload prefix from the repository name, so
+   while this repository is not the one that check names, its builds land under
+   `staging-builds/` — a prefix no lane or promotion step reads — and reach no lane
+   regardless of platform naming.
+
+6. **Docs**, once the artifacts exist and the names are settled. Done for the artifact
+   names in the same commit as the rename; `docs/install.md` describes the Linux artifact
+   generically and needed no edit.

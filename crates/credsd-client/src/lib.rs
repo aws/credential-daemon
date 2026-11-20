@@ -105,7 +105,7 @@ impl Client {
         env: &str,
         agentic: bool,
     ) -> Result<Credential, ClientError> {
-        fetch(&self.socket_path, env, None, agentic).await
+        fetch(&self.socket_path, env, None, None, agentic).await
     }
 
     /// Fetch a specific named credential within `env`. Backs `credsd get --env E --credential C`.
@@ -115,7 +115,22 @@ impl Client {
         credential: &str,
         agentic: bool,
     ) -> Result<Credential, ClientError> {
-        fetch(&self.socket_path, env, Some(credential), agentic).await
+        fetch(&self.socket_path, env, Some(credential), None, agentic).await
+    }
+
+    /// Fetch `credential` within `env` for another account and role of its `aws-idc-sso`
+    /// sign-in: the stored pair, or one the credential allows. Backs
+    /// `credsd get --credential C --account A --role R`.
+    pub async fn get_role_credential(
+        &self,
+        env: &str,
+        credential: &str,
+        account_id: &str,
+        role_name: &str,
+        agentic: bool,
+    ) -> Result<Credential, ClientError> {
+        let pair = Some((account_id, role_name));
+        fetch(&self.socket_path, env, Some(credential), pair, agentic).await
     }
 }
 
@@ -174,6 +189,20 @@ pub mod blocking {
             self.rt
                 .block_on(self.inner.get_credential(env, credential, agentic))
         }
+
+        pub fn get_role_credential(
+            &self,
+            env: &str,
+            credential: &str,
+            account_id: &str,
+            role_name: &str,
+            agentic: bool,
+        ) -> Result<Credential, ClientError> {
+            self.rt.block_on(
+                self.inner
+                    .get_role_credential(env, credential, account_id, role_name, agentic),
+            )
+        }
     }
 }
 
@@ -192,6 +221,10 @@ struct GetParams<'a> {
     environment: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claim: Option<&'a str>,
 }
@@ -255,6 +288,7 @@ async fn fetch(
     socket_path: &Path,
     env: &str,
     credential: Option<&str>,
+    pair: Option<(&str, &str)>,
     agentic: bool,
 ) -> Result<Credential, ClientError> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -271,6 +305,8 @@ async fn fetch(
         params: GetParams {
             environment: env,
             credential,
+            account_id: pair.map(|p| p.0),
+            role_name: pair.map(|p| p.1),
             claim: if agentic { Some("agentic") } else { None },
         },
     };
@@ -336,6 +372,7 @@ async fn fetch(
     _socket_path: &Path,
     _env: &str,
     _credential: Option<&str>,
+    _pair: Option<(&str, &str)>,
     _agentic: bool,
 ) -> Result<Credential, ClientError> {
     Err(ClientError::Daemon(
@@ -347,12 +384,16 @@ async fn fetch(
 
 // ── Full UDS API ─────────────────────────────────────────────────────────────
 
-pub use credsd_core::credential_resolve::{fetch_credential_in_env, fetch_from_daemon_uds};
+pub use credsd_core::credential_resolve::{
+    fetch_credential, fetch_credential_in_env, fetch_from_daemon_uds, fetch_role_credential,
+};
 pub use credsd_core::error::{DaemonError, Result as DaemonResult};
+pub use credsd_core::providers::aws_login::Identity;
 pub use credsd_core::rpc::{
-    ConfigGetResult, CredentialRemoveParams, CredentialSourceType, EnvRemoveParams, HealthResult,
-    ListResult, OkResult, ProfileBootstrapParams, ProfileLoginParams, ProfileManifest,
-    ProviderParams, ProviderParamsIamUser, ProviderParamsRa, ProviderParamsSso,
+    BootstrapResult, ConfigGetResult, CredentialRemoveParams, CredentialSourceType,
+    EnvRemoveParams, HealthResult, ListResult, OkResult, ProfileBootstrapParams,
+    ProfileLoginParams, ProfileManifest, ProviderParams, ProviderParamsIamUser, ProviderParamsRa,
+    ProviderParamsSso,
 };
 
 /// Handles interactive prompts during `bootstrap` and `login` flows.
@@ -395,11 +436,15 @@ pub async fn bootstrap(
     socket: &Path,
     params: &ProfileBootstrapParams,
     handler: &dyn BootstrapHandler,
-) -> DaemonResult<()> {
-    use credsd_core::rpc::{Id, Request, METHOD_PROFILE_BOOTSTRAP};
-    let request = Request::with_params(Id::from(1i64), METHOD_PROFILE_BOOTSTRAP, params)
+) -> DaemonResult<BootstrapResult> {
+    use credsd_core::rpc::{Id, Request, METHOD_CREDENTIAL_BOOTSTRAP};
+    let request = Request::with_params(Id::from(1i64), METHOD_CREDENTIAL_BOOTSTRAP, params)
         .map_err(|e| DaemonError::config(format!("failed to encode request: {e}")))?;
-    run_streaming_rpc(socket, request, Some(&params.environment), handler).await
+    let subject = params
+        .credential
+        .as_deref()
+        .or(params.name_prefix.as_deref());
+    run_streaming_rpc(socket, request, subject, handler).await
 }
 
 /// Re-authenticate a credential whose session is spent.
@@ -409,10 +454,17 @@ pub async fn login(
     params: &ProfileLoginParams,
     handler: &dyn BootstrapHandler,
 ) -> DaemonResult<()> {
-    use credsd_core::rpc::{Id, Request, METHOD_PROFILE_LOGIN};
-    let request = Request::with_params(Id::from(1i64), METHOD_PROFILE_LOGIN, params)
+    use credsd_core::rpc::{Id, Request, METHOD_CREDENTIAL_LOGIN};
+    let request = Request::with_params(Id::from(1i64), METHOD_CREDENTIAL_LOGIN, params)
         .map_err(|e| DaemonError::config(format!("failed to encode request: {e}")))?;
-    run_streaming_rpc(socket, request, Some(&params.environment), handler).await
+    run_streaming_rpc::<credsd_core::rpc::OkResult>(
+        socket,
+        request,
+        Some(&params.credential),
+        handler,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Return a profile's full manifest (credentials, region, sdk/cli settings).
@@ -433,13 +485,18 @@ pub async fn describe(socket: &Path, environment: &str) -> DaemonResult<ProfileM
 
 /// Enumerate credentials for `profile`, or all profiles when `None`.
 #[cfg(unix)]
-pub async fn list(socket: &Path, environment: Option<&str>) -> DaemonResult<ListResult> {
+pub async fn list(
+    socket: &Path,
+    environment: Option<&str>,
+    tags: Option<credsd_core::tags::TagFilter>,
+) -> DaemonResult<ListResult> {
     use credsd_core::rpc::{uds, ListParams, METHOD_CREDENTIAL_LIST};
     uds::call(
         socket,
         METHOD_CREDENTIAL_LIST,
         &ListParams {
             environment: environment.map(str::to_owned),
+            tags,
             request_id: None,
         },
         environment,
@@ -535,6 +592,40 @@ pub async fn credential_remove(socket: &Path, credential: &str) -> DaemonResult<
     .await
 }
 
+/// Sign a credential out: the daemon deletes its sealed session and keeps its entry.
+#[cfg(unix)]
+pub async fn credential_logout(
+    socket: &Path,
+    credential: &str,
+) -> DaemonResult<credsd_core::rpc::LogoutResult> {
+    use credsd_core::rpc::{uds, CredentialLogoutParams, METHOD_CREDENTIAL_LOGOUT};
+    uds::call(
+        socket,
+        METHOD_CREDENTIAL_LOGOUT,
+        &CredentialLogoutParams {
+            credential: credential.to_owned(),
+        },
+        Some(credential),
+    )
+    .await
+}
+
+/// Edit a credential's tags: `params.set` applied, then `params.unset` removed, in one write.
+#[cfg(unix)]
+pub async fn credential_tag(
+    socket: &Path,
+    params: &credsd_core::rpc::CredentialTagParams,
+) -> DaemonResult<OkResult> {
+    use credsd_core::rpc::{uds, METHOD_CREDENTIAL_TAG};
+    uds::call(
+        socket,
+        METHOD_CREDENTIAL_TAG,
+        params,
+        Some(&params.credential),
+    )
+    .await
+}
+
 /// Protocol liveness check.
 #[cfg(unix)]
 pub async fn health(socket: &Path) -> DaemonResult<HealthResult> {
@@ -545,14 +636,14 @@ pub async fn health(socket: &Path) -> DaemonResult<HealthResult> {
 // Streaming RPC driver for bootstrap and login. Loops reading notification lines
 // until a response with an `id` arrives, delegating interactive steps to `handler`.
 #[cfg(unix)]
-async fn run_streaming_rpc(
+async fn run_streaming_rpc<T: serde::de::DeserializeOwned>(
     socket: &Path,
     request: credsd_core::rpc::Request,
     subject: Option<&str>,
     handler: &dyn BootstrapHandler,
-) -> DaemonResult<()> {
+) -> DaemonResult<T> {
     use credsd_core::error::DaemonError;
-    use credsd_core::rpc::{codec, uds, OkResult, Outcome, Response};
+    use credsd_core::rpc::{codec, uds, Outcome, Response};
     use tokio::io::{AsyncReadExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -672,10 +763,10 @@ async fn run_streaming_rpc(
             };
 
             if let Some(sel) = selection {
-                use credsd_core::rpc::METHOD_PROFILE_BOOTSTRAP_RESPOND;
+                use credsd_core::rpc::METHOD_CREDENTIAL_BOOTSTRAP_RESPOND;
                 let notif = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "method": METHOD_PROFILE_BOOTSTRAP_RESPOND,
+                    "method": METHOD_CREDENTIAL_BOOTSTRAP_RESPOND,
                     "params": { "selection": sel }
                 });
                 let mut bytes = serde_json::to_vec(&notif)
@@ -686,10 +777,10 @@ async fn run_streaming_rpc(
             continue;
         }
 
-        let response: Response<OkResult> = serde_json::from_value(raw)
+        let response: Response<T> = serde_json::from_value(raw)
             .map_err(|e| DaemonError::config(format!("failed to decode daemon response: {e}")))?;
         return match response.outcome {
-            Outcome::Result(_) => Ok(()),
+            Outcome::Result(result) => Ok(result),
             Outcome::Error(e) => Err(uds::error_to_daemon(subject, e)),
         };
     }
@@ -738,10 +829,51 @@ mod streaming_tests {
         });
         let request =
             Request::with_params(Id::from(1i64), "profile/login", &serde_json::json!({})).unwrap();
-        let outcome = run_streaming_rpc(&socket, request, None, &NoPrompts).await;
+        let outcome = run_streaming_rpc::<OkResult>(&socket, request, None, &NoPrompts)
+            .await
+            .map(|_| ());
         daemon.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         outcome
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+        /// A selected pair reaches the daemon as both fields, exactly as given, alongside the
+        /// credential it selects within (Requirement 17 AC 1).
+        #[test]
+        fn a_role_request_sends_both_fields(
+            account_id in "[0-9]{12}",
+            role_name in "[A-Za-z0-9+=,.@_-]{1,64}",
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("s.sock");
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let sent = rt.block_on(async {
+                let listener = UnixListener::bind(&socket).unwrap();
+                let daemon = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut line = Vec::new();
+                    BufReader::new(read).read_until(b'\n', &mut line).await.unwrap();
+                    let reply = codec::encode_response::<()>(&Response::failure(
+                        Id::from(1i64),
+                        RpcError::domain(DomainCode::Internal, "stop"),
+                    ))
+                    .unwrap();
+                    write.write_all(&reply).await.unwrap();
+                    line
+                });
+                let client = Client::new(&socket);
+                let _ = client.get_role_credential("work", "acme", &account_id, &role_name, false).await;
+                daemon.await.unwrap()
+            });
+            let request: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+            proptest::prop_assert_eq!(&request["params"]["credential"], "acme");
+            proptest::prop_assert_eq!(&request["params"]["account_id"], account_id.as_str());
+            proptest::prop_assert_eq!(&request["params"]["role_name"], role_name.as_str());
+        }
     }
 
     /// A daemon that stops mid-frame is a transport failure, as on the one-shot path, and is not

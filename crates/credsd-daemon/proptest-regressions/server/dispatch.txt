@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f27ba5f30d8ff8097f1d74e3b02502ddfdc6cbdb647f14b69dd4385c9e807878 # shrinks to env = "a", credential = "a", ready = false
+cc 9ac04138cc2a826b13972dc3a66654ca3059a3f3bbf5c7a92d4aa9833e5e5e3f # shrinks to allowed = [], pick = 1, index = Index(0), other = ("000000000000", "_26__O5W=O=.A_0np--DCRF-uq+9"), by_environment = true

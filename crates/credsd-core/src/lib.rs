@@ -22,4 +22,5 @@ pub mod projection;
 pub mod providers;
 pub mod rpc;
 pub mod storage;
+pub mod tags;
 pub mod wire;

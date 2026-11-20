@@ -4217,15 +4217,20 @@ Used by:
 - cpufeatures 0.3.1
 - crypto-common 0.2.2
 - der 0.7.10
+- der 0.8.3
 - der_derive 0.7.3
+- der_derive 0.8.0
 - digest 0.11.3
 - hmac 0.13.0
 - hybrid-array 0.4.14
 - pem-rfc7468 0.7.0
+- pem-rfc7468 1.0.0
 - pkcs8 0.10.2
 - sha2 0.11.0
 - spki 0.7.3
+- spki 0.8.1
 - x509-cert 0.2.5
+- x509-cert 0.3.0
 
 ```text
                               Apache License

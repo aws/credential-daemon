@@ -463,14 +463,15 @@ fn open_or_mint(
             // destruction whether triggered from serve or from a reinstall.
             Err(e) if backend == crate::storage::Backend::Tpm => {
                 return Err(DaemonError::config(format!(
-                    "the TPM-sealed encryption key could not be unsealed (TPM error: {e}). \
+                    "the TPM-sealed encryption key could not be unsealed (TPM error: {}). \
                      Common causes: TPM was cleared or replaced, the key was sealed under a \
                      policy this build does not support, or /dev/tpmrm0 is inaccessible. \
                      Run 'credsd init --reset --storage-backend tpm' to recover: it will quarantine \
                      the undecryptable credential blobs and mint a fresh key. Each user's \
                      integrity record was sealed under the old key and will not open, so each \
                      user then runs 'creds revalidate' (its approval replaces the record), and \
-                     re-bootstraps each environment with 'credsd bootstrap --env <env>'.",
+                     re-bootstraps each credential with 'creds bootstrap --credential <name>'.",
+                    e.detail(),
                 )));
             }
             Err(e) => return Err(e),
@@ -488,7 +489,7 @@ fn open_or_mint(
                      To switch to '{selected}': remove the encryption key from the '{other}' \
                      keystore, then re-run 'credsd init --storage-backend {selected}'. \
                      All cached credentials will need to be re-imported after switching \
-                     ('credsd bootstrap --env <env>' for each environment).",
+                     ('creds bootstrap --credential <name>' for each credential).",
                     selected = backend.as_str(),
                 )));
             }

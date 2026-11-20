@@ -53,8 +53,12 @@ kkrs = ["credsd-core/kkrs"]
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
 proptest = "1"
 async-trait = "0.1"
+mockito = "1"
+tokio = { version = "1", features = ["test-util"] }
+credsd-core = { path = "../credsd-core", default-features = false, features = ["test-seam"] }
 
 [lints]
 workspace = true

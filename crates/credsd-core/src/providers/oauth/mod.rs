@@ -173,8 +173,10 @@ impl AwsWebIdentityProvider {
             .map_err(|e| {
                 DaemonError::provider(format!(
                     "no usable OAuth token for credential '{}': {}. \
-                     Run 'credsd login --environment {}'.",
-                    self.credential_name, e, self.credential_name
+                     Run 'creds login --credential {}'.",
+                    self.credential_name,
+                    e.detail(),
+                    self.credential_name
                 ))
             })?;
         Ok(serde_json::from_slice(&plaintext)?)

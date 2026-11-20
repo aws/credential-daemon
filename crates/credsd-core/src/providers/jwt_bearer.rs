@@ -75,7 +75,7 @@ impl Renewer for JwtBearerProvider {
             .map_err(|e| {
                 DaemonError::provider(format!(
                     "no usable assertion for credential: {}. Re-bootstrap with a fresh JWT.",
-                    e
+                    e.detail()
                 ))
             })?;
         let jwt = String::from_utf8(plaintext.to_vec())
@@ -110,6 +110,7 @@ impl Renewer for JwtBearerProvider {
 mod tests {
     use super::*;
     use crate::encryption::generate_key;
+    use crate::error::prefixes;
     use base64::Engine;
     use proptest::prelude::*;
     use tempfile::tempdir;
@@ -202,6 +203,27 @@ mod tests {
         let (p, _d) = provider();
         let err = p.renew().await.unwrap_err();
         assert!(err.to_string().contains("Re-bootstrap"));
+        assert_eq!(prefixes(&err.to_string()), 1, "{err}");
+    }
+
+    proptest! {
+        /// An assertion file that will not open is embedded through its `detail()`, so the
+        /// provider error names one category however the file is malformed.
+        #[test]
+        fn an_unopenable_assertion_names_one_category(
+            sealed in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let (p, dir) = provider();
+            std::fs::write(dir.path().join(ASSERTION_FILE), &sealed).expect("write assertion");
+            let Err(err) = rt.block_on(p.renew()) else {
+                panic!("an assertion that is not sealed must not renew");
+            };
+            prop_assert_eq!(prefixes(&err.to_string()), 1, "{}", err);
+        }
     }
 
     // Exchange tests live in providers::oauth::token.

@@ -43,12 +43,10 @@ pub enum Op {
     Enroll {
         public_key: Vec<u8>,
     },
-    /// A bootstrap that would overwrite an existing credential or repoint an existing
-    /// environment. Approval performs nothing: it grants a one-use authorization the client
+    /// A bootstrap that would overwrite an existing credential. Approval performs nothing: it grants a one-use authorization the client
     /// spends by re-sending the identical bootstrap, because an interactive provider flow cannot
     /// be replayed from a pending record and the secrets it carries must not wait in one.
     Bootstrap {
-        environment: String,
         credential: String,
         /// SHA-256 of the re-serialized bootstrap params. The params themselves, which carry the
         /// secret, are never held.
@@ -62,12 +60,13 @@ pub enum Op {
         key: String,
         base: [u8; 32],
     },
-    /// An import batch that would bind into existing environments or replace sealed material
-    /// left on disk. Like [`Op::Bootstrap`], approval grants a re-send of these exact params,
+    /// An import batch that would replace existing credentials or sealed material left on
+    /// disk. Like [`Op::Bootstrap`], approval grants a re-send of these exact params,
     /// because the batch carries long-term keys that must not wait in a pending record.
     Import {
-        /// The profiles that would overwrite, which the challenge names and the base covers.
-        environments: Vec<String>,
+        /// The credentials that would be overwritten, which the challenge names and the base
+        /// covers.
+        credentials: Vec<String>,
         params: [u8; 32],
         base: [u8; 32],
     },
@@ -691,13 +690,12 @@ fn canonical(p: &Pending) -> String {
             );
         }
         Op::Bootstrap {
-            environment,
             credential,
             params,
             base,
         } => {
             f += &format!(
-                "op=environment/bootstrap\narg.environment={environment}\narg.credential={credential}\nparams={}\nbase={}\n",
+                "op=credential/bootstrap\narg.credential={credential}\nparams={}\nbase={}\n",
                 presence::hex(params),
                 presence::hex(base)
             );
@@ -713,13 +711,13 @@ fn canonical(p: &Pending) -> String {
             );
         }
         Op::Import {
-            environments,
+            credentials,
             params,
             base,
         } => {
             f += &format!(
-                "op=environment/import\narg.environments={}\nparams={}\nbase={}\n",
-                environments.join(","),
+                "op=credential/import\narg.credentials={}\nparams={}\nbase={}\n",
+                credentials.join(","),
                 presence::hex(params),
                 presence::hex(base)
             );

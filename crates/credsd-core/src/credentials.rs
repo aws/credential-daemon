@@ -39,6 +39,17 @@ pub enum CredentialType {
     Unknown,
 }
 
+impl CredentialType {
+    /// The wire spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AccessToken => "access_token",
+            Self::SessionCredentials => "session_credentials",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Payload variants holding the actual secret material.
 ///
 /// Internally tagged on `type`, not `#[serde(untagged)]`: untagged picks a

@@ -23,6 +23,8 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+proptest = "1"
+tempfile = "3"
 
 [lints]
 workspace = true

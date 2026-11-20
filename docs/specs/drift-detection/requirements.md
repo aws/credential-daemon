@@ -300,16 +300,33 @@ What a user sees is in `ux.md`. The approval step is `presence-gated-operations/
 
 5.7. WHEN the integrity record cannot be updated, the daemon SHALL fail the operation.
 
-5.8. Every daemon operation that writes a load-bearing file, or seals material a load-bearing
-     file names, SHALL perform the Requirement 5.2 check, and the Requirement 10 comparison,
-     through a single shared verification step, immediately before the write and under the
-     caller's per-uid write lock, held across both the check and the write. This covers at least
-     environment bootstrap, import, and login; credential removal; environment removal;
-     `config set` and `config unset`; the commit of an approved request; revalidation; and
-     renewal, background and on demand. Revalidation's base check (Requirement 4.10) is its form
-     of this check. An operation that cannot perform the check, or whose check fails, SHALL fail
-     and SHALL NOT write. A refused renewal seals nothing and leaves the cached credential's
-     expiry where it was.
+5.8. Every daemon operation that writes a load-bearing file, or seals or deletes material a
+     load-bearing file names, SHALL perform the Requirement 5.2 check, and the Requirement 10
+     comparison, through a single shared verification step, immediately before the write and
+     under the caller's per-uid write lock, held across both the check and the write. A deletion
+     is a write here. This covers at least environment bootstrap, import, and login; credential
+     removal; credential logout; environment removal; `config set` and `config unset`; the commit
+     of an approved request; revalidation; and renewal, background and on demand. Revalidation's
+     base check (Requirement 4.10) is its form of this check. An operation that cannot perform
+     the check, or whose check fails, SHALL fail and SHALL NOT write. A refused renewal seals
+     nothing and leaves the cached credential's expiry where it was. A refused logout deletes
+     nothing.
+
+5.9. An operation that holds the per-uid write lock while it waits on a provider or a user SHALL
+     bound both its wait for the lock and its hold of it. The two bounds are its lock budget. A
+     holder is not required to fit inside other operations' waits: each holder has its own hold
+     bound, set in the table below, and any provider call it makes under the lock SHALL be bounded
+     to end inside that hold. A wait that runs out SHALL fail the operation before it starts with
+     a retryable error, so it writes nothing and the client may retry. A hold that runs out SHALL
+     cancel the operation and release the lock. The bounded operations and their budgets are:
+
+     | Operation | Wait | Hold |
+     |---|---|---|
+     | Login | 10 s | 300 s, the interactive step limit |
+     | Renewal, background and on demand | 10 s | 60 s |
+     | Credential logout | 10 s | 60 s, bounding the SSO refresh and `Logout` calls (30 s together) plus local deletion, which does not yield, so an expiry deletes nothing |
+
+     Every other holder does only local file work and MAY wait for the lock without a bound.
 
 ### Requirement 6: Only the verified load path reads load-bearing files
 
@@ -317,7 +334,8 @@ What a user sees is in `ux.md`. The approval step is `presence-gated-operations/
 
 6.1. No daemon code path that reads a load-bearing file and uses its contents to make a serving
      decision SHALL do so without first verifying drift. Direct reads that bypass the verified
-     load (e.g. `config/get`, the `envs_using` guard in `credential/remove`) SHALL either be
+     load (e.g. the `envs_using` guard in `credential/remove`; `config/get` is not dispatched,
+     per `credential-only-addressing` Requirement 4.1) SHALL either be
      routed through the verified load or shown to not affect serving decisions.
 
 ### Requirement 7: Drift is evidence, and refusal is policy

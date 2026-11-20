@@ -20,7 +20,7 @@ use crate::log::escape_log;
 use crate::providers::oauth::callback::{self, CallbackServer, CALLBACK_TIMEOUT};
 use crate::providers::oauth::dpop::DpopSigner;
 use crate::providers::oauth::{http_client, pkce, urlencode, PendingLogin};
-use crate::providers::{CredentialProvider, ReauthInput, Renewed, Renewer};
+use crate::providers::{sdk_failure, CredentialProvider, ReauthInput, Renewed, Renewer};
 
 pub(crate) const TOKEN_FILE: &str = "aws_login_token.enc";
 /// Sign-In's two registered devtools clients — the service accepts no other value. Which one is
@@ -84,6 +84,10 @@ struct TokenOutput {
     access_token: SessionCredentials,
     refresh_token: String,
     expires_in: i64,
+    /// Kept only for its `sub`, recorded for reference. Equality is decided from the caller
+    /// identity STS reports, so the token's signature is never relied on.
+    #[serde(default)]
+    id_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +126,49 @@ fn valid_region(region: &str) -> bool {
         && region
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Region prefix to AWS Sign-In domain, most specific prefix first so `us-gov-` and the
+/// `us-iso*-` partitions are tried before commercial `us-`. Mirrors the non-FIPS rules in the
+/// Sign-In endpoint rule set the AWS CLI applies for `aws login`; the partition DNS suffix can't
+/// be used instead, because most partitions serve Sign-In from a different domain.
+const PARTITIONS: &[(&str, &str)] = &[
+    ("us-gov-", "signin.amazonaws-us-gov.com"),
+    ("us-isob-", "signin.sc2shome.sgov.gov"),
+    ("us-isof-", "signin.csphome.hci.ic.gov"),
+    ("us-iso-", "signin.c2shome.ic.gov"),
+    ("eu-isoe-", "signin.csphome.adc-e.uk"),
+    ("eusc-de-", "signin.amazonaws-eusc.eu"),
+    ("cn-", "signin.amazonaws.cn"),
+    ("us-", "signin.aws.amazon.com"),
+    ("eu-", "signin.aws.amazon.com"),
+    ("ap-", "signin.aws.amazon.com"),
+    ("sa-", "signin.aws.amazon.com"),
+    ("ca-", "signin.aws.amazon.com"),
+    ("me-", "signin.aws.amazon.com"),
+    ("af-", "signin.aws.amazon.com"),
+    ("il-", "signin.aws.amazon.com"),
+    ("mx-", "signin.aws.amazon.com"),
+];
+
+/// The Sign-In origin for `region`, or `None` when the region is in no known partition. After the
+/// partition prefix the region must be exactly `{name}-{number}`, so nothing a caller supplies
+/// can reach the host beyond one DNS label in front of a fixed domain.
+fn signin_base_url(region: &str) -> Option<String> {
+    if !valid_region(region) {
+        return None;
+    }
+    let (rest, domain) = PARTITIONS
+        .iter()
+        .find_map(|(p, d)| region.strip_prefix(p).map(|rest| (rest, d)))?;
+    let (name, number) = rest.split_once('-')?;
+    let shaped = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit());
+    shaped.then(|| format!("https://{region}.{domain}"))
 }
 
 fn authorize_url(
@@ -253,7 +300,7 @@ async fn post_token(
 ) -> std::result::Result<TokenOutput, TokenError> {
     let proof = dpop
         .sign("POST", token_url, None, None)
-        .map_err(|e| TokenError::Failed(e.to_string()))?;
+        .map_err(|e| TokenError::Failed(e.detail()))?;
     let resp = http
         .post(token_url)
         .header("DPoP", proof)
@@ -291,9 +338,209 @@ pub struct AwsLoginProvider {
     encryption: Arc<EncryptionService>,
     data_dir: PathBuf,
     http: reqwest::Client,
-    /// `https://{region}.signin.aws.amazon.com`. A field, not derived per call, so tests can point
-    /// the token endpoint at a local mock.
+    /// The region's Sign-In origin (see [`signin_base_url`]). A field, not derived per call, so
+    /// tests can point the token endpoint at a local mock.
     base_url: String,
+    /// STS endpoint override, for tests only. `None` lets the SDK resolve the region's endpoint.
+    sts_endpoint: Option<String>,
+}
+
+/// The sealed record of who signed in to a credential. `identity.enc` beside the token.
+pub const IDENTITY_FILE: &str = "identity.enc";
+
+/// Who a completed sign-in authorized, as `sts:GetCallerIdentity` reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub arn: String,
+    pub partition: String,
+    pub account: String,
+    /// `role`, `user`, or `root`.
+    pub kind: String,
+    /// The role name, or the user's path and name. Empty for root.
+    pub name: String,
+    /// The role session name. Empty for a user or root; it changes on every sign-in.
+    pub session: String,
+    /// The `idToken` `sub`, when Sign-In returned one. For reference only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+}
+
+impl Identity {
+    /// The same partition, account, and role or user. The session takes no part: it changes on
+    /// every sign-in while the principal does not.
+    pub fn same_principal(&self, other: &Identity) -> bool {
+        self.partition == other.partition
+            && self.account == other.account
+            && self.kind == other.kind
+            && self.name == other.name
+    }
+
+    /// The unnormalized name for this identity under a prefix: the Principal and never the
+    /// session, so a repeat sign-in as the same account and role addresses the same credential.
+    /// The resource type is in the name so a role and a user of one name never share a
+    /// credential (`aws-login-identity` Requirement 4.2).
+    pub fn name_under(&self, prefix: &str) -> String {
+        match self.kind.as_str() {
+            "role" => format!("{prefix}{}-role-{}", self.account, self.name),
+            "user" => format!(
+                "{prefix}{}-user-{}",
+                self.account,
+                self.name.rsplit('/').next().unwrap_or(&self.name)
+            ),
+            _ => format!("{prefix}{}-root", self.account),
+        }
+    }
+}
+
+/// The ARN `sts:GetCallerIdentity` reports for `creds` in `region`, as [`sdk_failure`] words a
+/// failure. `endpoint` replaces the region's resolved endpoint, for tests.
+///
+/// Shared by `aws-login`'s sign-in check and the Identity Center audit lookup, so the one call both
+/// make runs with one set of bounds rather than each provider's own. The bounds are the tightest of
+/// the two it replaces: the overall cap matters where the call is on a sign-in's critical path, and
+/// the per-phase caps where it is a spawned lookup that must not linger.
+pub(crate) async fn caller_arn(
+    creds: aws_sdk_sts::config::Credentials,
+    region: &str,
+    endpoint: Option<&str>,
+) -> Result<String> {
+    use aws_sdk_sts::config::{timeout::TimeoutConfig, BehaviorVersion, Region};
+    let mut conf = aws_sdk_sts::Config::builder()
+        .region(Region::new(region.to_owned()))
+        .credentials_provider(creds)
+        .behavior_version(BehaviorVersion::latest())
+        .timeout_config(
+            TimeoutConfig::builder()
+                .operation_timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(30))
+                .build(),
+        );
+    if let Some(endpoint) = endpoint {
+        conf = conf.endpoint_url(endpoint);
+    }
+    let out = aws_sdk_sts::Client::from_conf(conf.build())
+        .get_caller_identity()
+        .send()
+        .await
+        .map_err(|e| sdk_failure("get_caller_identity", e))?;
+    Ok(out.arn().unwrap_or_default().to_owned())
+}
+
+/// Parse the ARN `sts:GetCallerIdentity` returns. Anything other than an assumed role, an IAM
+/// user, or an account root is refused: the comparison would have nothing reliable to compare.
+pub fn parse_caller_arn(arn: &str) -> Result<Identity> {
+    let bad = || DaemonError::provider("sign-in returned a caller identity credsd cannot read");
+    let mut parts = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(""), Some(account), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(bad());
+    };
+    if partition.is_empty() || account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let (kind, name, session) = match (service, resource.split_once('/')) {
+        ("sts", Some(("assumed-role", rest))) => {
+            let (role, session) = rest.split_once('/').ok_or_else(bad)?;
+            if role.is_empty() || session.is_empty() || session.contains('/') {
+                return Err(bad());
+            }
+            ("role", role, session)
+        }
+        ("iam", Some(("user", name))) if !name.is_empty() => ("user", name, ""),
+        ("iam", None) if resource == "root" => ("root", "", ""),
+        _ => return Err(bad()),
+    };
+    Ok(Identity {
+        arn: arn.to_owned(),
+        partition: partition.to_owned(),
+        account: account.to_owned(),
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        session: session.to_owned(),
+        sub: None,
+    })
+}
+
+/// Normalize a derived name with the AWS CLI's rule: a valid name is used as is; otherwise every
+/// disallowed character becomes `-`, the result is cut to 55 characters, and `-` plus the first 8
+/// hex digits of the SHA-256 of the name before cleanup is appended. Deterministic.
+pub fn normalize_name(raw: &str) -> String {
+    if crate::config::credentials::validate_name(raw).is_ok() {
+        return raw.to_owned();
+    }
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(55)
+        .collect();
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, raw.as_bytes());
+    let hex: String = digest
+        .as_ref()
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // A name that would start with '.' is not valid; the CLI's prefixes never do, but the rule
+    // must still produce a valid name for any input.
+    let cleaned = cleaned.trim_start_matches('.').to_owned();
+    format!("{cleaned}-{hex}")
+}
+
+/// The identity recorded for the credential in `dir`, or `None` when there is none or it cannot
+/// be read. Unreadable reads as absent, which can only lead to a confirmation, never to a match.
+pub fn stored_identity(encryption: &EncryptionService, dir: &std::path::Path) -> Option<Identity> {
+    let plaintext = encryption.open_from_file(&dir.join(IDENTITY_FILE)).ok()?;
+    serde_json::from_slice(&plaintext).ok()
+}
+
+/// A completed sign-in held in memory. Nothing is persisted until [`AwsLoginProvider::commit`].
+pub struct SignedIn {
+    token: CachedAwsLogin,
+    dpop: DpopSigner,
+    pub identity: Identity,
+}
+
+impl SignedIn {
+    /// A held sign-in with throwaway session material, for tests of what is done with it.
+    #[doc(hidden)]
+    pub fn for_tests(identity: Identity) -> Result<Self> {
+        Ok(Self {
+            token: CachedAwsLogin {
+                access_key_id: "AKIATEST".into(),
+                secret_access_key: "secret".into(),
+                session_token: "session".into(),
+                refresh_token: "refresh".into(),
+                expires_at: Utc::now()
+                    .checked_add_signed(Duration::minutes(15))
+                    .unwrap_or_else(Utc::now)
+                    .to_rfc3339(),
+            },
+            dpop: DpopSigner::generate_unsealed()?,
+            identity,
+        })
+    }
+}
+
+/// The `sub` claim of an `idToken`, decoded without verification. Reference only.
+fn id_token_sub(id_token: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("sub")?.as_str().map(str::to_owned)
 }
 
 impl AwsLoginProvider {
@@ -316,7 +563,12 @@ impl AwsLoginProvider {
                  loopback listener",
             ));
         }
-        let base_url = format!("https://{region}.signin.aws.amazon.com");
+        // Safe to echo: `valid_region` above limits it to lowercase letters, digits, and '-'.
+        let base_url = signin_base_url(region).ok_or_else(|| {
+            DaemonError::provider(format!(
+                "aws-login region '{region}' is not in a known AWS partition"
+            ))
+        })?;
         Ok(Self {
             credential_name,
             config,
@@ -324,7 +576,41 @@ impl AwsLoginProvider {
             data_dir,
             http: http_client()?,
             base_url,
+            sts_endpoint: None,
         })
+    }
+
+    /// Ask STS who the new credentials act as. Called before anything is persisted, so a
+    /// failure leaves the stored credential untouched.
+    async fn caller_identity(&self, token: &CachedAwsLogin) -> Result<Identity> {
+        let creds = aws_sdk_sts::config::Credentials::new(
+            token.access_key_id.clone(),
+            token.secret_access_key.clone(),
+            Some(token.session_token.clone()),
+            None,
+            "credsd-aws-login",
+        );
+        let arn = caller_arn(creds, &self.config.region, self.sts_endpoint.as_deref())
+            .await
+            .map_err(|_| {
+                DaemonError::provider(
+                    "sign-in completed but STS could not confirm who signed in; nothing was saved",
+                )
+            })?;
+        parse_caller_arn(&arn)
+    }
+
+    /// Persist a held sign-in: the token, then its DPoP key, then who signed in.
+    pub fn commit(&self, signed: SignedIn) -> Result<()> {
+        // Token before key, as in `aws-web-identity`: a newer token with a stale key fails its next
+        // refresh and offers re-login; the reverse leaves nothing to refresh with.
+        self.persist_token(&signed.token)?;
+        signed.dpop.seal(&self.encryption, &self.data_dir)?;
+        let json = Zeroizing::new(serde_json::to_vec(&signed.identity)?);
+        self.encryption
+            .seal_to_file(&self.data_dir.join(IDENTITY_FILE), &json)?;
+        info!(credential = %self.credential_name, arn = %escape_log(&signed.identity.arn), "aws login saved");
+        Ok(())
     }
 
     fn persist_token(&self, token: &CachedAwsLogin) -> Result<()> {
@@ -339,8 +625,9 @@ impl AwsLoginProvider {
             .open_from_file(&self.data_dir.join(TOKEN_FILE))
             .map_err(|e| {
                 DaemonError::provider(format!(
-                    "no usable login for credential '{}': {e}",
-                    self.credential_name
+                    "no usable login for credential '{}': {}",
+                    self.credential_name,
+                    e.detail()
                 ))
             })?;
         Ok(serde_json::from_slice(&plaintext)?)
@@ -414,7 +701,7 @@ impl AwsLoginProvider {
         &self,
         pending: PendingRemoteLogin,
         paste: &str,
-    ) -> Result<()> {
+    ) -> Result<SignedIn> {
         let PendingRemoteLogin {
             pkce,
             state,
@@ -423,11 +710,11 @@ impl AwsLoginProvider {
             authorize_url: _,
         } = pending;
         let code = code_from_paste(paste, &state)?;
-        self.exchange_code(&dpop, code.as_str(), &pkce, &redirect_uri)
+        self.exchange_code(dpop, code.as_str(), &pkce, &redirect_uri)
             .await
     }
 
-    pub async fn finish_interactive_login(&self, pending: PendingLogin) -> Result<()> {
+    pub async fn finish_interactive_login(&self, pending: PendingLogin) -> Result<SignedIn> {
         let PendingLogin {
             server,
             pkce,
@@ -443,24 +730,24 @@ impl AwsLoginProvider {
                 .await
                 .map_err(|e| DaemonError::provider(format!("callback task failed: {e}")))??;
 
-        self.exchange_code(&dpop, code.as_str(), &pkce, &redirect_uri)
+        self.exchange_code(dpop, code.as_str(), &pkce, &redirect_uri)
             .await
     }
 
-    /// Redeem an authorization code and persist what it buys. `redirect_uri` must be the one the
+    /// Redeem an authorization code and hold what it buys. `redirect_uri` must be the one the
     /// authorization request carried, whichever flow produced the code.
     async fn exchange_code(
         &self,
-        dpop: &DpopSigner,
+        dpop: DpopSigner,
         code: &str,
         pkce: &pkce::Pkce,
         redirect_uri: &str,
-    ) -> Result<()> {
+    ) -> Result<SignedIn> {
         let token_url = format!("{}/v1/token", self.base_url);
         let out = post_token(
             &self.http,
             &token_url,
-            dpop,
+            &dpop,
             serde_json::json!({
                 "client_id": self.client_id(),
                 "grant_type": "authorization_code",
@@ -476,12 +763,16 @@ impl AwsLoginProvider {
             }
         })?;
 
-        // Token before key, as in `aws-web-identity`: a newer token with a stale key fails its next
-        // refresh and offers re-login; the reverse leaves nothing to refresh with.
-        self.persist_token(&CachedAwsLogin::from_output(out))?;
-        dpop.seal(&self.encryption, &self.data_dir)?;
-        info!(credential = %self.credential_name, "aws login successful");
-        Ok(())
+        let sub = out.id_token.as_deref().and_then(id_token_sub);
+        let token = CachedAwsLogin::from_output(out);
+        let mut identity = self.caller_identity(&token).await?;
+        identity.sub = sub;
+        info!(credential = %self.credential_name, "aws login signed in; not yet saved");
+        Ok(SignedIn {
+            token,
+            dpop,
+            identity,
+        })
     }
 }
 
@@ -559,6 +850,188 @@ impl Renewer for AwsLoginProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_encryption() -> Arc<EncryptionService> {
+        Arc::new(EncryptionService::new(crate::encryption::generate_key().unwrap()).unwrap())
+    }
+
+    fn role(account: &str, role: &str, session: &str) -> Identity {
+        parse_caller_arn(&format!(
+            "arn:aws:sts::{account}:assumed-role/{role}/{session}"
+        ))
+        .expect("assumed-role arn")
+    }
+
+    #[test]
+    fn caller_arns_parse_by_kind_and_odd_ones_are_refused() {
+        let r = role("111111111111", "Admin", "alice");
+        assert_eq!(
+            (
+                r.partition.as_str(),
+                r.account.as_str(),
+                r.kind.as_str(),
+                r.name.as_str(),
+                r.session.as_str()
+            ),
+            ("aws", "111111111111", "role", "Admin", "alice")
+        );
+        let u = parse_caller_arn("arn:aws-us-gov:iam::222222222222:user/team/bob").unwrap();
+        assert_eq!(
+            (u.kind.as_str(), u.name.as_str(), u.session.as_str()),
+            ("user", "team/bob", "")
+        );
+        let root = parse_caller_arn("arn:aws:iam::333333333333:root").unwrap();
+        assert_eq!(root.kind, "root");
+        for bad in [
+            "",
+            "arn:aws:sts::1111:assumed-role/Admin/alice",
+            "arn:aws:sts::111111111111:assumed-role/Admin",
+            "arn:aws:sts::111111111111:assumed-role/Admin/alice/extra",
+            "arn:aws:s3:::bucket",
+            "arn::sts::111111111111:assumed-role/Admin/alice",
+            "arn:aws:sts:us-east-1:111111111111:assumed-role/Admin/alice",
+            "arn:aws:iam::111111111111:group/devs",
+        ] {
+            assert!(parse_caller_arn(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    /// The session changes on every sign-in; the principal is what the gate compares.
+    #[test]
+    fn same_principal_ignores_the_session_and_nothing_else() {
+        let a = role("111111111111", "Admin", "alice");
+        assert!(a.same_principal(&role("111111111111", "Admin", "alice-2")));
+        assert!(!a.same_principal(&role("111111111111", "ReadOnly", "alice")));
+        assert!(!a.same_principal(&role("222222222222", "Admin", "alice")));
+        let gov =
+            parse_caller_arn("arn:aws-us-gov:sts::111111111111:assumed-role/Admin/alice").unwrap();
+        assert!(!a.same_principal(&gov));
+        // The resource type is part of the Principal: a role and an IAM user may share a name
+        // in one account, and they are different principals with different permissions.
+        let user = parse_caller_arn("arn:aws:iam::111111111111:user/Admin").unwrap();
+        assert!(!role("111111111111", "Admin", "alice").same_principal(&user));
+        assert!(
+            !a.same_principal(&role("111111111111", "admin", "alice")),
+            "no case folding"
+        );
+    }
+
+    #[test]
+    fn the_derived_name_is_the_principal_and_not_the_session() {
+        let id = role("111111111111", "Admin", "alice");
+        assert_eq!(
+            normalize_name(&id.name_under("login.")),
+            "login.111111111111-role-Admin"
+        );
+        assert_eq!(
+            id.name_under("login."),
+            role("111111111111", "Admin", "alice-2").name_under("login."),
+            "a new session addresses the same credential"
+        );
+    }
+
+    /// A role and an IAM user of the same name are different Principals, so they derive
+    /// different names; a user's path is left out, and root has a name of its own.
+    #[test]
+    fn the_derived_name_carries_the_resource_type() {
+        let user = parse_caller_arn("arn:aws:iam::111111111111:user/team/Admin").unwrap();
+        let root = parse_caller_arn("arn:aws:iam::111111111111:root").unwrap();
+        assert_eq!(user.name_under("login."), "login.111111111111-user-Admin");
+        assert_eq!(root.name_under("login."), "login.111111111111-root");
+        assert_ne!(
+            user.name_under("login."),
+            role("111111111111", "Admin", "alice").name_under("login.")
+        );
+    }
+
+    proptest::proptest! {
+        /// Whatever the identity, the derived name is a valid credential name, the same every
+        /// time, and a name that was already valid is used as is.
+        #[test]
+        fn derived_names_are_valid_and_deterministic(
+            role in "[A-Za-z0-9+=,.@_ /-]{1,64}",
+            session in "[A-Za-z0-9+=,.@_ /-]{1,64}",
+            account in "[0-9]{12}",
+        ) {
+            let id = Identity {
+                arn: String::new(),
+                partition: "aws".into(),
+                account,
+                kind: "role".into(),
+                name: role,
+                session,
+                sub: None,
+            };
+            let raw = id.name_under("login.");
+            let name = normalize_name(&raw);
+            proptest::prop_assert!(crate::config::credentials::validate_name(&name).is_ok(), "{name:?}");
+            proptest::prop_assert_eq!(&name, &normalize_name(&raw));
+            if crate::config::credentials::validate_name(&raw).is_ok() {
+                proptest::prop_assert_eq!(&name, &raw);
+            }
+        }
+    }
+
+    const CALLER_IDENTITY_XML: &str = r#"<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><GetCallerIdentityResult><Arn>arn:aws:sts::111111111111:assumed-role/Admin/alice</Arn><UserId>AROAEXAMPLE:alice</UserId><Account>111111111111</Account></GetCallerIdentityResult><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></GetCallerIdentityResponse>"#;
+
+    fn sts_provider(dir: &std::path::Path, endpoint: String) -> AwsLoginProvider {
+        let config = serde_json::from_str(r#"{"region":"us-east-1"}"#).unwrap();
+        let mut provider =
+            AwsLoginProvider::new("test".into(), config, test_encryption(), dir.into()).unwrap();
+        provider.sts_endpoint = Some(endpoint);
+        provider
+    }
+
+    #[tokio::test]
+    async fn the_identity_comes_from_sts_with_the_new_credentials() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("Action=GetCallerIdentity".into()))
+            .with_header("content-type", "text/xml")
+            .with_body(CALLER_IDENTITY_XML)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = sts_provider(dir.path(), server.url());
+        let signed = SignedIn::for_tests(role("000000000000", "x", "y")).unwrap();
+        let id = provider
+            .caller_identity(&signed.token)
+            .await
+            .expect("caller identity");
+        mock.assert_async().await;
+        assert_eq!(id.arn, "arn:aws:sts::111111111111:assumed-role/Admin/alice");
+    }
+
+    /// A sign-in whose identity STS cannot confirm saves nothing.
+    #[tokio::test]
+    async fn an_sts_failure_fails_the_sign_in_before_anything_is_saved() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(403)
+            .with_header("content-type", "text/xml")
+            .with_body(r#"<ErrorResponse><Error><Code>AccessDenied</Code><Message>no</Message></Error></ErrorResponse>"#)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = sts_provider(dir.path(), server.url());
+        let signed = SignedIn::for_tests(role("000000000000", "x", "y")).unwrap();
+        assert!(provider.caller_identity(&signed.token).await.is_err());
+        assert!(!dir.path().join(TOKEN_FILE).exists());
+        assert!(!dir.path().join(IDENTITY_FILE).exists());
+    }
+
+    #[test]
+    fn commit_seals_the_identity_beside_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = sts_provider(dir.path(), "http://unused".into());
+        let id = role("111111111111", "Admin", "alice");
+        provider
+            .commit(SignedIn::for_tests(id.clone()).unwrap())
+            .unwrap();
+        assert_eq!(stored_identity(&provider.encryption, dir.path()), Some(id));
+    }
 
     #[test]
     fn authorize_url_carries_challenge_and_no_verifier() {
@@ -717,6 +1190,7 @@ mod tests {
                 },
                 refresh_token: "r".into(),
                 expires_in,
+                id_token: None,
             };
             assert!(matches!(lifetime_checked(out), Err(TokenError::Failed(_))));
         }
@@ -740,7 +1214,114 @@ mod tests {
         assert!(valid_region("us-gov-west-1"));
     }
 
+    /// Every partition the AWS CLI's `aws login` reaches, with the host it resolves to.
+    #[test]
+    fn each_partition_signs_in_at_its_own_host() {
+        for (region, host) in [
+            ("us-east-1", "https://us-east-1.signin.aws.amazon.com"),
+            ("eu-west-1", "https://eu-west-1.signin.aws.amazon.com"),
+            (
+                "ap-southeast-7",
+                "https://ap-southeast-7.signin.aws.amazon.com",
+            ),
+            ("mx-central-1", "https://mx-central-1.signin.aws.amazon.com"),
+            (
+                "us-gov-west-1",
+                "https://us-gov-west-1.signin.amazonaws-us-gov.com",
+            ),
+            (
+                "us-gov-east-1",
+                "https://us-gov-east-1.signin.amazonaws-us-gov.com",
+            ),
+            ("cn-north-1", "https://cn-north-1.signin.amazonaws.cn"),
+            (
+                "cn-northwest-1",
+                "https://cn-northwest-1.signin.amazonaws.cn",
+            ),
+            (
+                "eusc-de-east-1",
+                "https://eusc-de-east-1.signin.amazonaws-eusc.eu",
+            ),
+            (
+                "us-iso-east-1",
+                "https://us-iso-east-1.signin.c2shome.ic.gov",
+            ),
+            (
+                "us-isob-east-1",
+                "https://us-isob-east-1.signin.sc2shome.sgov.gov",
+            ),
+            (
+                "eu-isoe-west-1",
+                "https://eu-isoe-west-1.signin.csphome.adc-e.uk",
+            ),
+            (
+                "us-isof-south-1",
+                "https://us-isof-south-1.signin.csphome.hci.ic.gov",
+            ),
+        ] {
+            assert_eq!(signin_base_url(region).as_deref(), Some(host), "{region}");
+        }
+    }
+
+    /// A region in no known partition is refused, not guessed as commercial: a wrong guess
+    /// sends the refresh token to another partition's service.
+    #[test]
+    fn a_region_in_no_partition_is_refused() {
+        for region in [
+            "zz-fake-1",
+            "us-east",
+            "us-east-1a",
+            "us-east-1-",
+            "-us-east-1",
+            "us--1",
+            "us-gov-1",
+            "us-iso-",
+            "eusc-fr-east-1",
+            "cn-north",
+            "us-east-x",
+            "us-east-1.evil.example",
+            "us-east-1/evil",
+            "",
+        ] {
+            assert_eq!(signin_base_url(region), None, "{region:?}");
+            let config = serde_json::from_value(serde_json::json!({ "region": region })).unwrap();
+            let error = AwsLoginProvider::new(
+                "c".into(),
+                config,
+                Arc::new(
+                    EncryptionService::new(crate::encryption::generate_key().unwrap()).unwrap(),
+                ),
+                PathBuf::from("/nonexistent"),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{region:?} was accepted"));
+            // Requirement 1.2: a well-formed region outside every partition is named, so the
+            // user sees which value to fix. A malformed one is not echoed.
+            if valid_region(region) {
+                assert!(
+                    error.to_string().contains(&format!("'{region}'")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
     proptest::proptest! {
+        /// Whatever the region, a resolved host is HTTPS, is the region followed by one of the
+        /// eight sign-in domains, and carries no port, user-info, path, or query.
+        #[test]
+        fn a_resolved_host_is_the_region_on_a_known_domain(region in ".{0,40}") {
+            if let Some(url) = signin_base_url(&region) {
+                let rest = url.strip_prefix("https://").unwrap();
+                let suffix = rest.strip_prefix(region.as_str()).unwrap();
+                let known = PARTITIONS
+                    .iter()
+                    .any(|(_, d)| suffix.strip_prefix('.') == Some(*d));
+                proptest::prop_assert!(known);
+                proptest::prop_assert!(!rest.contains([':', '@', '/', '?', '#']));
+            }
+        }
+
         #[test]
         fn accepted_region_is_a_bare_label(region in ".*") {
             if valid_region(&region) {

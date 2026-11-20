@@ -98,14 +98,13 @@ Paths below are relative to the daemon's data directory; see
   to start the `tpm` backend while `CREDSD_TPM_POLICY` is set, and refuses a key whose
   sidecar records any other policy, which `credsd init --reset --storage-backend tpm`
   recovers from.
-- **Needs its own download:** the `-tpm` artifacts — `al2023-x64-tpm`, `al2023-aarch64-tpm`,
-  `ubuntu-x64-tpm`, `ubuntu-aarch64-tpm` — are the only builds carrying the `tpm` feature.
-  They need the tpm2-tss runtime libraries on the host — `libtss2-esys.so.0`,
-  `libtss2-mu.so.0`, and `libtss2-tctildr.so.0`, from `tpm2-tss` on AL2023 or `libtss2-dev`
-  on Ubuntu, whose own runtime packages are named per soname and renamed between releases —
-  and do not start without them, which is why they are separate downloads. There is no AL2
-  variant. Any other artifact has to name a backend, as described under
-  [how a backend is chosen](#how-a-backend-is-chosen).
+- **Needs its own download:** the `-tpm` artifacts — `linux-x64-tpm` and
+  `linux-aarch64-tpm` — are the only builds carrying the `tpm` feature. They need the tpm2-tss
+  runtime libraries on the host — `libtss2-esys.so.0`, `libtss2-mu.so.0`, and
+  `libtss2-tctildr.so.0`, from `tpm2-tss` on AL2023 or `libtss2-dev` on Ubuntu, whose own
+  runtime packages are named per soname and renamed between releases — and do not start
+  without them, which is why they are separate downloads. Any other artifact has to name a
+  backend, as described under [how a backend is chosen](#how-a-backend-is-chosen).
 
 ### `kkrs` (Linux, with the `kkrs` feature)
 
@@ -240,13 +239,13 @@ So a deliberate switch is three steps, and it costs every sealed credential:
 ```bash
 sudo credsd uninstall --purge-key --storage-backend <old>   # quarantines, then deletes the key
 sudo credsd install --storage-backend <new>                 # mints a fresh key
-creds login --env <env>                                     # re-seals under it, as yourself
+creds login --credential <name>                             # re-seals under it, as yourself
 ```
 
 1. `uninstall --purge-key` moves every sealed credential to `<data-dir>/quarantine/` and then
    deletes the old key. Nothing migrates; the quarantined files can never be opened again.
 2. `install --storage-backend <new>` mints a new random master key in the new backend.
-3. `creds login --env <env>` re-authenticates issuer-backed sources (SSO, OAuth, AWS login).
+3. `creds login --credential <name>` re-authenticates issuer-backed sources (SSO, OAuth, AWS login).
    Secrets you entered yourself, such as IAM access keys or static secrets, need
    `creds bootstrap` again with the secret in hand. Either one re-seals under the new key.
 
@@ -312,8 +311,9 @@ re-running `sudo credsd install` is the reinitialization path.
 
 A reset quarantines the undecryptable blobs and mints a fresh key. Each user's integrity record
 was sealed under the old key and will not open either, so each user then runs `creds
-revalidate` (its approval replaces the record) and re-bootstraps each environment with
-`creds bootstrap --env <env>`.
+revalidate` (its approval replaces the record), signs each issuer-backed credential in again
+with `creds login --credential <name>`, and re-enters hand-entered secrets with `creds
+bootstrap`.
 
 `secure-enclave` and `file` also refuse to start when the key is present but unusable, and
 leave the files in place. For the keychain backends and `credential-manager`, see

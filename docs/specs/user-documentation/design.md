@@ -177,9 +177,9 @@ by path. No new dependency.
 2. Transport — the Unix socket (and named pipe), socket location order, peer-uid
    authorization
 3. Envelope — JSON-RPC 2.0 framing, notifications used by interactive bootstrap
-4. Methods — one section per wire method: `credential/get`, `credential/get_batch`,
-   `credential/list`, `credential/remove`, `environment/describe`, `environment/bootstrap`,
-   `environment/bootstrap/respond`, `environment/login`, `environment/import`,
+4. Methods — one section per wire method: `credential/get`, `environment/credentials`,
+   `credential/list`, `credential/remove`, `environment/describe`, `credential/bootstrap`,
+   `credential/bootstrap/respond`, `credential/login`, `credential/import`,
    `environment/remove`, `config/get`, `config/set`, `config/unset`, `system/health`,
    `request/get`, `request/list`, `request/approve`, `request/withdraw`, `presence/enroll`,
    `presence/revoke`, `presence/status`; which methods are gated, and how approval completes

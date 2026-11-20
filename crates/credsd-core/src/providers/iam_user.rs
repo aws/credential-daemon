@@ -106,7 +106,7 @@ impl SessionTokenProvider {
                 let e = e.detail();
                 DaemonError::provider(format!(
                     "no usable key for credential '{}': {}. If the keystore key changed, \
-                     re-run 'credsd bootstrap --env {}'.",
+                     re-run 'creds bootstrap --credential {}'.",
                     self.credential_name, e, self.credential_name
                 ))
             })?;
@@ -363,7 +363,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("credsd bootstrap"),
+            err.contains("creds bootstrap --credential"),
             "unexpected error: {}",
             err
         );

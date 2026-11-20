@@ -10,7 +10,7 @@
 #[derive(Clone, Debug)]
 pub enum DenyReason {
     /// No `callers/<uid>/owner` file — the caller was never provisioned (deny-by-absence).
-    /// Run `creds bootstrap --env <name> <provider>` to provision this uid.
+    /// Run `creds bootstrap --credential <name> <provider>` to provision this uid.
     NoRoot,
     /// `peer_cred()` returned `None` — the kernel did not supply a uid for this connection.
     /// Not a bootstrap problem; likely a platform or socket configuration issue.
@@ -28,7 +28,7 @@ impl std::fmt::Display for DenyReason {
         match self {
             Self::NoRoot => write!(
                 f,
-                "not bootstrapped (run: creds bootstrap --env <name> <provider>)"
+                "not bootstrapped (run: creds bootstrap --credential <name> <provider>)"
             ),
             Self::NoPeerCred => write!(f, "kernel did not supply a peer uid for this connection"),
             Self::OwnerMismatch => {
@@ -47,7 +47,7 @@ mod tests {
     fn deny_reason_display_covers_all_variants() {
         assert_eq!(
             DenyReason::NoRoot.to_string(),
-            "not bootstrapped (run: creds bootstrap --env <name> <provider>)"
+            "not bootstrapped (run: creds bootstrap --credential <name> <provider>)"
         );
         assert_eq!(
             DenyReason::NoPeerCred.to_string(),

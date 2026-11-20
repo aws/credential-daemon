@@ -63,7 +63,7 @@ pub(crate) fn check_not_expired(
 /// writer.
 ///
 pub fn reseal_command(credential: &str) -> String {
-    format!("creds bootstrap --env <env> --credential {credential} jwt --token-file <path>")
+    format!("creds bootstrap --credential {credential} jwt --token-file <path>")
 }
 
 /// The `exp` (Unix seconds) claim of a JWT, as the local expiry.
@@ -145,7 +145,7 @@ impl Renewer for JwtProvider {
                 DaemonError::provider(format!(
                     "no usable JWT for credential '{}': {}. Seal one with '{}'.",
                     self.credential_name,
-                    e,
+                    e.detail(),
                     reseal_command(&self.credential_name)
                 ))
             })?;

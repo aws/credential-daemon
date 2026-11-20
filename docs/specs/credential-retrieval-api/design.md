@@ -136,7 +136,7 @@ fn exposed(method: &str, carrier: Carrier) -> bool
 | Method | UDS | Enforcement |
 |---|---|---|
 | `credential/get` | yes | returns Material |
-| `credential/get_batch` | yes | returns Material |
+| `environment/credentials` | yes | returns Material |
 | `credential/list` | yes | capped at name/kind/status by the *type*, not the handler |
 | `environment/describe` | yes | carries projection inputs |
 | `system/health` | yes | no Material, no config |
@@ -152,7 +152,7 @@ Two properties this shape buys, both required:
   emits the same error an unknown method would — a permission error would confirm the method
   exists.
 - **`credential/list`'s cap is structural.** `ListResult` cannot carry `source` or `default`
-  because `CredentialSummary` has no such fields (`src/rpc/methods.rs:243`). Requirement 13
+  because `CredentialSummary` has no such fields. Requirement 13
   AC 4's "nothing more" is enforced by the type, so a handler cannot widen it and a reviewer
   does not have to notice.
 
@@ -169,7 +169,8 @@ table is the contract; a variant missing from it must not fall through to a defa
 | `Provider(_)` | `PROVIDER_UNAVAILABLE` | Transient; remedy is retry. |
 | `CredentialsExpired` | `REAUTH_REQUIRED` | Same remedy, same code — expiry is not its own branch for a caller. |
 | `Config(_)`, `Storage(_)`, `Encryption(_)`, `Io(_)`, `Json(_)`, `Toml(_)` | `INTERNAL` | Message must not echo config content or paths beyond what the operator already knows. |
-| kind mismatch (not a `DaemonError` today) | `WRONG_CREDENTIAL_TYPE` | Raised at the handler: an `access_token` credential requested where session credentials are required. |
+| caller config fails validation (not a `DaemonError`) | `CONFIG_INVALID` | Raised at dispatch for `credential/get`, `credential/list` and `credential/tag`; nothing is served. The message names the credential and key, never a value. Unlike `CONFIG_DRIFTED` (remedy: revalidate), the remedy is to edit the file, then revalidate. |
+| kind mismatch (not a `DaemonError`) | `WRONG_CREDENTIAL_TYPE` | Raised at the handler: an `access_token` credential requested where session credentials are required. |
 
 Two rules that are easy to violate later:
 
@@ -179,8 +180,8 @@ Two rules that are easy to violate later:
   (`src/rpc/methods.rs:36`).
 - **Scope failures have no codes yet, deliberately.** Requirement 8 AC 2's two scope
   conditions stay unnamed until the Requested_Scope grammar exists, because AC 5 makes codes
-  additive-only and a name coined before its domain is permanent. Both are unreachable today:
-  nothing populates a `Scope`.
+  additive-only and a name coined before its domain is permanent. Both are unreachable
+  while nothing populates a `Scope`.
 
 ## Name validation at deserialize time
 
@@ -195,6 +196,168 @@ ENVIRONMENT_NOT_FOUND`. This is not a Requirement 8 AC 3-4 violation: malformed 
 decidable from the request alone, without consulting any config or keystore, so it cannot
 serve as an existence oracle. What AC 3-4 forbid is distinguishing *well-formed and absent*
 from *well-formed and forbidden*, and those remain identical.
+
+## Credential-addressed `credential/get`
+
+`GetParams.environment` is optional (Requirement 10 AC 6). The handler branches on the form of
+the request, never on what the caller's config happens to contain:
+
+1. Neither `environment` nor `credential`: `-32602`, before any config or keystore is read
+   (AC 9).
+2. The audit record and the drift and custody refusal run for both forms before anything can
+   miss (AC 10).
+3. Credential-addressed (`credential` only): look the credential up in the caller's
+   `credentials.toml` sources. Present: serve it from the store under its own restrictions.
+   Absent, or the caller unauthorized: `CREDENTIAL_NOT_FOUND` with one fixed message (AC 11).
+4. Environment-addressed: the environment must exist; with `credential`, the environment's
+   `credentials` list must contain it; without, the first entry is served. Any miss is
+   `ENVIRONMENT_NOT_FOUND`. The credential is then served by the same store lookup as step 3,
+   so naming an environment cannot reach material the credential-addressed form would refuse
+   (AC 8).
+
+`REAUTH_REQUIRED` data names the credential, and its remediation is `credential/login` for
+that credential (AC 12).
+
+### Where each restriction lives
+
+| Restriction | Lives on | Applies to |
+|---|---|---|
+| `identity_type` | the credential source | every request for that credential |
+| Approval and presence gates | the credential (gated operations) | every write to it |
+| Drift and custody | the caller root | every request |
+| `claim`, `scope` | the request | that request |
+| Environment `identity_type`, boundary, region | the environment | only requests that name it; narrow only |
+
+### No implicit environments (Requirement 16)
+
+`credential/bootstrap` and `credential/import` write `credentials.toml` and its snapshot only.
+`config.toml` is not touched, so its snapshot is not resealed by a credential write.
+`EnvConfig::credential_list` returns the explicit list only; an empty list composes nothing.
+
+### `environment/credentials`
+
+Renamed from `credential/get_batch`. It runs one environment-addressed get per entry of the
+environment's list, in order, and fails the whole call on the first error (Requirement 3).
+
+## Role selection for `aws-idc-sso` (Requirement 17)
+
+`GetParams` carries `account_id` and `role_name` as two flat optional fields, each validated on
+deserialize like a name. The handler adds two steps to the order above:
+
+1. After the neither-subject check, one of the two without the other is `-32602`, before any
+   config or keystore read (AC 1).
+2. After the credential resolves, a pair on a source other than `aws-idc-sso` is
+   `ROLE_SELECTION_UNSUPPORTED`, a domain refusal, since resolved config decides it (AC 3).
+   A pair equal to the stored one is dropped, so it shares the default's cache entry (AC 4).
+   Any other pair not in the credential's `allowed_roles` is `ROLE_NOT_ALLOWED`, naming the
+   credential (AC 10). Both a served and a refused pair log `credential.role_selected` with the
+   credential, account, role, and `outcome` (`allowed` or `refused`) (AC 8).
+
+`allowed_roles` lives on the SSO credential's config and on `ProviderParamsSso`, so it is set by
+`creds bootstrap aws-idc-sso --allow-role ACCOUNT_ID:ROLE_NAME` and stored with the rest of the
+sealed entry. Changing it is a re-bootstrap over an existing credential, which the Req 1.7
+overwrite gate already holds for approval; the approval binds the digest of the params, list
+included, and its description names every listed pair.
+
+The store keys its cache by `(uid, credential, pair)`, where `pair` is `None` for the stored
+account and role, and its renewal turn locks by `(uid, credential)`, so the pairs of one
+credential renew in turn and at most one refresh-token grant is in flight (AC 6). Neither grows
+with the pairs a caller names: there is one turn lock per credential, and each cache insert drops
+expired entries. A pair renews
+through `CredentialProvider::role_renewer`, which only the SSO provider implements: it shares the
+provider's sealed token and refresh path and differs only in the account and role it passes to
+`GetRoleCredentials`. The background loop warms the stored pair. A selected pair renews on
+demand, and only a successful renewal is cached, so the cache holds pairs the user actually has.
+
+Restrictions need no new code (AC 7): drift, custody, `identity_type`, and environment narrowing
+all run on the credential before the pair is read, and the pair only changes the call to
+Identity Center.
+
+### Repeating a bootstrap (AC 11)
+
+A client that names one credential per Identity Center sign-in signs in again whenever the
+session expires, and it has one verb for a sign-in: `credential/bootstrap`. So bootstrap is
+idempotent in its settings. The entry gate asks what a bootstrap would overwrite, and a sign-in
+that leaves every stored setting as it found it overwrites only the session, which is the thing
+the sign-in replaces by definition. `credential/login` is the re-authentication a
+`REAUTH_REQUIRED` points at (AC 5); which of the two a client uses is its own choice.
+
+The decision is taken twice, where `aws-login`'s is: in `admit` and again in `commit_bootstrap`
+under the per-caller write lock. `overwrite_reason` reports that the credential holds an entry or
+sealed material, and `same_provider_source` clears that reason when the stored source matches the
+request. The SSO arm compares `start_url`, `sso_region`, `identity_type`, `account_id`,
+`role_name`, and `allowed_roles` against the entry, reading the `TomlFiles` bytes the write check
+verified rather than the file again, so a swap after the check cannot exempt a replace.
+
+The commit comparison is the one AC 11 names, because it holds the lock the write holds: it
+compares the staged `SsoConfig`, the settings the sign-in ran on, against the entry as it then
+stands. The entry check decides nothing the commit check does not decide again; it is there to
+refuse a replace before the user is sent to a browser. Where the two disagree the entry changed
+while the provider flow waited on a person, and the sign-in is discarded with the refusal that
+says the credential changed while the user was signing in, rather than installed over settings
+nobody approved. `aws-login` reaches commit for its own reason — its gate turns on who signed in,
+which nothing knows until the sign-in returns — but the shape is one shape: the entry refuses
+early where it can, and the lock decides.
+
+Settings the request omits are read from the entry, not resolved again: `bootstrap_sso` takes the
+stored `SsoConfig` as its starting point for a credential that has one, so `ListAccounts` and
+`ListAccountRoles` run only for a credential with no entry to read. Without that, a repeat
+bootstrap of a user with several accounts would send `select_account` and wait for a
+`credential/bootstrap/respond` that a non-interactive sign-in never sends.
+
+"Omitted" has to be a value the wire carries, so `ProviderParamsSso.allowed_roles` is
+`Option<Vec<RolePair>>`: a `Vec` under `#[serde(default)]` reads an absent list and an empty one
+as the same thing, and AC 11 turns on the difference between them — absent keeps the stored list,
+`[]` clears it under approval. `account_id` and `role_name` are already `Option<String>`, so they
+need no change. The wire stays additive; a Rust caller building the struct literally gains one
+field to name.
+
+The rule is "every stored setting equal", not a list of settings a repeat may change. One
+comparison is cheaper to hold than a per-field policy, and it keeps the gate table reading as a
+single rule — a sign-in that changes nothing but the session — with one definition per source.
+A pair the allowed list already names is deliberately inside the gate: `account_id` and
+`role_name` are the pair a request naming none is served, so moving the default changes what
+every such consumer receives, even though a request naming the pair could already reach it. The
+narrower reading — ungate a move within the allowed list, since reach does not widen — buys a
+client nothing, because a client re-authenticating names no pair at all.
+
+A replace discloses what it replaces. `describe_overwrite` carries one clause per changed
+setting, named by its stored key with its old and new value, the clauses joined with `; ` as
+`credential/import` joins its per-profile ones and appended as the `identity_type` clause is. A
+changed `start_url` or `sso_region` repoints the stored pair and the allowed list at an instance
+where a different administrator decides who holds them, so a single parenthetical enumerates what
+the new sign-in keeps, as `environment/remove` enumerates the credentials it leaves in place:
+
+```
+replace existing credential 'dev' (source and sealed material) with a new credential; change start_url from A to B; change sso_region from C to D (kept on the new sign-in: account 111122223333 role Admin, allowed_roles 111122223333/Admin and 444455556666/ReadOnly)
+```
+
+Nothing is written before the sign-in succeeds. The device flow runs first, and only its success
+reaches `write_caller_state_locked`, the credentials snapshot reseal, and the cache eviction, so
+a failed, timed-out, or cancelled sign-in leaves the stored settings and the old sign-in as they
+were — as `aws sso login` writes a changed region only after a successful login.
+
+#### Who signed in
+
+`SsoProvider::signed_in_user` brokers role credentials for a pair and reads the session name
+`sts:GetCallerIdentity` returns, reusing `aws_login::parse_caller_arn` on the
+`assumed-role/AWSReservedSSO_<permission-set>_<hash>/<user>` form rather than a second parser.
+`audit_sso_signed_in_user` emits it as its own `sso.signed_in` record, not a field of `bootstrap
+complete`, because the lookup has an unresolved outcome to express and the reason for it is the
+useful half of that record. The session name is Identity Center's rendering of an IdP user name,
+and on a first bootstrap the pair comes from `ListAccounts`/`ListAccountRoles`, so every field of
+the record is remote data and goes through `escape_log`.
+
+It runs on each path that completes a fresh sign-in, after the pair is final so the lookup uses
+the pair the sign-in is stored with: in `bootstrap_sso`, where no lock is held across the flow,
+and in `login_sso`, where the device flow already runs under the per-caller write lock and one
+more call is noise beside it. Not on the unattended renew path: a refresh uses the same user's
+refresh token, so the user cannot have changed, and a silent background renewal should not mint
+credentials.
+
+The outcome is audited and nothing else — neither call site applies `?` to it — so an unresolved
+identity leaves the sign-in successful, which is what Requirement 17's "Who signed in" requires of
+a credential whose stored pair the instance may no longer assign.
 
 ## Socket discovery
 
@@ -256,25 +419,30 @@ without control.
 
 ## Mutation methods
 
-Five UDS-only methods let the caller manage their own `callers/<uid>/` tree. All are caller-scoped
+Six UDS-only methods let the caller manage their own `callers/<uid>/` tree. All are caller-scoped
 daemon-side: the daemon resolves the caller uid from `SO_PEERCRED` and opens the caller's own
 `callers/<uid>/config.toml` or `callers/<uid>/credentials.toml` — a caller cannot name another
-uid's folder. An unauthorized caller receives `ENVIRONMENT_NOT_FOUND` per the indistinguishability
-rule (Req 8 AC 3–4).
+uid's folder. An unauthorized caller receives the code the method returns for any other miss, so
+the two are indistinguishable (Req 8 AC 3–4): `ENVIRONMENT_NOT_FOUND` on the environment-addressed
+methods, and `CREDENTIAL_NOT_FOUND` on `credential/remove` and `credential/logout`, which pass the
+one credential access check (Req 8 AC 7-8, Req 15 AC 4).
 
 | Method | Params | Result | Errors |
 |---|---|---|---|
 | `config/set` | `{environment, key, value, request_id?}` | `OkResult {ok: true}` | `ENVIRONMENT_NOT_FOUND`, `INTERNAL` |
 | `config/get` | `{environment, key, request_id?}` | `ConfigGetResult {value?}` | `ENVIRONMENT_NOT_FOUND`, `INTERNAL` |
 | `config/unset` | `{environment, key, request_id?}` | `OkResult {ok: true}` | `ENVIRONMENT_NOT_FOUND`, `INTERNAL` |
-| `credential/remove` | `{credential, request_id?}` | `OkResult {ok: true}` | `ENVIRONMENT_NOT_FOUND`, `INTERNAL` |
+| `credential/remove` | `{credential, request_id?}` | `OkResult {ok: true}` | `CREDENTIAL_NOT_FOUND`, `INTERNAL` |
+| `credential/logout` | `{credential, request_id?}` | `LogoutResult {signed_out, provider, start_url?, access_token_expires_at?}` | `CREDENTIAL_NOT_FOUND`, `LOGOUT_UNSUPPORTED_SOURCE`, `-32602` (Invalid params), `CONFIG_DRIFTED`, `INTERNAL` |
 | `environment/remove` | `{environment, request_id?}` | `OkResult {ok: true}` | `ENVIRONMENT_NOT_FOUND`, `INTERNAL` |
 
-All five are UDS-only (`Carrier::Uds`). `config/set`, `config/get`,
-`config/unset`, and `environment/remove` take `environment` as an env name; `credential/remove` takes
-`credential` as a credential name. `environment` and `credential` are validated at deserialize time by
+All six are UDS-only (`Carrier::Uds`). `config/set`, `config/get`,
+`config/unset`, and `environment/remove` take `environment` as an env name; `credential/remove` and
+`credential/logout` take `credential` as a credential name. `environment` and `credential` are validated at deserialize time by
 `config::credentials::validate_name` — an invalid name is `-32602` and the message carries the rule
-(`NAME_RULE`) and never the offending value.
+(`NAME_RULE`) and never the offending value. `-32602` is the code JSON-RPC 2.0 reserves for Invalid
+params ([JSON-RPC 2.0, Error object](https://www.jsonrpc.org/specification#error_object)); the daemon
+defines it as `CODE_INVALID_PARAMS`.
 
 Updated carrier exposure table (extends the table in [Method dispatch and carrier exposure](#method-dispatch-and-carrier-exposure)):
 
@@ -284,11 +452,134 @@ Updated carrier exposure table (extends the table in [Method dispatch and carrie
 | `config/get` | yes | reads caller config |
 | `config/unset` | yes | mutates caller data |
 | `credential/remove` | yes | mutates caller data |
+| `credential/logout` | yes | deletes caller session material |
 | `environment/remove` | yes | mutates caller data |
 
 **Caller-scoping invariant.** The daemon derives the caller's `callers/<uid>/` root from the
 kernel-verified peer uid, never from a method parameter. A caller that names an `environment` it
-has not provisioned gets `ENVIRONMENT_NOT_FOUND`; it cannot influence the path the daemon opens.
+has not provisioned gets `ENVIRONMENT_NOT_FOUND`, and one that names a `credential` it does not hold
+gets `CREDENTIAL_NOT_FOUND`; it cannot influence the path the daemon opens.
+
+### Signing out with `credential/logout` (Requirement 15 AC 12-19)
+
+`credential/logout` is how `aws logout` signs out without approval. Under the caller's write lock it
+runs the shared write check first, then looks the credential up, then deletes everything in the
+credential's data directory (`callers/<uid>/credentials/<name>/`) except `identity.enc`, and the
+`.replaced-*` archives of it that hold only sign-in output. A `.replaced-<name>.<id>` archive is
+the set-aside copy left when the credential was replaced. A successful replace deletes it at once;
+only a failed cleanup or restore, which is logged, leaves one behind. A logout deletes such an
+archive for the same reason `credential/remove` does: so the old sign-in cannot be restored by
+renaming it back. But an archive can hold a prior source's key, such as an IAM secret key from
+before a re-bootstrap to `aws-login`, which a logout is refused for (AC 13). Nothing records an
+archive's source once its entry is replaced, so its files decide: a logout deletes an archive only
+when every file in it is in the data-directory table below or is `identity.enc`, and leaves any
+other for the gated `credential/remove`. It writes neither TOML file and does not touch the integrity record, so nothing it does reads as drift. It
+evicts the caller's cached state, so a held session is not served after the logout returns.
+
+**What a logout ends.** The method is named for what it does, and it pairs with `credential/login`:
+it ends the sign-in of one credential that stays configured. The credential's entry, its source
+settings, and the caller's other credentials are untouched, and the next `credential/login` signs
+it back in. For `aws-idc-sso` a logout also calls the SSO service's `Logout`, so the session ends
+server-side as well when SSO accepts it, in the same vocabulary SSO uses. `creds logout --credential <name>` and
+`aws logout` call it.
+
+**What the result reports** (AC 17-18). An error may leave the logout partly done. Retrying the
+same logout is safe and finishes it. Once the local deletion has happened the logout succeeds,
+and `LogoutResult.provider` says what happened at the identity provider:
+
+| `provider` | When | `signed_out` | Also carries |
+|---|---|---|---|
+| `ended` | `aws-idc-sso`, and SSO accepted `Logout` | `true` | |
+| `token_rejected` | `aws-idc-sso`, and SSO refused the access token or the refresh before it as invalid or expired; the portal session may still be live | `true` | |
+| `local_only` | `aws-login` or `aws-web-identity`, neither of which has an end-session endpoint; or `aws-idc-sso` with local material deleted but no sealed token to send | `true` | |
+| `failed` | `aws-idc-sso`, and `Logout` or the refresh before it was refused for another reason or timed out, or the sealed token was unreadable | `true` | `start_url`, the portal to sign out at; `access_token_expires_at`, the expiry of the newest access token SSO issued, sealed or refreshed for the logout, when the sealed token was readable |
+| `none` | no sealed session; nothing deleted, nothing sent | `false` | |
+
+The `Logout` call goes first, since it needs the sealed access token. An expired access token
+is refreshed first when a refresh token is sealed with it, since that refresh token can keep the
+portal session live. The refreshed tokens stay in memory for that one call and are never sealed.
+The refresh and `Logout` share one 30 s
+bound, connect to response with any retries inside it, not the shared SSO client's timeouts and
+retries, so both always end inside the logout's 60 s lock hold (drift-detection Requirement 5.9)
+and the hold never cancels a logout before it deletes. A call that hits the bound reports
+`failed`. A lock wait past 10 s or a hold past 60 s is `INTERNAL` and deletes nothing: the wait
+lands before the logout starts, and the local deletion does not yield, so the hold can cancel only
+at the refresh or `Logout` call. Any other `INTERNAL` is a local step that failed and may leave the logout partly done, for example
+after SSO accepted `Logout`. The daemon cannot make the SSO sign-out and the local deletion one
+atomic step, so a retry finishes whatever is left. That retry still holds the sealed token, so
+it sends `Logout` again, and SSO refuses a token the first call invalidated. A refusal of the
+token as invalid or expired is `token_rejected`, not `failed`: nothing sealed can act, and the
+daemon keeps no record on disk that the first call succeeded. An expired access token with no
+refresh token gets the same answer while the portal session may still be live, so `creds logout`
+says only that the token no longer works at SSO and that the portal session may still be live.
+Only `ended`, an accepted `Logout`, lets it say the portal session ended. An earlier draft reported a refused
+`Logout` as `PROVIDER_UNAVAILABLE` after deleting the session. That error reads as retryable when
+state had already changed, and the retry then found no session, returned success, and hid the
+session still live at SSO. `creds logout` exits 1 on `failed` and warns with the start URL to
+sign out at and the access token's expiry, which the SSO session may outlast, so a script still
+sees the incomplete sign-out.
+
+**Sign-in output.** A credential's data may be one of three kinds:
+
+| Kind | Examples | Where it lives | A logout |
+|---|---|---|---|
+| Security-relevant metadata | authorization and token endpoints, SSO start URL, region, role ARN, client id | `credentials.toml` | keeps it |
+| Intermediate sign-in data | refresh tokens, SSO access token and client registration, IdP access and ID tokens, the DPoP key | sealed in the data directory | deletes it |
+| Resulting credentials | AWS session credentials | sealed in the data directory, or only in the daemon's memory | deletes the sealed copy; eviction drops the in-memory one |
+
+Sign-in output is the second and third kinds: what a sign-in returns and the daemon seals. The
+metadata is what the next sign-in needs, so a logout keeps it and a re-login needs no reconfiguring.
+
+`credential/logout` applies only to the three sources whose data directory holds nothing but
+sign-in output, and `credential/login` rebuilds every file in it:
+
+| Source | Data directory |
+|---|---|
+| `aws-login` | `aws_login_token.enc` (AWS session credentials and refresh token), `dpop_key.enc` |
+| `aws-idc-sso` | `sso_token.enc` (SSO access and refresh token, client registration, and copies of the start URL and region whose source stays in `credentials.toml`) |
+| `aws-web-identity` | `oauth_token.enc` (IdP access, ID, and refresh token) |
+
+The AWS credentials an `aws-idc-sso` or `aws-web-identity` credential yields are held only in
+memory and go with the eviction. Every other source keeps material only a bootstrap supplies (an IAM
+key, a Roles Anywhere private key, a static secret, a JWT, an OAuth client secret), so a logout of one
+is refused with `LOGOUT_UNSUPPORTED_SOURCE` rather than reduced to "delete the cache". That is a
+domain code, not `-32602`: the source comes from resolved config, not the request, and envelope
+codes carry no domain meaning (Requirement 8 AC 1).
+
+**When it is ungated.** A logout is never presence-gated (presence-gated-operations Requirement 1.7),
+and that holds only because it is refused for every source but the three above. For those,
+`credential/login` is ungated and replaces the same material with whatever the next sign-in
+returns, and a logout does strictly less: it ends the session and leaves the next sign-in to restore
+it. Gating it would protect nothing a same-uid caller cannot already do through login, and would put
+`sudo` on every `aws logout`. A logout of material only a bootstrap can restore would destroy what
+login cannot rebuild, so it is refused rather than gated. Being ungated does not skip the other
+checks: the caller must be authorized over UDS, and the shared write check must pass, so a drifted
+caller gets `CONFIG_DRIFTED` before the name is looked up.
+
+The exemption rests on one condition: no `credential/login` parameter selects or changes the
+principal beyond what the sign-in itself decides. The only such parameter is the
+`aws-idc-sso` `provider` (Requirement 17 AC 11), and a change through it is gated. A logout then a
+login gives a caller nothing a login alone does not: `aws-login` and `aws-web-identity` pin no
+principal, so whoever signs in becomes it, and an `aws-idc-sso` credential pins its account and
+role but any SSO user with that role may sign in, as the AWS CLI's own login allows. The exemption
+does not depend on `identity.enc`. For `aws-login` a logout keeps that record, so the next login
+still refuses a different principal (aws-login-identity Requirement 3.6), but the argument holds
+without it. Any login parameter added later that selects a principal, such as an account, role,
+start URL, or region passed through from a client, must be gated or must trigger a re-examination
+of this exemption.
+
+**Claims do not apply.** A logout takes no `claim` and is not checked against the credential's
+`identity_type` (Requirement 15 AC 19), matching login. A caller whose claim bars it from
+retrieving a credential may still sign that credential out: the claim is self-reported and only
+adds restriction, a logout yields no material, and an ungated login could already replace the
+session it ends.
+
+Open questions:
+
+- **Identity record.** A logout keeps `identity.enc`, the record of who signed in that
+  aws-login-identity defines, so the next sign-in compares against it. Only `aws-login` writes it.
+- **MFA sessions.** An `aws-iam-user` credential with MFA keeps a session file next to its key. A
+  logout that drops only the session would be a sign-out for it; it is currently refused.
 
 ## Increments
 
@@ -299,7 +590,7 @@ Ordered so each lands independently and nothing depends on an unsettled decision
 | 1 | Wire types: envelope, method surface, codec, name validation | **Shipped** — `src/rpc/{mod,methods,codec}.rs` |
 | 2 | Socket discovery from `CREDSD_SOCKET` | **Shipped** — `src/config/{mod,platform}.rs` |
 | 3 | Dispatcher + UDS transport: read lines, dispatch, exposure table, error mapping. `system/health`, `credential/list`, `environment/describe` handlers (no Material) | Next |
-| 4 | `credential/get` and `credential/get_batch` handlers; all-or-none enforced daemon-side | After 3 |
+| 4 | `credential/get` and `environment/credentials` handlers; all-or-none enforced daemon-side | After 3 |
 | 5 | Per-request peer re-sampling (Req 14), macOS first, Linux gated on verification | Parallel with 4; blocks nothing else |
 | 6 | Client: a sync JSON-RPC client for `creds get` and `credential_process` | After 3 |
 | 7 | Legacy UDS routes deleted (Req 9 AC 3) | After 6 |
@@ -324,7 +615,7 @@ guess would ship.
   `profile` and `credential` disagree is blocked by the `scope-down-plugin` base-directory
   question. No increment may implement boundary application. The `credential` field is safe to
   carry meanwhile only because it is optional and its absence means "the profile's configured
-  credential" — the behavior that exists today. **An increment MUST reject a `credential`
+  credential". **An increment MUST reject a `credential`
   value naming anything other than that**, rather than honoring it unrestricted.
 - **Scope on aggregates (Open Decision 2).** `GetBatchParams::scope` exists as a field;
   applying it does not. Leaning reject, decided with Req 7 AC 3. Nothing populates a scope, so
@@ -344,9 +635,9 @@ guess would ship.
    `environment/bootstrap`, `profile/login` → `environment/login`, `env/remove` →
    `environment/remove`), all `profile` param/result field names, and `DomainCode::ProfileNotFound`
    → `DomainCode::EnvironmentNotFound` (`ENVIRONMENT_NOT_FOUND`) are renamed in this commit.
-   This is a breaking wire change accepted pre-launch. Requirement 11 AC 3 requires a version
-   increment for breaking changes; `PROTOCOL_VERSION` is not bumped because no deployed
-   production consumers exist yet.
+   This is a breaking wire change accepted under the Requirement 11 AC 3 pre-launch waiver,
+   which covers every wire change before the first general-availability release;
+   `PROTOCOL_VERSION` is not bumped.
 
    Under the same policy, `CredentialResult.expires_at` becomes nullable (`DateTime | null`,
    `null` = the credential does not expire; see Requirement 4 as amended and
@@ -389,6 +680,18 @@ guess would ship.
 | `src/server/mod.rs` | `uds_router` deleted (Req 9 AC 3). `start()` serves the dispatcher over UDS. |
 | `src/server/routes.rs` | Native credential routes deleted. |
 | `src/config/mod.rs`, `src/config/platform.rs` | **Shipped.** `CREDSD_SOCKET` resolution and platform default. |
+| `crates/credsd-core/src/rpc/methods.rs` | `GetParams.environment` optional (Req 10 AC 6). |
+| `crates/credsd-daemon/src/server/dispatch.rs` | `get` serves a credential-addressed request from the credential alone; environment-addressed requests narrow (Req 10 AC 6-13). Method renames. |
+| `crates/credsd-daemon/src/server/bootstrap.rs` | Bootstrap and import write the credential only (Req 16). |
+| `crates/credsd-core/src/config/mod.rs` | `credential_list` drops the implicit one-to-one default (Req 16 AC 3). |
+| `crates/credsd-core/src/rpc/{methods,uds}.rs`, `crates/credsd-client/src/lib.rs` | `CREDENTIAL_NOT_FOUND`; renamed methods; bootstrap and login params are credential-addressed. |
+| `docs/api/openrpc.json`, `docs/reference/api.md`, user docs | Credential-addressed get, renames, no default environments. |
+| `crates/credsd-core/src/rpc/methods.rs` | `GetParams.account_id` and `role_name`, validated on deserialize (Req 17 AC 1-2). |
+| `crates/credsd-core/src/providers/{mod,sso}.rs` | `CredentialProvider::role_renewer`; the SSO provider renews any pair from its one token (Req 17 AC 4-5). |
+| `crates/credsd-daemon/src/credential_store.rs` | Cache and renewal turns keyed by pair (Req 17 AC 6). |
+| `crates/credsd-daemon/src/server/dispatch.rs` | Pair checks, default-pair folding, and the audit line (Req 17 AC 1, 3, 4, 8). |
+| `crates/credsd-core/src/rpc/methods.rs` | `ProviderParamsSso.allowed_roles` is `Option<Vec<RolePair>>`, so absent and empty differ (Req 17 AC 11). |
+| `crates/credsd-daemon/src/server/bootstrap.rs` | `same_provider_source` reads an `aws-idc-sso` entry at the entry check and again at commit against the staged source; `bootstrap_sso` keeps a stored pair instead of prompting; `describe_overwrite` names each changed setting and what the sign-in keeps (Req 17 AC 11). |
 
 ## Security considerations
 
@@ -406,5 +709,10 @@ guess would ship.
 - **A connection is a capability on every platform.** Re-sampling identifies the current
   writer; it does not prevent an FD from being inherited or passed. Attributable, not
   preventable (Req 14 AC 8).
+- **An SSO credential reaches only its allowed roles.** A caller allowed to get an `aws-idc-sso`
+  credential can get its stored account and role and the pairs its `allowed_roles` names, and no
+  other, even when the sign-in holds more (Req 17 AC 10). An absent or empty list allows only the
+  stored pair. The list changes only through the presence-gated re-bootstrap (Req 1.7), and the
+  daemon audits each selected pair.
 - **Bounded input.** `MAX_LINE_LEN` caps the buffer one message can force a transport to hold,
   so a peer that never sends a newline cannot drive it to grow without limit.

@@ -21,6 +21,7 @@ use super::{
 };
 use crate::error::{DaemonError, Result};
 use crate::rpc::CredentialSourceType;
+use crate::tags::Tags;
 
 /// Every field required to resolve one credential, tagged by source type.
 ///
@@ -135,6 +136,24 @@ impl CredentialSource {
         }
     }
 
+    /// Set who this credential is *for*. The credential owns its `identity_type`; no environment
+    /// carries it on the credential's behalf (credential-retrieval-api Requirement 2, amended).
+    /// No-op on `Unsupported`, which has no field to hold it.
+    pub fn set_identity_type(&mut self, identity_type: crate::config::IdentityType) {
+        match self {
+            Self::AwsIdcSso(c) => c.identity_type = identity_type,
+            Self::AwsIamUser(c) => c.identity_type = identity_type,
+            Self::AwsRolesAnywhere(c) => c.identity_type = identity_type,
+            Self::AwsWebIdentity(c) => c.identity_type = identity_type,
+            Self::AwsLogin(c) => c.identity_type = identity_type,
+            Self::Jwt(c) => c.identity_type = identity_type,
+            Self::StaticSecret(c) => c.identity_type = identity_type,
+            Self::Oauth(c) => c.identity_type = identity_type,
+            Self::JwtBearer(c) => c.identity_type = identity_type,
+            Self::Unsupported => {}
+        }
+    }
+
     /// The projection used when no level declares one — the first supported projection.
     pub fn default_projection(&self) -> Option<crate::projection::ProjectionType> {
         crate::projection::default_projection(self.source_type())
@@ -162,35 +181,36 @@ pub fn load() -> Result<CredentialSources> {
 
 /// Load credentials from an explicit path (used for per-caller scoped loading).
 pub fn load_from(path: &std::path::Path) -> Result<CredentialSources> {
+    load_entries_from(path).map(sources)
+}
+
+/// [`load_from`] keeping each entry's tags.
+pub fn load_entries_from(path: &std::path::Path) -> Result<CredentialEntries> {
     let Some(content) = super::read_if_present(path)? else {
-        return Ok(CredentialSources::new());
+        return Ok(CredentialEntries::new());
     };
     warn_if_permissive(path);
-
-    let credentials: CredentialSources = toml::from_str(&content).map_err(|e| {
+    parse_entries(&content, |e| {
         DaemonError::config(format!(
             "{}: parse error at {}",
             path.display(),
             super::located(e.span(), &content)
         ))
-    })?;
-
-    for name in credentials.keys() {
-        validate_name(name)?;
-    }
-    Ok(credentials)
+    })
 }
 
 /// Parse `content` as a `credentials.toml`. The text form of [`load_from`], for a caller that
 /// already holds the bytes it verified and must not read the file a second time to validate
 /// against them.
 pub fn from_text(content: &str) -> Result<CredentialSources> {
-    let credentials: CredentialSources = toml::from_str(content)
-        .map_err(|e| DaemonError::config(format!("failed to parse credentials: {}", e)))?;
-    for name in credentials.keys() {
-        validate_name(name)?;
-    }
-    Ok(credentials)
+    entries_from_text(content).map(sources)
+}
+
+/// [`from_text`] keeping each entry's tags.
+pub fn entries_from_text(content: &str) -> Result<CredentialEntries> {
+    parse_entries(content, |e| {
+        DaemonError::config(format!("failed to parse credentials: {}", e))
+    })
 }
 
 /// Insert or update a credential, preserving comments and formatting.
@@ -202,7 +222,7 @@ pub fn upsert_credential(name: &str, entry: &CredentialSource) -> Result<()> {
     }
 
     let mut doc = load_document(&path)?;
-    upsert_in_doc(&mut doc, name, entry)?;
+    upsert_in_doc(&mut doc, name, entry, None)?;
     write_config_file(&path, &doc.to_string())
 }
 
@@ -224,7 +244,7 @@ pub fn upsert_credential_at(
     }
     let path = credentials_path.to_path_buf();
     let mut doc = load_document(&path)?;
-    upsert_in_doc(&mut doc, name, entry)?;
+    upsert_in_doc(&mut doc, name, entry, None)?;
     write_config_file(&path, &doc.to_string())
 }
 
@@ -232,11 +252,14 @@ pub fn upsert_credential_at(
 /// result to `credentials_path`. Returns the written text. Edits `checked`, not a fresh read: the
 /// caller confirms the file still holds `checked` before calling, and this function does not
 /// re-verify it.
+///
+/// `tags` replaces the entry's tag set when given and keeps it when `None`.
 pub fn upsert_credential_in(
     credentials_path: &std::path::Path,
     checked: &str,
     name: &str,
     entry: &CredentialSource,
+    tags: Option<&Tags>,
 ) -> Result<String> {
     validate_name(name)?;
     if let Some(parent) = credentials_path.parent() {
@@ -245,24 +268,69 @@ pub fn upsert_credential_in(
     let mut doc = checked
         .parse::<DocumentMut>()
         .map_err(|e| DaemonError::config(format!("failed to parse credentials: {}", e)))?;
-    upsert_in_doc(&mut doc, name, entry)?;
+    upsert_in_doc(&mut doc, name, entry, tags)?;
     let written = doc.to_string();
     write_config_file(credentials_path, &written)?;
     Ok(written)
 }
 
-/// Parse credentials text, validating every name as `load_from` does.
-pub fn parse_sources(content: &str) -> Result<CredentialSources> {
-    let credentials: CredentialSources = toml::from_str(content).map_err(|e| {
+/// One `credentials.toml` entry: its tags beside the source they describe.
+///
+/// `tags` is consumed here before the rest of the table reaches the source, so a source that
+/// denies unknown fields still refuses a stray key and never sees `tags`. No
+/// `deny_unknown_fields` on this wrapper: the source decides what else its table may hold.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaggedSource {
+    #[serde(default)]
+    pub tags: Tags,
+    #[serde(flatten)]
+    pub source: CredentialSource,
+}
+
+/// Every `credentials.toml` entry by name, tags included.
+pub type CredentialEntries = HashMap<String, TaggedSource>;
+
+/// Parses `content`, then checks every name; a parse error is worded by `parse_error`. Tags are
+/// left as written: a tag that breaks the grammar is an invalid config, refused by
+/// [`check_tags`], not a file that fails to parse, so its snapshot can still be checked.
+fn parse_entries(
+    content: &str,
+    parse_error: impl FnOnce(toml::de::Error) -> DaemonError,
+) -> Result<CredentialEntries> {
+    let entries: CredentialEntries = toml::from_str(content).map_err(parse_error)?;
+    entries.keys().try_for_each(|name| validate_name(name))?;
+    Ok(entries)
+}
+
+/// Folds every entry's tag keys to lowercase and checks them against the tag grammar. The error
+/// names the credential and the key, never the value.
+pub fn check_tags(entries: &mut CredentialEntries) -> Result<()> {
+    for (name, entry) in entries {
+        let named =
+            |e: DaemonError| DaemonError::config(format!("credential '{name}': {}", e.detail()));
+        entry.tags = crate::tags::normalize(std::mem::take(&mut entry.tags)).map_err(named)?;
+    }
+    Ok(())
+}
+
+/// `entries` without their tags: what config validation reads.
+pub fn sources(entries: CredentialEntries) -> CredentialSources {
+    entries.into_iter().map(|(n, e)| (n, e.source)).collect()
+}
+
+/// Parse credentials text keeping each entry's tags as written, validating names.
+pub fn parse_tagged(content: &str) -> Result<CredentialEntries> {
+    parse_entries(content, |e| {
         DaemonError::config(format!(
             "failed to parse credentials: parse error at {}",
             super::located(e.span(), content)
         ))
-    })?;
-    for name in credentials.keys() {
-        validate_name(name)?;
-    }
-    Ok(credentials)
+    })
+}
+
+/// Parse credentials text, validating every name as `load_from` does.
+pub fn parse_sources(content: &str) -> Result<CredentialSources> {
+    parse_tagged(content).map(sources)
 }
 
 /// Remove credential `name` from `checked`, the bytes the caller verified, and write the result
@@ -298,6 +366,48 @@ fn remove_credential_with(
     credentials_path: &std::path::Path,
     checked: &str,
     name: &str,
+    before_write: impl FnMut(&str) -> Result<()>,
+    write: impl FnOnce(&std::path::Path, &str) -> Result<()>,
+) -> Result<Option<String>> {
+    edit_credentials_with(
+        credentials_path,
+        checked,
+        |doc| doc.remove(name).is_some(),
+        before_write,
+        write,
+    )
+}
+
+/// Replace credential `name`'s tag set in `checked` with `tags` and write the result, under the
+/// same checked-bytes, seal-first, roll-back contract as [`remove_credential_from`]. `None`
+/// (writing nothing) when there is no such credential.
+pub fn set_tags_from(
+    credentials_path: &std::path::Path,
+    checked: &str,
+    name: &str,
+    tags: &Tags,
+    before_write: impl FnMut(&str) -> Result<()>,
+) -> Result<Option<String>> {
+    edit_credentials_with(
+        credentials_path,
+        checked,
+        |doc| match doc.get_mut(name).and_then(Item::as_table_mut) {
+            Some(table) => {
+                set_tags(table, tags);
+                true
+            }
+            None => false,
+        },
+        before_write,
+        write_config_file,
+    )
+}
+
+/// Applies `edit` to `checked` and writes the result; `edit` returning false writes nothing.
+fn edit_credentials_with(
+    credentials_path: &std::path::Path,
+    checked: &str,
+    edit: impl FnOnce(&mut DocumentMut) -> bool,
     mut before_write: impl FnMut(&str) -> Result<()>,
     write: impl FnOnce(&std::path::Path, &str) -> Result<()>,
 ) -> Result<Option<String>> {
@@ -307,7 +417,7 @@ fn remove_credential_with(
             super::located(e.span(), checked)
         ))
     })?;
-    if doc.remove(name).is_none() {
+    if !edit(&mut doc) {
         return Ok(None);
     }
     let written = doc.to_string();
@@ -317,7 +427,7 @@ fn remove_credential_with(
             write(credentials_path, &written)
         } else {
             Err(DaemonError::config(
-                "credentials changed after they were checked; nothing was removed",
+                "credentials changed after they were checked; nothing was written",
             ))
         }
     });
@@ -325,7 +435,9 @@ fn remove_credential_with(
         return Err(match before_write(checked) {
             Ok(()) => err,
             Err(rollback) => DaemonError::config(format!(
-                "{err}; the snapshot rollback also failed: {rollback}"
+                "{}; the snapshot rollback also failed: {}",
+                err.detail(),
+                rollback.detail()
             )),
         });
     }
@@ -336,8 +448,14 @@ fn remove_credential_with(
 ///
 /// Replaces the entry's keys when it already exists, so keys owned by a previous source
 /// type — including any stale secret material — do not linger after a re-bootstrap.
-/// Comments and unrelated entries elsewhere in the document are left untouched.
-fn upsert_in_doc(doc: &mut DocumentMut, name: &str, entry: &CredentialSource) -> Result<()> {
+/// Comments and unrelated entries elsewhere in the document are left untouched. `tags` replaces
+/// the entry's tag set when given; `None` keeps whatever set the entry had.
+fn upsert_in_doc(
+    doc: &mut DocumentMut,
+    name: &str,
+    entry: &CredentialSource,
+    tags: Option<&Tags>,
+) -> Result<()> {
     // `#[serde(other)]` governs deserialization only, so this variant serializes happily to
     // `type = "unsupported"` — an entry no provider can resolve. Refuse before rendering.
     if matches!(entry, CredentialSource::Unsupported) {
@@ -350,15 +468,41 @@ fn upsert_in_doc(doc: &mut DocumentMut, name: &str, entry: &CredentialSource) ->
         .map_err(|e| DaemonError::config(format!("failed to serialize credential: {}", e)))?;
 
     if let Some(existing) = doc.get_mut(name).and_then(Item::as_table_mut) {
+        let kept = existing.remove(TAGS_KEY);
         existing.clear();
         for (key, item) in rendered.iter() {
             existing.insert(key, item.clone());
         }
+        match (tags, kept) {
+            (Some(tags), _) => set_tags(existing, tags),
+            (None, Some(kept)) => {
+                existing.insert(TAGS_KEY, kept);
+            }
+            (None, None) => {}
+        }
         return Ok(());
     }
 
-    doc.insert(name, Item::Table(rendered.into_table()));
+    let mut table = rendered.into_table();
+    set_tags(&mut table, tags.unwrap_or(&Tags::new()));
+    doc.insert(name, Item::Table(table));
     Ok(())
+}
+
+const TAGS_KEY: &str = "tags";
+
+/// Writes `tags` as the entry's inline `tags` table; an empty set removes the table, so an
+/// untagged entry reads exactly as it did before tags existed.
+fn set_tags(table: &mut toml_edit::Table, tags: &Tags) {
+    if tags.is_empty() {
+        table.remove(TAGS_KEY);
+        return;
+    }
+    let inline: toml_edit::InlineTable = tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), toml_edit::Value::from(v.as_str())))
+        .collect();
+    table.insert(TAGS_KEY, Item::Value(toml_edit::Value::InlineTable(inline)));
 }
 
 const MAX_NAME_LEN: usize = 64;
@@ -414,6 +558,167 @@ pub fn validate_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    mod tags {
+        use super::super::*;
+        use crate::tags::{Tags, MAX_TAGS};
+        use proptest::collection::btree_map;
+        use proptest::prelude::*;
+
+        const SSO: &str = r#"type = "aws-idc-sso"
+start_url = "https://example.awsapps.com/start"
+sso_region = "us-east-1"
+account_id = "111111111111"
+role_name = "Developer"
+"#;
+
+        /// `AwsWebIdentityConfig` denies unknown fields, so it is the source a misrouted `tags`
+        /// key would break.
+        const WEB_IDENTITY: &str = r#"type = "aws-web-identity"
+role_arn = "arn:aws:iam::111111111111:role/r"
+region = "us-east-1"
+"#;
+
+        fn render(body: &str, tags: &Tags) -> String {
+            let mut table = toml_edit::InlineTable::new();
+            for (k, v) in tags {
+                table.insert(k, v.as_str().into());
+            }
+            format!("[dev]\n{body}tags = {table}\n")
+        }
+
+        /// The text parsed, then its tags folded and checked: what a caller serves from.
+        fn checked(text: &str) -> Result<CredentialEntries> {
+            let mut entries = parse_tagged(text)?;
+            check_tags(&mut entries)?;
+            Ok(entries)
+        }
+
+        proptest! {
+            /// Tags survive a parse exactly, and the source beside them parses as if they were
+            /// absent, for a lenient source and a strict one alike.
+            #[test]
+            fn tags_round_trip_beside_any_source(
+                tags in btree_map("[a-z0-9][a-z0-9._-]{0,62}", "[ -~]{0,256}", 0..=MAX_TAGS),
+                strict in any::<bool>(),
+            ) {
+                let body = if strict { WEB_IDENTITY } else { SSO };
+                let parsed = parse_tagged(&render(body, &tags)).expect("parses");
+                let untagged = parse_sources(&format!("[dev]\n{body}")).expect("parses");
+                prop_assert_eq!(&parsed["dev"].tags, &tags);
+                prop_assert_eq!(parsed["dev"].source.source_type(), untagged["dev"].source_type());
+            }
+
+            /// A tag that breaks the grammar still parses, so drift is judged on it like any
+            /// edit, and then fails the tag check with a message naming the key.
+            #[test]
+            fn a_bad_tag_key_parses_then_fails_the_check_naming_it(bad in "[a-z]{0,4}[\\u{e0}-\\u{ff}][a-z]{0,4}|[._-][a-z]{0,8}|[a-z0-9]{64,70}") {
+                let text = render(SSO, &Tags::from([(bad.clone(), "v".into())]));
+                prop_assert_eq!(&parse_tagged(&text).expect("a bad tag still parses")["dev"].tags[&bad], "v");
+                let err = checked(&text).expect_err("accepted a bad tag key").to_string();
+                prop_assert!(err.contains(&bad), "error {err:?} does not name {bad:?}");
+            }
+        }
+
+        proptest! {
+            /// Requirement 1.4: a hand-edited file may spell a key in any case; the load returns
+            /// it folded, with the value byte for byte.
+            #[test]
+            fn a_load_folds_any_case_keys(
+                tags in btree_map("[a-z0-9][a-z0-9._-]{0,62}", "[ -~]{0,64}", 0..8),
+                up in proptest::collection::vec(any::<bool>(), 63),
+            ) {
+                let spelled: Tags = tags
+                    .iter()
+                    .map(|(k, v)| {
+                        let k = k.chars().zip(up.iter().chain(std::iter::repeat(&false)))
+                            .map(|(c, u)| if *u { c.to_ascii_uppercase() } else { c })
+                            .collect();
+                        (k, v.clone())
+                    })
+                    .collect();
+                let parsed = checked(&render(SSO, &spelled)).expect("parses");
+                prop_assert_eq!(&parsed["dev"].tags, &tags);
+            }
+        }
+
+        /// Requirement 1.6: two spellings of one key in an entry fail the load, naming the
+        /// credential and both spellings; neither value is picked or quoted.
+        #[test]
+        fn two_spellings_of_one_key_fail_the_load_naming_both() {
+            let text = render(
+                SSO,
+                &Tags::from([
+                    ("Env".into(), "sk-planted-a".into()),
+                    ("env".into(), "sk-planted-b".into()),
+                ]),
+            );
+            let err = checked(&text).expect_err("collision accepted").to_string();
+            for want in ["'dev'", "\"Env\"", "\"env\""] {
+                assert!(err.contains(want), "{err} lacks {want}");
+            }
+            assert!(!err.contains("sk-planted"), "{err}");
+        }
+
+        #[test]
+        fn a_strict_source_accepts_a_tag_table() {
+            let text = render(WEB_IDENTITY, &Tags::from([("team".into(), "x".into())]));
+            parse_sources(&text).expect("tags must not reach the strict source");
+        }
+
+        /// Tags must not become a hole in the strict source's typo check: a stray key beside
+        /// them is still refused. The load error gives a position and never quotes the file, so
+        /// the refusal is asserted, not its wording.
+        #[test]
+        fn a_strict_source_still_refuses_a_stray_key_beside_tags() {
+            let tagged = render(WEB_IDENTITY, &Tags::from([("team".into(), "x".into())]));
+            parse_sources(&tagged).expect("tags alone are accepted");
+            assert!(parse_sources(&format!("{tagged}bogus = 1\n")).is_err());
+        }
+
+        /// The error names the key and never quotes the value: a value may be something the owner
+        /// would not want in a log.
+        #[test]
+        fn a_bad_tag_value_fails_the_load_without_quoting_it() {
+            let text = render(
+                SSO,
+                &Tags::from([("team".into(), "sk-planted\u{7}".into())]),
+            );
+            let err = checked(&text)
+                .expect_err("control character accepted")
+                .to_string();
+            assert!(err.contains("team"), "{err}");
+            assert!(!err.contains("sk-planted"), "{err}");
+        }
+
+        /// Requirement 3.2: a re-bootstrap that names no tags rewrites the source and keeps the
+        /// entry's tag set, whatever the source was before.
+        #[test]
+        fn an_upsert_keeps_the_entry_tags() {
+            let tags = Tags::from([("team".into(), "payments".into())]);
+            for body in [SSO, WEB_IDENTITY] {
+                let mut doc: DocumentMut = render(body, &tags).parse().expect("toml");
+                upsert_in_doc(&mut doc, "dev", &super::sso_entry(), None).expect("upsert");
+                let kept = doc["dev"]
+                    .get("tags")
+                    .and_then(Item::as_inline_table)
+                    .map(|t| {
+                        t.iter()
+                            .map(|(k, v)| (k.to_owned(), v.as_str().unwrap_or_default().to_owned()))
+                            .collect::<Tags>()
+                    });
+                assert_eq!(kept.as_ref(), Some(&tags), "{doc}");
+            }
+        }
+
+        #[test]
+        fn thirty_three_tags_fail_the_load() {
+            let tags: Tags = (0..=MAX_TAGS)
+                .map(|i| (format!("k{i}"), "v".into()))
+                .collect();
+            assert!(checked(&render(SSO, &tags)).is_err());
+        }
+    }
+
     fn sso_entry() -> CredentialSource {
         CredentialSource::AwsIdcSso(SsoConfig {
             start_url: "https://example.awsapps.com/start".into(),
@@ -421,6 +726,7 @@ mod tests {
             account_id: "111111111111".into(),
             role_name: "Developer".into(),
             identity_type: Default::default(),
+            allowed_roles: Vec::new(),
         })
     }
 
@@ -498,7 +804,7 @@ role_name = "Developer"
     #[test]
     fn upsert_writes_a_new_table() {
         let mut doc = DocumentMut::new();
-        upsert_in_doc(&mut doc, "dev", &sso_entry()).unwrap();
+        upsert_in_doc(&mut doc, "dev", &sso_entry(), None).unwrap();
         let out = doc.to_string();
         assert!(out.contains("[dev]"));
         assert!(out.contains(r#"type = "aws-idc-sso""#));
@@ -524,7 +830,7 @@ account_id = "222222222222"
 role_name = "Reader"
 "#;
         let mut doc = original.parse::<DocumentMut>().unwrap();
-        upsert_in_doc(&mut doc, "dev", &sso_entry()).unwrap();
+        upsert_in_doc(&mut doc, "dev", &sso_entry(), None).unwrap();
         let out = doc.to_string();
 
         assert!(out.contains("# my credential sources"));
@@ -544,7 +850,7 @@ access_key_id = "AKIAOLD"
 secret_access_key = "leftover-secret"
 "#;
         let mut doc = original.parse::<DocumentMut>().unwrap();
-        upsert_in_doc(&mut doc, "dev", &sso_entry()).unwrap();
+        upsert_in_doc(&mut doc, "dev", &sso_entry(), None).unwrap();
         let out = doc.to_string();
 
         assert!(out.contains(r#"type = "aws-idc-sso""#));
@@ -571,7 +877,7 @@ identity_type = "agent"
 "#;
         let mut doc = original.parse::<DocumentMut>().unwrap();
         // sso_entry() has account_id 111.. and identity_type at its Human default.
-        upsert_in_doc(&mut doc, "dev", &sso_entry()).unwrap();
+        upsert_in_doc(&mut doc, "dev", &sso_entry(), None).unwrap();
         let out = doc.to_string();
 
         assert!(out.contains(r#"account_id = "111111111111""#));
@@ -597,7 +903,7 @@ identity_type = "agent"
     #[test]
     fn upsert_round_trips_every_field() {
         let mut doc = DocumentMut::new();
-        upsert_in_doc(&mut doc, "dev", &sso_entry()).unwrap();
+        upsert_in_doc(&mut doc, "dev", &sso_entry(), None).unwrap();
         let credentials: CredentialSources = toml::from_str(&doc.to_string()).unwrap();
         match (&credentials["dev"], &sso_entry()) {
             (CredentialSource::AwsIdcSso(got), CredentialSource::AwsIdcSso(want)) => {
@@ -613,7 +919,7 @@ identity_type = "agent"
     #[test]
     fn unsupported_entry_cannot_be_written() {
         let mut doc = DocumentMut::new();
-        assert!(upsert_in_doc(&mut doc, "x", &CredentialSource::Unsupported).is_err());
+        assert!(upsert_in_doc(&mut doc, "x", &CredentialSource::Unsupported, None).is_err());
     }
 
     #[test]
